@@ -639,6 +639,9 @@ static struct ggml_tensor * ggml_dup_tensor_layout(struct ggml_context * ctx, co
     }
     return dup;
 }
+struct ggml_tensor * ggml_dup_tensor_layout_public(struct ggml_context * ctx, const struct ggml_tensor * tensor) {
+    return ggml_dup_tensor_layout(ctx, tensor);
+}
 
 static bool ggml_is_view_op(enum ggml_op op) {
     return op == GGML_OP_VIEW || op == GGML_OP_RESHAPE || op == GGML_OP_PERMUTE || op == GGML_OP_TRANSPOSE;

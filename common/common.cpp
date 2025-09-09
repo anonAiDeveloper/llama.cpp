@@ -894,6 +894,8 @@ std::string fs_get_cache_file(const std::string & filename) {
 //
 // Model utils
 //
+#include "../src/llama-context.h"
+#include "../src/llama-parameter-offloader.h"
 
 struct common_init_result common_init_from_params(common_params & params) {
     common_init_result iparams;
@@ -909,6 +911,10 @@ struct common_init_result common_init_from_params(common_params & params) {
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
     auto cparams = common_context_params_to_llama(params);
+
+    auto * param_off = new parameter_offloader(model);
+    cparams.cb_eval = llama_offloader_eval_cb;
+    cparams.cb_eval_user_data = param_off;
 
     llama_context * lctx = llama_init_from_model(model, cparams);
     if (lctx == NULL) {
@@ -1007,6 +1013,53 @@ struct common_init_result common_init_from_params(common_params & params) {
         LOG_WRN("%s: warning: vocab does not have an EOS token, ignoring --ignore-eos\n", __func__);
         params.sampling.ignore_eos = false;
     }
+
+    // ---- Phase A: collect true first-use order with a single decode ----
+    {
+        // pick BOS if available
+        llama_token tok = 0;
+        if (const llama_vocab * v = llama_model_get_vocab(model)) {
+            llama_token t = llama_vocab_bos(v);
+            if (t != LLAMA_TOKEN_NULL)
+                tok = t;
+        }
+        std::vector<llama_token> one{ tok };
+        llama_batch warm = llama_batch_get_one(one.data(), one.size()); // 1 token, 1 seq
+        (void) llama_decode(lctx, warm);
+
+        // cleanup warm-up side-effects
+        llama_memory_clear(llama_get_memory(lctx), true);
+        llama_synchronize(lctx);
+        llama_perf_context_reset(lctx);
+    }
+
+    // ---- Phase B: mirror & schedule, then enable streaming ----
+    LLAMA_LOG_INFO("%s before parameter_offloader->init()\n", __func__);
+    {
+        // Create a CUDA arena + twins ctx
+        ggml_backend_dev_t cuda_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+        if (cuda_dev)
+        {
+            size_t arena_bytes = /* e.g. */ (size_t)2 * 1024ull * 1024ull * 1024ull; // TODO: parametrize
+            ggml_backend_buffer_t arena = ggml_cuda_arena_create_on(cuda_dev, arena_bytes, /*device_ordinal=*/0);
+            if (arena)
+            {
+                const size_t MB = 1024ull * 1024ull;
+                ggml_init_params twins{ 64*MB, nullptr, true };
+
+                param_off->init(arena, cparams, ggml_init(twins), lctx);
+
+                // One helper does both: stash + install eval callback
+                //if (llama_offload_install(lctx, param_off) != 0) {
+                    // fallback: uninstall and delete on failure
+                //    llama_offload_uninstall(lctx);
+                //    delete param_off;
+                //}
+            }
+        }
+    }
+    LLAMA_LOG_INFO("%s after parameter_offloader->init()\n", __func__);
+    // === VRAM offload: end ===
 
     // initialize once
     for (llama_token i = 0; i < llama_vocab_n_tokens(vocab); i++) {

@@ -335,6 +335,8 @@ extern "C" {
         struct ggml_cgraph * graph;
     };
 
+    GGML_API struct ggml_tensor * ggml_dup_tensor_layout_public(struct ggml_context * ctx, const struct ggml_tensor * tensor);
+    
     // Copy a graph to a different backend
     GGML_API struct ggml_backend_graph_copy ggml_backend_graph_copy(ggml_backend_t backend, struct ggml_cgraph * graph);
     GGML_API void                           ggml_backend_graph_copy_free(struct ggml_backend_graph_copy copy);
