@@ -45,12 +45,11 @@ public:
     std::vector<ggml_tensor*>             gpu_tensors_in_order;  // feed-order list of GPU twins
     std::unordered_map<ggml_tensor*, int> gpu2index;         // GPU twin -> feed-order index
 
-    std::atomic<int>  loaded_idx{ -1 };  // highest index copied into arena
-    std::atomic<int>  used_idx{ -1 };    // highest index observed in execution
+    std::atomic<int> tensor_idx_loaded{ -1 };  // highest index copied into arena
 
-    std::atomic<int> used_mod{-1};         // last seen feed index this pass
-    std::atomic<int> used_epoch{0};        // increments when index decreases (wrap)
-    std::atomic<long long> used_seq{ -1 }; // used_epoch*N + used_mod
+    std::atomic<int> tensor_idx_used_mod{-1};         // last seen feed index this pass
+    std::atomic<int> tensor_idx_used_epoch{0};        // increments when index decreases (wrap)
+    std::atomic<long long> tensor_idx_used_seq{ -1 }; // tensor_idx_used_epoch*tensor_count + tensor_idx_used_mod
 
 
     // Fast lookups
@@ -58,6 +57,9 @@ public:
     std::unordered_map<ggml_tensor*, ggml_tensor*> gpu2cpu;
     // CPU->GPU: answer “do we already have a GPU twin for this CPU weight?”
     std::unordered_map<ggml_tensor*, ggml_tensor*> cpu2gpu;
+
+    //map the gpu tensors to hashes recorded at init, to ensure data integrity
+    std::unordered_map<ggml_tensor*, uint64_t> gpu_hashes;
 
     std::unordered_set<ggml_tensor*> weight_set; // CPU weight ptrs
 
@@ -69,6 +71,8 @@ public:
               ggml_context        * ctx_twins, llama_context      * lctx);
     parameter_offloader(llama_model * model);
     ~parameter_offloader();
+
+    void copy_host_to_arena_with_transform(ggml_tensor * src_host, ggml_tensor * dst_arena);
 
     ggml_tensor * cpu_tensor_to_arena(ggml_tensor * w_cpu);
 

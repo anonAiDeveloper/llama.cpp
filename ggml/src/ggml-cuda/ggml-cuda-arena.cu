@@ -50,12 +50,24 @@ static void cuda_arena_get_tensor(ggml_backend_buffer_t b, const ggml_tensor *t,
 
 static bool cuda_arena_cpy_tensor(ggml_backend_buffer_t b, const ggml_tensor *src, ggml_tensor *dst)
 {
-    // Fast D2D if src is device-backed
     if (!ggml_backend_buffer_is_host(src->buffer))
     {
         cuda_arena *ctx = (cuda_arena*) b->context;
         cudaSetDevice(ctx->device);
-        cudaMemcpy(dst->data, src->data, ggml_nbytes(src), cudaMemcpyDeviceToDevice);
+
+        // Use the *device allocation size*, and assert src/dst agree:
+        ggml_backend_buffer_type_t src_buft = ggml_backend_buffer_get_type(src->buffer);
+        ggml_backend_buffer_type_t dst_buft = ggml_backend_buffer_get_type(dst->buffer);
+        size_t src_sz = ggml_backend_buft_get_alloc_size(src_buft, const_cast<ggml_tensor *>(src));
+        size_t dst_sz = ggml_backend_buft_get_alloc_size(dst_buft, dst);
+        size_t sz = src_sz;
+        if (src_sz != dst_sz) {
+            // be strict; mismatched layouts is a bug for weights
+            // you can also choose: sz = std::min(src_sz, dst_sz);
+            GGML_ASSERT(src_sz == dst_sz);
+        }
+
+        cudaMemcpy(dst->data, src->data, sz, cudaMemcpyDeviceToDevice);
         return true;
     }
     return false;
@@ -63,12 +75,14 @@ static bool cuda_arena_cpy_tensor(ggml_backend_buffer_t b, const ggml_tensor *sr
 
 static enum ggml_status cuda_arena_init_tensor(ggml_backend_buffer_t b, ggml_tensor *t)
 {
-    // Optional: zero padded tail for quantized tensors, mirroring ggml-cuda.
-    // size_t orig = ggml_nbytes(t);
-    // size_t pad  = ggml_backend_buft_get_alloc_size(ggml_backend_buffer_get_type(b), t);
-    // if (pad > orig) cudaMemset((char*) t->data + orig, 0, pad - orig);
-    (void)b; (void)t;    //to avoid not referenced warnings
-    return ggml_status::GGML_STATUS_SUCCESS;
+    cuda_arena *ctx = (cuda_arena*) b->context;
+    cudaSetDevice(ctx->device);
+
+    size_t logical = ggml_nbytes(t);
+    size_t device  = ggml_backend_buft_get_alloc_size(ggml_backend_buffer_get_type(b), t);
+    if (device > logical)
+        cudaMemset((char*) t->data + logical, 0, device - logical);
+    return GGML_STATUS_SUCCESS;
 }
 
 static const ggml_backend_buffer_i cuda_arena_iface = {

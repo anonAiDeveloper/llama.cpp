@@ -1,5 +1,6 @@
 #include "llama-parameter-offloader.h"
 #include "llama-arch.h"
+#include "llama-impl.h"
 #include "llama.h"
 #include "llama-model.h"
 #include "llama-context.h"
@@ -12,9 +13,28 @@
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
+#include <math.h>       /* isfinite */
 
 // add near top of file
 #include <cstring>
+
+/////////////////////////////////////
+//   DEBUGGING SWITCHES
+/////////////////////////////////////
+//Set this number to the max number of copies ahead you want to allow
+//#define LLAMA_DIAGNOSE_COPY 9999
+//#define LLAMA_DIAGNOSE_COPY 1
+
+//#define LLAMA_CHECK_WEIGHTS 1
+//#define LLAMA_CHECK_WEIGHTS_VERBOSE 1
+//#define LLAMA_CHECK_NON_FINITES 1
+//#define LLAMA_CHECK_NODES 1
+//#define LLAMA_PRINT_ALL_NODES 1
+//#define LLAMA_LOG_READS 1
+//#define LLAMA_LOG_COPIES 1
+/////////////////////////////////////
+
+#include "llama-offloader-diagnostic.h"
 
 static inline size_t align_up(size_t x, size_t a)
 {
@@ -65,6 +85,18 @@ void parameter_offloader::init(
     else
         for (ggml_tensor * w_cpu : collected_order)
             (void) cpu_tensor_to_arena(w_cpu);
+
+#ifdef LLAMA_CHECK_WEIGHTS
+    //record hashes right after we create the gpu tensors
+    for (ggml_tensor * w_gpu : gpu_tensors_in_order)
+    {
+        const size_t nbytes_g = ggml_nbytes(w_gpu);
+        std::vector<uint8_t> tmp_(nbytes_g);
+        // copy device -> host for the logical bytes
+        ggml_backend_tensor_get(w_gpu, tmp_.data(), 0, nbytes_g);
+        gpu_hashes[w_gpu] = fnv1a64(tmp_.data(), nbytes_g);
+    }
+#endif
 
     //print_model_tensor_stats(model);
 
@@ -264,13 +296,25 @@ void parameter_offloader::init(
     //       FINISH UP
     //////////////////////////////////////////////////////////////////
 
-    loaded_idx.store(-1);
-    used_idx.store(-1);
+    tensor_idx_loaded.store(tensor_count - 1);
+    //Untested, might solve some invisible startup glitches?
+    tensor_idx_used_mod.store(tensor_count - 1);
+    tensor_idx_used_seq.store(tensor_idx_used_epoch*tensor_count + tensor_idx_used_mod);
 
     ready = true;
 
     print_snapshot();
+
+#if defined(LLAMA_DIAGNOSE_COPY)
+    //streamer thread disabled during debug mode, so get things started with the first copy
+    ggml_tensor *w_cpu = cpu_tensors_in_order[0];
+    ggml_tensor *w_gpu = gpu_tensors_in_order[0];
+    //ggml_backend_tensor_copy(w_cpu, w_gpu);
+    copy_host_to_arena_with_transform(w_cpu, w_gpu);
+    tensor_idx_loaded.store(tensor_count);   //this is not out of range, as its meant to go over to represent wrap-around
+#else
     start_streamer();                         // begin background H2D streaming
+#endif
 
     // Optional log
     size_t peak = 0;
@@ -443,6 +487,41 @@ void patch_model_refs_for(llama_model * model, ggml_tensor * w_cpu, ggml_tensor 
     }
 }
 
+void parameter_offloader::copy_host_to_arena_with_transform(ggml_tensor * src_host, ggml_tensor * dst_arena)
+{
+    GGML_ASSERT(src_host && dst_arena);
+    GGML_ASSERT(ggml_backend_buffer_is_host(src_host->buffer));
+    GGML_ASSERT(dst_arena->buffer == arena);
+
+    ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    GGML_ASSERT(dev);
+
+    ggml_backend_buffer_type_t dev_buft = ggml_backend_dev_buffer_type(dev);
+    const size_t dev_bytes = ggml_backend_buft_get_alloc_size(dev_buft, src_host);
+
+    ggml_backend_buffer_t tmp_buf = ggml_backend_buft_alloc_buffer(dev_buft, dev_bytes);
+    GGML_ASSERT(tmp_buf);
+
+    ggml_init_params tmp_ip{ 64*1024, nullptr, true };
+    ggml_context * tmp_ctx = ggml_init(tmp_ip);
+    GGML_ASSERT(tmp_ctx);
+
+    ggml_tensor * tmp_dev = ggml_dup_tensor_layout_public(tmp_ctx, src_host);
+    GGML_ASSERT(tmp_dev);
+
+    void * tmp_base = ggml_backend_buffer_get_base(tmp_buf);
+    GGML_ASSERT(ggml_backend_tensor_alloc(tmp_buf, tmp_dev, tmp_base) == GGML_STATUS_SUCCESS);
+
+    // This applies the CUDA-side packing/transform for the tensor's type:
+    ggml_backend_tensor_set(tmp_dev, src_host->data, 0, ggml_nbytes(src_host));
+
+    // Now copy the transformed device bytes into your arena twin (D2D):
+    ggml_backend_tensor_copy(tmp_dev, dst_arena);
+
+    ggml_free(tmp_ctx);
+    ggml_backend_buffer_free(tmp_buf);
+}
+
 ggml_tensor * parameter_offloader::cpu_tensor_to_arena(ggml_tensor * w_cpu)
 {
     GGML_ASSERT(ctx_gpu_twins);
@@ -498,8 +577,43 @@ ggml_tensor * parameter_offloader::cpu_tensor_to_arena(ggml_tensor * w_cpu)
     // Bind GPU twin into the arena at [base + off]
     GGML_ASSERT(ggml_backend_tensor_alloc(arena, w_gpu, base + off) == GGML_STATUS_SUCCESS);
 
-    // Copy host→device once so VRAM content matches the CPU weight now
-    ggml_backend_tensor_copy(w_cpu, w_gpu);
+    // Copy host→device with proper CUDA-side transform, then D2D into the arena
+    // (fallback to direct copy if the temp path cannot be created)
+    bool transformed_ok = false;
+    //if (false)
+    {
+        ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+        if (dev) {
+            ggml_backend_buffer_type_t dev_buft = ggml_backend_dev_buffer_type(dev);
+            const size_t dev_bytes = ggml_backend_buft_get_alloc_size(dev_buft, w_cpu);
+
+            ggml_backend_buffer_t tmp_buf = ggml_backend_buft_alloc_buffer(dev_buft, dev_bytes);
+            if (tmp_buf) {
+                // need a small metadata pool even with no_alloc=true
+                ggml_init_params tmp_ip{ 64*1024, nullptr, true };
+                ggml_context * tmp_ctx = ggml_init(tmp_ip);
+                if (tmp_ctx) {
+                    ggml_tensor * tmp_dev = ggml_dup_tensor_layout_public(tmp_ctx, w_cpu);
+                    if (tmp_dev) {
+                        void * tmp_base = ggml_backend_buffer_get_base(tmp_buf);
+                        if (ggml_backend_tensor_alloc(tmp_buf, tmp_dev, tmp_base) == GGML_STATUS_SUCCESS) {
+                            // This applies any device-side packing/transform for quantized layouts:
+                            ggml_backend_tensor_set(tmp_dev, w_cpu->data, 0, ggml_nbytes(w_cpu));
+                            // Now copy the transformed device bytes into our arena twin:
+                            ggml_backend_tensor_copy(tmp_dev, w_gpu);
+                            transformed_ok = true;
+                        }
+                    }
+                    ggml_free(tmp_ctx);
+                }
+                ggml_backend_buffer_free(tmp_buf);
+            }
+        }
+    }
+    if (!transformed_ok) {
+        // Fallback: direct H2D copy (works for plain FP types; may be suboptimal for some Q layouts)
+        ggml_backend_tensor_copy(w_cpu, w_gpu);
+    }
 
     // Register mappings
     gpu2cpu.emplace(w_gpu, w_cpu);
@@ -518,6 +632,8 @@ ggml_tensor * parameter_offloader::cpu_tensor_to_arena(ggml_tensor * w_cpu)
     patch_model_refs_for(model, w_cpu, w_gpu);
     return w_gpu;
 }
+
+
 
 // Return true if node 't' reads any tracked GPU twin; optionally output the
 // feed-order index you should advance to (choose the furthest-ahead in ring).
@@ -553,7 +669,7 @@ bool parameter_offloader::node_reads_tracked_weight(ggml_tensor * t, int * out_i
         }
 
         // pick “furthest ahead” vs the last used index to keep monotonic progress
-        const int last = used_mod.load(std::memory_order_relaxed);
+        const int last = tensor_idx_used_mod.load(std::memory_order_relaxed);
         if (last < 0)
             continue;
 
@@ -570,15 +686,87 @@ bool parameter_offloader::node_reads_tracked_weight(ggml_tensor * t, int * out_i
 
 // Ask-phase: only opt in for nodes that read any tracked weight.
 // Keeps batching intact for other nodes.
-bool parameter_offloader::wants_observe(ggml_tensor * t)
+bool parameter_offloader::wants_observe(ggml_tensor * node)
 {
-    return node_reads_tracked_weight(t, /*out_idx*/ nullptr);
+#ifdef LLAMA_CHECK_NODES
+    const char * name = ggml_get_name(node);
+    for (int i = 0; i < GGML_MAX_SRC; ++i)
+    {
+        ggml_tensor * src_node = node->src[i];
+        if (!src_node)
+            break;
+
+        while (src_node->view_src)
+            src_node = src_node->view_src;
+
+        const char * src_name = ggml_get_name(src_node);
+        ggml_backend_buffer_t buf = src_node->buffer;
+
+        // skip true model weights that we track (either CPU weight or its GPU twin)
+        bool is_tracked_weight =
+            (cpu2gpu.find(src_node) != cpu2gpu.end()) ||
+            (gpu2cpu.find(src_node) != gpu2cpu.end());
+
+        if (!is_tracked_weight)
+        //if (!node_reads_tracked_weight(src_node, /*out_idx*/ nullptr))
+        {
+            // 1) Is this source’sp buffer literally the same buffer handle as your weight arena?
+            if (src_node->buffer == arena) {
+                LLAMA_LOG_WARN("[ACT-IN-WEIGHT-ARENA] node=%s tens=%s ptr=%p\n",
+                            ggml_get_name(node)?: "(unnamed)",
+                            ggml_get_name(src_node)?: "(unnamed)", src_node->data);
+            }
+
+            // 2) Does this pointer fall inside your arena’s [base, base+cap)?
+            char *q = (char*) src_node->data;
+            if (q && q >= base && q < base + cap) {
+                LLAMA_LOG_WARN("[ACT-IN-WEIGHT-RANGE] node=%s tens=%s ptr=%p (inside [%p, %p))\n",
+                            ggml_get_name(node)?: "(unnamed)",
+                            ggml_get_name(src_node)?: "(unnamed)", src_node->data, base, base + cap);
+            }
+        }
+
+#ifdef LLAMA_PRINT_ALL_NODES
+        //LLAMA_LOG_INFO("[SRC node=%s src=%d tens=%s buf=%s op=%s host=%d ptr=%p]\n",
+        //        name ? name : "(unnamed)",
+        //        i, n ? n : "(unnamed)", ggml_backend_buffer_name(buf), ggml_op_to_string(node->op), (int)ggml_backend_buffer_is_host(buf), src_node->data);
+        // Column widths; adjust as needed
+#define NAME_W 30
+#define SRC_W   2
+#define TENS_W 30
+#define BUF_W  16
+#define OP_W   24
+#define PTR_W  18  // width for %p column; %p length may vary by platform
+#define NN(s) ((s) ? (s) : "(unnamed)")
+        LLAMA_LOG_INFO(
+            "[SRC  node=%-*s src=%*d src_name=%-*s buf=%-*s op=%-*s src_op=%-*s host=%d ptr=%*p]\n",
+            NAME_W, NN(name),                        // node
+            SRC_W,  i,                               // src
+            TENS_W, NN(src_name),                    // src_name
+            BUF_W,  ggml_backend_buffer_name(buf),   // buf
+            OP_W,   ggml_op_to_string(node->op),     // op
+            OP_W,   ggml_op_to_string(src_node->op), // src_op
+            (int)ggml_backend_buffer_is_host(buf),   // host
+            PTR_W,  (void*)src_node->data            // ptr
+        );
+#endif /* #ifdef LLAMA_PRINT_ALL_NODES */
+#ifdef LLAMA_CHECK_NON_FINITES
+        if (finite_check_node(src_node, true))
+            run_probe_rules_for_bad_source(src_node, true);
+#endif
+    }
+#ifdef LLAMA_CHECK_NON_FINITES
+    //checking the node itself pre-compute is meaningless
+    //finite_check_node(node, true);
+#endif
+#endif /* #ifdef LLAMA_CHECK_NODES */
+    return node_reads_tracked_weight(node, /*out_idx*/ nullptr);
 }
+
 
 // Called when a node we opted into observing is actually executed.
 // Pick the “latest” managed weight used by this node and advance your
-// used_mod/used_epoch/used_seq just like you do now.
-
+// tensor_idx_used_mod/tensor_idx_used_epoch/tensor_idx_used_seq just like you do now.
 void parameter_offloader::on_eval_tensor(ggml_tensor * node)
 {
     int idx = -1;
@@ -586,9 +774,11 @@ void parameter_offloader::on_eval_tensor(ggml_tensor * node)
         return;
 
     // for readable logs
-    const int N = (int)gpu_tensors_in_order.size();
+    const int tensor_count = (int)gpu_tensors_in_order.size();
+    //if (idx == tensor_count - 1)
+    //    LLAMA_LOG_INFO("%s got to idx %d\n", __func__, idx);
     auto ring_dist = [&](int from, int to) -> int {
-        return (to - from + N) % N; // forward distance in ring
+        return (to - from + tensor_count) % tensor_count; // forward distance in ring
     };
 
     // Resolve the GPU twin + its CPU source so we can print name/size/offset
@@ -604,62 +794,119 @@ void parameter_offloader::on_eval_tensor(ggml_tensor * node)
     const int bar       = (idx < (int)ready_after.size()) ? ready_after[idx] : -1;
     const int win       = (bar >= 0 ? ring_dist(idx, bar) : -1); // how many slots ahead are copyable
 
-    int last  = used_mod.load(std::memory_order_relaxed);
-    int epoch = used_epoch.load(std::memory_order_relaxed);
+    int last  = tensor_idx_used_mod.load(std::memory_order_relaxed);
+    int epoch = tensor_idx_used_epoch.load(std::memory_order_relaxed);
 
     if (last >= 0 && ((idx - last) < 0)) {
         ++epoch;
-        used_epoch.store(epoch, std::memory_order_relaxed);
+        tensor_idx_used_epoch.store(epoch, std::memory_order_relaxed);
     }
 
-    used_mod.store(idx, std::memory_order_release);
-    const long long seq = (long long)epoch * (long long)N + idx;
-    used_seq.store(seq, std::memory_order_release);
+    tensor_idx_used_mod.store(idx, std::memory_order_release);
+    const long long seq = (long long)epoch * (long long)tensor_count + idx;
+    tensor_idx_used_seq.store(seq, std::memory_order_release);
 
-    // ---- DEBUG INTEGRITY CHECK: hash CPU vs GPU bytes ----
-    if (false)
+#ifdef LLAMA_CHECK_WEIGHTS
+    //hash_compare_tensor(w_cpu, w_gpu, base, idx);
     {
-        // FNV-1a 64-bit (simple, fast)
-        auto fnv1a64 = [](const void * p, size_t n) -> uint64_t
+        const size_t nbytes_g = ggml_nbytes(w_gpu);
+        std::vector<uint8_t> tmp_(nbytes_g);
+        // copy device -> host for the logical bytes
+        ggml_backend_tensor_get(w_gpu, tmp_.data(), 0, nbytes_g);
+        if (gpu_hashes[w_gpu] != fnv1a64(tmp_.data(), nbytes_g))
         {
-            const uint8_t * b = static_cast<const uint8_t *>(p);
-            uint64_t h = 1469598103934665603ull;        // offset basis
-            const uint64_t prime = 1099511628211ull;
-            for (size_t i = 0; i < n; ++i)
-            {
-                h ^= b[i];
-                h *= prime;
-            }
-            return h;
-        };
-
-        // CPU view
-        uint64_t h_cpu = 0;
-        if (w_cpu && w_cpu->data && nbytes)
-            h_cpu = fnv1a64(w_cpu->data, nbytes);
-
-        // GPU snapshot -> host and hash
-        uint64_t h_gpu = 0;
-        if (nbytes)
-        {
-            std::vector<uint8_t> tmp(nbytes);
-            // copy device -> host for the logical bytes
-            ggml_backend_tensor_get(w_gpu, tmp.data(), 0, nbytes);
-            h_gpu = fnv1a64(tmp.data(), nbytes);
-        }
-
-        if (h_cpu != h_gpu) {
             LLAMA_LOG_WARN(
-                "[MISMATCH] idx=%d name=%s off=%zu bytes=%zu h_cpu=%016llx h_gpu=%016llx\n",
-                idx, name ? name : "(unnamed)", (size_t)off, (size_t)nbytes,
-                (unsigned long long)h_cpu, (unsigned long long)h_gpu
+                "[MISMATCH] idx=%d name=%s off=%zu bytes=%zu\n",
+                idx, name ? name : "(unnamed)", (size_t)off, (size_t)nbytes_g
             );
         }
+#ifdef LLAMA_CHECK_WEIGHTS_VERBOSE
+        else
+        {
+            LLAMA_LOG_INFO(
+                "[GOOD] idx=%d name=%s off=%zu bytes=%zu\n",
+                idx, name ? name : "(unnamed)", (size_t)off, (size_t)nbytes_g
+            );
+        }
+#endif
     }
-    // ---- DEBUG INTEGRITY CHECK: hash CPU vs GPU bytes ----
+#endif
+
+#ifdef LLAMA_CHECK_NON_FINITES
+    finite_check_node(node);
+
+    if (const char *nm = ggml_get_name(node)) {
+        if (strncmp(nm, "fattn_mla", 9) == 0) {
+            // node has just been computed and flagged non-finite in your log
+            // inspect its inputs *post*-compute too:
+
+            ggml_tensor * w = node->src[0]; // V weight
+            ggml_tensor * x = node->src[1]; // FA output (permuted)
+
+            // Peel views for clarity (optional)
+            ggml_tensor * pw = w;
+            while (pw && pw->view_src)
+                pw = pw->view_src;
+
+            ggml_tensor * px = x;
+            while (px && px->view_src)
+                px = px->view_src;
+
+            // Check the FA output that feeds the GEMM:
+            if (x)
+                finite_check_node(x);    // now meaningful (x exists & is computed)
+
+            // Sanity: weight should be finite (it’s constant), but assert anyway
+            if (w)
+                finite_check_node(w);
+        }
+    }
+#endif
 
     // Verbose, but super handy while tuning:
-    //LLAMA_LOG_INFO("[R.%d.%d.%d.%lld.%d]", idx, bar, win, seq, epoch);
+#ifdef LLAMA_LOG_READS
+    LLAMA_LOG_INFO("[R.%d.%d.%d.%lld.%d]", idx, bar, win, seq, epoch);
+#endif
+
+#if defined(LLAMA_DIAGNOSE_COPY)
+    int i = (tensor_idx_loaded.load(std::memory_order_relaxed) + 1 + (int)tensor_count) % (int)tensor_count;
+    
+    for (;;)
+    {
+        // snapshot the current reader sequence
+        long long cur_seq = tensor_idx_used_seq.load(std::memory_order_acquire);
+
+        {
+            const int r_idx = (int)(cur_seq % tensor_count); // current reader index
+            const int bar   = ready_after[r_idx];            // last copyable index while r is read
+            const int di    = ring_dist(r_idx, i);           // distance from reader to copy slot
+            const int dbar  = ring_dist(r_idx, bar);         // distance from reader to barrier
+
+            //bool allowed = (di <= dbar);                // push copies up to and including 'bar'
+            bool allowed = (di <= dbar) && (di <= LLAMA_DIAGNOSE_COPY);
+
+            if (!allowed)
+            {
+                //LLAMA_LOG_INFO("[NO_COPY.%d.%d.%d.%d]", r_idx, bar, di, dbar);
+                break;
+            }
+        }
+
+        // Safe to copy slot i
+        ggml_tensor *w_cpu_ = cpu_tensors_in_order[i];
+        ggml_tensor *w_gpu_ = gpu_tensors_in_order[i];
+        //ggml_backend_tensor_copy(w_cpu_, w_gpu_);
+        copy_host_to_arena_with_transform(w_cpu_, w_gpu_);
+#ifdef LLAMA_LOG_COPIES
+        LLAMA_LOG_INFO("[C.%d]", i);
+#endif
+        tensor_idx_loaded.store(i, std::memory_order_release);
+
+        // advance ring
+        i = (i + 1) % (int)tensor_count;
+    }
+    //LLAMA_LOG_INFO("\n", i);
+#endif /* defined(LLAMA_DIAGNOSE_COPY) */
 
     // wake streamer
     node_cv_.notify_all();
@@ -688,34 +935,35 @@ void parameter_offloader::stream_worker()
     };
 
     // next slot to copy
-    int i = (loaded_idx.load(std::memory_order_relaxed) + 1 + (int)tensor_count) % (int)tensor_count;
+    int i = (tensor_idx_loaded.load(std::memory_order_relaxed) + 1 + (int)tensor_count) % (int)tensor_count;
 
-    for (;;) {
+    for (;;)
+    {
         if (stop_stream.load(std::memory_order_acquire))
             return;
 
         // snapshot the current reader sequence
-        long long cur_seq = used_seq.load(std::memory_order_acquire);
+        long long cur_seq = tensor_idx_used_seq.load(std::memory_order_acquire);
 
         if (cur_seq < 0) {
             // No reader yet (startup). Prefill opportunistically without waiting.
             // (If you want to limit prefill, add a soft cap here.)
         } else {
-            const int N    = (int)tensor_count;
-            const int r    = (int)(cur_seq % N);           // current reader index
-            const int bar  = ready_after[r];               // last copyable index while r is read
-            const int di   = ring_dist(r, i);              // distance from reader to copy slot
-            const int dbar = ring_dist(r, bar);            // distance from reader to barrier
+            const int r_idx = (int)(cur_seq % tensor_count);// current reader index
+            const int bar   = ready_after[r_idx];           // last copyable index while r_idx is read
+            const int di    = ring_dist(r_idx, i);          // distance from reader to copy slot
+            const int dbar  = ring_dist(r_idx, bar);        // distance from reader to barrier
 
-            // Allowed window is (r, ..., bar) inclusive. di == 0 means "r" itself (disallowed).
+            // Allowed window is (r_idx, ..., bar) inclusive. di == 0 means "r_idx" itself (disallowed).
             bool allowed = (di != 0) && (di <= dbar);
 
-            if (!allowed) {
-                // Not safe to copy this slot yet; wait until reader advances (used_seq changes)
+            if (!allowed)
+            {
+                // Not safe to copy this slot yet; wait until reader advances (tensor_idx_used_seq changes)
                 std::unique_lock<std::mutex> lk(node_mu_);
                 node_cv_.wait(lk, [&]{
                     return stop_stream.load(std::memory_order_acquire) ||
-                           used_seq.load(std::memory_order_acquire) != cur_seq;
+                           tensor_idx_used_seq.load(std::memory_order_acquire) != cur_seq;
                 });
                 if (stop_stream.load(std::memory_order_acquire))
                     return;
@@ -727,15 +975,18 @@ void parameter_offloader::stream_worker()
         // Safe to copy slot i
         ggml_tensor *w_cpu = cpu_tensors_in_order[i];
         ggml_tensor *w_gpu = gpu_tensors_in_order[i];
-        ggml_backend_tensor_copy(w_cpu, w_gpu);
-        //LLAMA_LOG_INFO("[C.%d]", i);
-        last_streamed_gpu = w_gpu;
-        loaded_idx.store(i, std::memory_order_release);
+        //ggml_backend_tensor_copy(w_cpu, w_gpu);
+        copy_host_to_arena_with_transform(w_cpu, w_gpu);
+#ifdef LLAMA_LOG_COPIES
+        LLAMA_LOG_INFO("[C.%d]", i);
+#endif
+        tensor_idx_loaded.store(i, std::memory_order_release);
 
         // advance ring
         i = (i + 1) % (int)tensor_count;
     }
 }
+
 
 void parameter_offloader::print_snapshot()
 {
@@ -771,7 +1022,7 @@ void parameter_offloader::print_snapshot()
 
 
 // signature must match ggml_backend_sched_eval_callback
-bool llama_offloader_eval_cb(ggml_tensor * t, bool ask, void * ud)
+bool llama_offloader_eval_cb(ggml_tensor * node, bool ask, void * ud)
 {
     struct parameter_offloader * po = static_cast<parameter_offloader *>(ud);
     if (!po)
@@ -782,13 +1033,13 @@ bool llama_offloader_eval_cb(ggml_tensor * t, bool ask, void * ud)
     {
         // Only observe matmuls during warm-up to keep batching intact
         if (ask)
-            return t->op == GGML_OP_MUL_MAT;
+            return node->op == GGML_OP_MUL_MAT;
 
         // find the real model weight among sources
         ggml_tensor * w = nullptr;
         for (int k = 0; k < GGML_MAX_SRC; ++k)
         {
-            ggml_tensor * s = t->src[k];
+            ggml_tensor * s = node->src[k];
             if (!s)
                 break;
             ggml_tensor * p = s;
@@ -812,10 +1063,57 @@ bool llama_offloader_eval_cb(ggml_tensor * t, bool ask, void * ud)
     }
 
     // Only return true for weights you actually track; keeps batching intact
-    if (ask)
-        return po->wants_observe(t);
-    
-    // Node is being executed
-    po->on_eval_tensor(t);
-    return true;           // return false to cancel compute
+    if (ask) {
+        return po->wants_observe(node);
+    } else {
+        // === POST-COMPUTE ===
+        po->on_eval_tensor(node);  // keep your current bookkeeping first
+
+#ifdef LLAMA_CHECK_NON_FINITES
+        // 3) alias/overlap guard for view/reshape/concat/permutation outputs
+        auto ranges_overlap = [](char *a0, size_t an, char *b0, size_t bn) -> bool {
+            char *a1 = a0 + an, *b1 = b0 + bn;
+            return !(a1 <= b0 || b1 <= a0);
+        };
+        auto logical_nbytes = [](const ggml_tensor *t) -> size_t {
+            return ggml_nbytes(t);
+        };
+
+        switch (node->op) {
+            case GGML_OP_CONCAT:
+            case GGML_OP_RESHAPE:
+            case GGML_OP_PERMUTE:
+            case GGML_OP_VIEW: {
+                char  * outp = (char *) node->data;
+                size_t on    = logical_nbytes(node);
+                for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                    ggml_tensor * s = node->src[k];
+                    if (!s) break;
+                    while (s->view_src) s = s->view_src;
+                    char  * inp = (char *) s->data;
+                    size_t in   = logical_nbytes(s);
+                    if (outp && inp && ranges_overlap(outp, on, inp, in)) {
+                        LLAMA_LOG_WARN("[ALIAS-OVERLAP] op=%s node=%s out=%p in=%p",
+                                       ggml_op_to_string(node->op),
+                                       ggml_get_name(node) ? ggml_get_name(node) : "(unnamed)",
+                                       outp, inp);
+                    }
+                }
+            } break;
+            default: break;
+        }
+
+        // Optional: when fattn_mla-* trips, check its RHS input post-compute
+        if (const char * nm = ggml_get_name(node)) {
+            if (strncmp(nm, "fattn_mla", 9) == 0) {
+                ggml_tensor * rhs = node->src[1];
+                if (rhs) (void) finite_check_node(rhs, /*log_if_bad=*/true);
+            }
+        }
+
+        // your diagnose-copy/read (if any), then:
+        // node_cv_.notify_all();
+#endif
+        return true;
+    }
 }

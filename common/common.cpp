@@ -897,6 +897,14 @@ std::string fs_get_cache_file(const std::string & filename) {
 #include "../src/llama-context.h"
 #include "../src/llama-parameter-offloader.h"
 
+//#define DISABLE_OFFLOADER 1
+//#define LLAMA_SLICE_ONLY_DIAGNOSTIC 1
+
+#ifdef LLAMA_SLICE_ONLY_DIAGNOSTIC
+#define DISABLE_OFFLOADER 1
+#include "../src/llama-offloader-diagnostic.h"
+#endif
+
 struct common_init_result common_init_from_params(common_params & params) {
     common_init_result iparams;
     auto mparams = common_model_params_to_llama(params);
@@ -912,9 +920,24 @@ struct common_init_result common_init_from_params(common_params & params) {
 
     auto cparams = common_context_params_to_llama(params);
 
-    auto * param_off = new parameter_offloader(model);
+#if defined(DISABLE_OFFLOADER)
+    parameter_offloader * param_off = nullptr;
+#else
+    parameter_offloader * param_off = new parameter_offloader(model);
     cparams.cb_eval = llama_offloader_eval_cb;
     cparams.cb_eval_user_data = param_off;
+#endif
+#if defined(LLAMA_SLICE_ONLY_DIAGNOSTIC)
+    // do NOT create parameter_offloader
+    // do NOT patch refs
+    // just install the slice-only callback
+    auto * slice_diag = new slice_only_diag();
+    // optional: set this true to test “don’t cut inside attention/PE”
+    slice_diag->avoid_attn_pe = false;  // start with false to match your current slicing
+
+    cparams.cb_eval = llama_slice_only_eval_cb;
+    cparams.cb_eval_user_data = slice_diag;
+#endif
 
     llama_context * lctx = llama_init_from_model(model, cparams);
     if (lctx == NULL) {
@@ -1015,6 +1038,7 @@ struct common_init_result common_init_from_params(common_params & params) {
     }
 
     // ---- Phase A: collect true first-use order with a single decode ----
+#ifndef DISABLE_OFFLOADER
     {
         // pick BOS if available
         llama_token tok = 0;
@@ -1060,6 +1084,7 @@ struct common_init_result common_init_from_params(common_params & params) {
     }
     LLAMA_LOG_INFO("%s after parameter_offloader->init()\n", __func__);
     // === VRAM offload: end ===
+#endif
 
     // initialize once
     for (llama_token i = 0; i < llama_vocab_n_tokens(vocab); i++) {
