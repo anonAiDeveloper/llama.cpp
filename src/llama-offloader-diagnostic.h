@@ -248,7 +248,7 @@ void hash_compare_tensor(ggml_tensor * w_cpu, ggml_tensor * w_gpu, char * base, 
 }
 
 //returns true if non-finite is detected, max_bytes defaults to 1 MiB
-bool finite_check_node(ggml_tensor * node, bool ask = false, size_t max_bytes = 1ull << 30)
+bool finite_check_node(ggml_tensor * node, bool ask = false, size_t max_bytes = 1ull << 20)
 {
     const size_t nbytes  = ggml_nbytes(node);
     const ggml_type t    = node->type;

@@ -45,12 +45,6 @@ public:
     std::vector<ggml_tensor*>             gpu_tensors_in_order;  // feed-order list of GPU twins
     std::unordered_map<ggml_tensor*, int> gpu2index;         // GPU twin -> feed-order index
 
-    std::atomic<int> tensor_idx_loaded{ -1 };  // highest index copied into arena
-
-    std::atomic<int> tensor_idx_used_mod{-1};         // last seen feed index this pass
-    std::atomic<int> tensor_idx_used_epoch{0};        // increments when index decreases (wrap)
-    std::atomic<long long> tensor_idx_used_seq{ -1 }; // tensor_idx_used_epoch*tensor_count + tensor_idx_used_mod
-
 
     // Fast lookups
     // GPU->CPU: answer “what CPU weight backs this GPU twin?”
@@ -82,7 +76,7 @@ public:
 
     bool node_reads_tracked_weight(ggml_tensor * t, int * out_idx);
     bool wants_observe(ggml_tensor * node);
-    void on_eval_tensor(ggml_tensor * node);
+    bool on_eval_tensor(ggml_tensor * node);
 
     // start/stop the streaming worker
     void start_streamer();
@@ -90,6 +84,16 @@ public:
 
     void print_snapshot();
 private:
+
+    //std::atomic<int> tensor_idx_loaded{ -1 };  // highest index copied into arena
+    std::atomic<int>       tensor_idx_copied_mod   { -1 };
+    std::atomic<int>       tensor_idx_copied_epoch {  0 };
+    std::atomic<long long> tensor_idx_copied_seq   { -1 };
+
+    std::atomic<int>       tensor_idx_used_mod{-1};         // last seen feed index this pass
+    std::atomic<int>       tensor_idx_used_epoch{0};        // increments when index decreases (wrap)
+    std::atomic<long long> tensor_idx_used_seq{ -1 }; // tensor_idx_used_epoch*tensor_count + tensor_idx_used_mod
+
     std::mutex              node_mu_;
     std::condition_variable node_cv_;
 
