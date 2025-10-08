@@ -142,3 +142,22 @@ extern "C"
 bool ggml_backend_buffer_is_cuda_arena_public(ggml_backend_buffer_t buffer) {
     return ggml_backend_buffer_is_cuda_arena(buffer);   // call the static one
 }
+
+void ggml_cuda_arena_tensor_write_raw(ggml_backend_buffer_t b,
+                                      ggml_tensor * t,
+                                      const void * src,
+                                      size_t nbytes) {
+    cuda_arena * ctx = (cuda_arena *) b->context;
+    cudaSetDevice(ctx->device);
+
+    // Safety: destination must belong to this arena
+    GGML_ASSERT(t->buffer == b);
+
+    // And we must not write past the device allocation for this tensor
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(b);
+    const size_t dev_bytes = ggml_backend_buft_get_alloc_size(buft, t);
+    GGML_ASSERT(nbytes <= dev_bytes);
+
+    // Raw H2D copy of the entire packed region (padded tail included)
+    cudaMemcpy(t->data, src, nbytes, cudaMemcpyHostToDevice);
+}

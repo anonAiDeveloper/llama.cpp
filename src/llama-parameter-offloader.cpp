@@ -34,11 +34,36 @@
 //#define LLAMA_LOG_COPIES 1
 /////////////////////////////////////
 
+#ifndef GGML_USE_CUDA
+#warning "WARNING! GGML_USE_CUDA is not defined!"
+#endif
 #include "llama-offloader-diagnostic.h"
 
 static inline size_t align_up(size_t x, size_t a)
 {
     return (x + (a - 1)) & ~(a - 1);
+}
+
+inline bool parameter_offloader::no_transform_needed_for_backend_(const ggml_tensor *t) const {
+    const size_t logical   = ggml_nbytes(t);
+    const size_t dev_bytes = ggml_backend_buft_get_alloc_size(buft, t);
+
+    switch (t->type) {
+        case GGML_TYPE_F32:
+        case GGML_TYPE_F16:
+        case GGML_TYPE_BF16:
+        case GGML_TYPE_I8:
+        case GGML_TYPE_I16:
+        case GGML_TYPE_I32:
+        case GGML_TYPE_I64:
+        case GGML_TYPE_F64:
+            return dev_bytes == logical;   // safe: same bytes, no backend packing
+        default:
+            // If you *know* a quantized type for your CUDA kernels matches host layout,
+            // add it here and keep the dev_bytes==logical guard:
+            // case GGML_TYPE_Q8_0: return dev_bytes == logical;
+            return false;
+    }
 }
 
 parameter_offloader::parameter_offloader(llama_model  * model)
@@ -52,9 +77,9 @@ parameter_offloader::parameter_offloader(llama_model  * model)
 
     weight_set.clear();
     weight_set.reserve(model->tensors_by_name.size());
-    for (const auto & kv : model->tensors_by_name) {
-        if (kv.second) weight_set.insert(kv.second);
-    }
+    for (const auto & kv : model->tensors_by_name)
+        if (kv.second)
+            weight_set.insert(kv.second);
 }
 
 void parameter_offloader::init(
@@ -79,12 +104,12 @@ void parameter_offloader::init(
         cpu2gpu.reserve(4096);
     }
 
-    // Mirror weights exactly in collected first-use order
-    if (collected_order.empty())
-        LLAMA_LOG_WARN("%s: no weights collected\n", __func__);
-    else
-        for (ggml_tensor * w_cpu : collected_order)
-            (void) cpu_tensor_to_arena(w_cpu);
+    const size_t packed = transform_all_cpu_weights_to_device_layout();
+    LLAMA_LOG_INFO("host-packing: %zu/%zu weights packed on host\n",
+                packed, collected_order.size());
+
+    for (ggml_tensor * w_cpu : collected_order)
+        (void) cpu_tensor_to_arena(w_cpu);
 
     //print_model_tensor_stats(model);
 
@@ -300,8 +325,9 @@ void parameter_offloader::init(
     //streamer thread disabled during debug mode, so get things started with the first copy
     ggml_tensor *w_cpu = cpu_tensors_in_order[0];
     ggml_tensor *w_gpu = gpu_tensors_in_order[0];
-    //ggml_backend_tensor_copy(w_cpu, w_gpu);
-    copy_host_to_arena_with_transform(w_cpu, w_gpu);
+
+    upload_weight_auto(w_cpu, w_gpu);
+
 
     //this is not out of range, as its meant to go over to represent wrap-around
     //tensor_idx_loaded.store(tensor_count);
@@ -318,7 +344,8 @@ void parameter_offloader::init(
         peak = *std::max_element(end.begin(), end.end());
     LLAMA_LOG_INFO("vram-offload: scheduled %zu tensors; peak logical occupancy ~%zu bytes\n", tensor_count, peak);
 }
-parameter_offloader::~parameter_offloader() {
+parameter_offloader::~parameter_offloader()
+{
     stop_streamer_join();
     if (ctx_gpu_twins) {
         ggml_free(ctx_gpu_twins);
@@ -328,7 +355,78 @@ parameter_offloader::~parameter_offloader() {
         ggml_backend_buffer_free(arena);
         arena = nullptr;
     }
+    for (auto b : owned_host_buffers_)
+        if (b)
+            ggml_backend_buffer_free(b);
+    owned_host_buffers_.clear();
 }
+
+size_t parameter_offloader::transform_all_cpu_weights_to_device_layout()
+{
+    size_t packed = 0;
+    // Optional: skip obvious non-weights or already-packed
+    for (ggml_tensor * w_cpu : collected_order)
+        if (transform_cpu_tensor_to_device_layout(w_cpu))
+            ++packed;
+    return packed;
+}
+
+bool parameter_offloader::transform_cpu_tensor_to_device_layout(ggml_tensor * w_cpu) {
+    if (!w_cpu) return false;
+
+    // only real host-backed weights (usually file-mapped)
+    if (!(w_cpu->buffer && ggml_backend_buffer_is_host(w_cpu->buffer))) return false;
+
+    // already packed?
+    if (host_packed_.count(w_cpu)) return false;
+
+    ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    GGML_ASSERT(dev);
+    ggml_backend_buffer_type_t dev_buft = ggml_backend_dev_buffer_type(dev);
+
+    const size_t logical   = ggml_nbytes(w_cpu);
+    const size_t dev_bytes = ggml_backend_buft_get_alloc_size(dev_buft, w_cpu);
+
+    // Allocate a host RAM buffer sized like the device allocation so we can memcpy the whole region later.
+    ggml_backend_buffer_type_t host_buft = ggml_backend_cpu_buffer_type(); // use pinned-host type if you have one
+    ggml_backend_buffer_t host_buf = ggml_backend_buft_alloc_buffer(host_buft, dev_bytes);
+    GGML_ASSERT(host_buf);
+    uint8_t * host_base = (uint8_t *) ggml_backend_buffer_get_base(host_buf);
+
+    // Create a temporary device tensor to invoke the backend’s packing path
+    ggml_backend_buffer_t tmp_dev_buf = ggml_backend_buft_alloc_buffer(dev_buft, dev_bytes);
+    GGML_ASSERT(tmp_dev_buf);
+
+    ggml_init_params tmp_ip{ 64*1024, nullptr, true };
+    ggml_context * tmp_ctx = ggml_init(tmp_ip);
+    GGML_ASSERT(tmp_ctx);
+
+    ggml_tensor * tmp_dev = ggml_dup_tensor_layout_public(tmp_ctx, w_cpu);
+    GGML_ASSERT(tmp_dev);
+    GGML_ASSERT(ggml_backend_tensor_alloc(tmp_dev_buf, tmp_dev,
+                ggml_backend_buffer_get_base(tmp_dev_buf)) == GGML_STATUS_SUCCESS);
+
+    // H2D: this call triggers CUDA-side transform/packing for the tensor layout
+    ggml_backend_tensor_set(tmp_dev, w_cpu->data, 0, logical);
+
+    // D2H: read back ONLY the logical payload (tensor_get is bounded by ggml_nbytes())
+    ggml_backend_tensor_get(tmp_dev, host_base, 0, logical);
+
+    // Zero-fill the padded tail so later H2D memcpy can copy dev_bytes safely
+    if (dev_bytes > logical) {
+        std::memset(host_base + logical, 0, dev_bytes - logical);
+    }
+
+    // Cleanup temps
+    ggml_free(tmp_ctx);
+    ggml_backend_buffer_free(tmp_dev_buf);
+
+    // Remember the packed bytes for this weight
+    host_packed_.emplace(w_cpu, PackedHostBytes{ host_buf, host_base, dev_bytes });
+    return true;
+}
+
+
 
 void patch_model_refs_for(llama_model * model, ggml_tensor * w_cpu, ggml_tensor * w_gpu) {
     // same matching rule you used: pointer match, else name match
@@ -567,8 +665,9 @@ ggml_tensor * parameter_offloader::cpu_tensor_to_arena(ggml_tensor * w_cpu)
     // Bind GPU twin into the arena at [base + off]
     GGML_ASSERT(ggml_backend_tensor_alloc(arena, w_gpu, base + off) == GGML_STATUS_SUCCESS);
 
-    // Always upload via transform-aware path (CPU -> stock CUDA tmp -> D2D into arena)
-    copy_host_to_arena_with_transform(w_cpu, w_gpu);
+    // Upload
+    upload_weight_auto(w_cpu, w_gpu);
+
 
     // Register mappings
     gpu2cpu.emplace(w_gpu, w_cpu);
@@ -598,7 +697,37 @@ ggml_tensor * parameter_offloader::cpu_tensor_to_arena(ggml_tensor * w_cpu)
     return w_gpu;
 }
 
+inline void parameter_offloader::upload_weight_auto(ggml_tensor *w_cpu, ggml_tensor *w_gpu) {
+    GGML_ASSERT(w_cpu && w_gpu);
+    GGML_ASSERT(ggml_backend_buffer_is_host(w_cpu->buffer));
+    GGML_ASSERT(w_gpu->buffer == arena);
 
+    // Path B: already host-prepacked into device layout (must copy full dev_bytes)
+    auto it = host_packed_.find(w_cpu);
+    if (it != host_packed_.end()) {
+        // Prefer raw arena H2D copy to include the packed tail:
+        if (ggml_backend_buffer_is_cuda_arena_public(arena)) {
+            const size_t dev_bytes = ggml_backend_buft_get_alloc_size(buft, w_cpu);
+            ggml_cuda_arena_tensor_write_raw(arena, w_gpu, it->second.base, dev_bytes);
+            //ggml_backend_tensor_copy(w_cpu, w_gpu);
+        } else {
+            // Non-CUDA arenas: best we can do is logical; consider adding analogous backends.
+            const size_t logical = ggml_nbytes(w_gpu);
+            ggml_backend_tensor_set(w_gpu, it->second.base, 0, logical);
+        }
+        return;
+    }
+
+    // Path A: layout-identical → simple H2D of logical bytes
+    if (no_transform_needed_for_backend_(w_cpu)) {
+        const size_t logical = ggml_nbytes(w_cpu);
+        ggml_backend_tensor_set(w_gpu, w_cpu->data, 0, logical);
+        return;
+    }
+
+    // Path C: backend must pack/transform
+    copy_host_to_arena_with_transform(w_cpu, w_gpu);
+}
 
 
 // Return true if node 't' reads any tracked GPU twin; optionally output the
@@ -743,15 +872,12 @@ bool parameter_offloader::on_eval_tensor(ggml_tensor * node)
     const int tensor_count = (int)gpu_tensors_in_order.size();
     //if (idx == tensor_count - 1)
     //    LLAMA_LOG_INFO("%s got to idx %d\n", __func__, idx);
-    auto ring_dist = [&](int from, int to) -> int {
-        return (to - from + tensor_count) % tensor_count; // forward distance in ring
-    };
 
     // Resolve the GPU twin + its CPU source so we can print name/size/offset
     ggml_tensor * w_gpu = gpu_tensors_in_order[idx];
     ggml_tensor * w_cpu = gpu2cpu[w_gpu];
 
-    const char * name   = ggml_get_name(w_gpu); // you mirrored names when duplicating
+    const char * name   = ggml_get_name(w_gpu);
     const size_t off    = (size_t)((char *) w_gpu->data - base);
     const size_t bytes  = ggml_backend_buft_get_alloc_size(buft, w_cpu);
     const size_t nbytes = ggml_nbytes(w_cpu);
@@ -853,6 +979,9 @@ bool parameter_offloader::on_eval_tensor(ggml_tensor * node)
 #endif
 
 #if defined(LLAMA_DIAGNOSE_COPY)
+    auto ring_dist = [&](int from, int to) -> int {
+        return (to - from + tensor_count) % tensor_count; // forward distance in ring
+    };
     //int i = (tensor_idx_loaded.load(std::memory_order_relaxed) + 1) % (int)tensor_count;
     int last_cmod = tensor_idx_copied_mod.load(std::memory_order_relaxed);
     int i = (last_cmod + 1) % (int)tensor_count;
@@ -882,9 +1011,10 @@ bool parameter_offloader::on_eval_tensor(ggml_tensor * node)
         // Safe to copy slot i
         ggml_tensor *w_cpu_ = cpu_tensors_in_order[i];
         ggml_tensor *w_gpu_ = gpu_tensors_in_order[i];
-        //ggml_backend_tensor_copy(w_cpu_, w_gpu_);
-        copy_host_to_arena_with_transform(w_cpu_, w_gpu_);
-#ifdef LLAMA_LOG_COPIES
+
+        upload_weight_auto(w_cpu, w_gpu);
+
+        #ifdef LLAMA_LOG_COPIES
         LLAMA_LOG_INFO("[C.%d]", i);
 #endif
         //tensor_idx_loaded.store(i, std::memory_order_release);
@@ -975,8 +1105,9 @@ void parameter_offloader::stream_worker()
         // Safe to copy slot i
         ggml_tensor *w_cpu = cpu_tensors_in_order[i];
         ggml_tensor *w_gpu = gpu_tensors_in_order[i];
-        //ggml_backend_tensor_copy(w_cpu, w_gpu);
-        copy_host_to_arena_with_transform(w_cpu, w_gpu);
+
+        upload_weight_auto(w_cpu, w_gpu);
+
 
         //tensor_idx_loaded.store(i, std::memory_order_release);
         tensor_idx_copied_mod.store(i, std::memory_order_release);

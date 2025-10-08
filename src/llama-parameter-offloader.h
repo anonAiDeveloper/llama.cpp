@@ -36,8 +36,6 @@ public:
     size_t                      cap   = 0;               // ggml_backend_buffer_get_size(arena)
     size_t                      align = 0;               // ggml_backend_buffer_get_alignment(arena)
     size_t                      cur_off = 0;             // next free offset (bytes) inside arena
-    size_t placed_bytes = 0;
-    size_t placed       = 0;
 
     // Scheduling
     std::vector<int>                      ready_after;       // barrier per feed-order index
@@ -56,10 +54,6 @@ public:
     std::unordered_map<ggml_tensor*, uint64_t> gpu_hashes;
 
     std::unordered_set<ggml_tensor*> weight_set; // CPU weight ptrs
-
-    // Runtime trackers (set by your streaming/callback code during inference)
-    ggml_tensor* last_streamed_gpu   = nullptr;  // last tensor copied into VRAM (GPU twin)
-    ggml_tensor* current_in_use_gpu  = nullptr;  // tensor currently being used on GPU
 
     void init(ggml_backend_buffer_t arena,     llama_context_params params,
               ggml_context        * ctx_twins, llama_context      * lctx);
@@ -97,5 +91,28 @@ private:
     std::mutex              node_mu_;
     std::condition_variable node_cv_;
 
+    struct PackedHostBytes {
+        ggml_backend_buffer_t buf = nullptr;  // owns the RAM block
+        void * base = nullptr;                // host pointer to the packed bytes
+        size_t bytes = 0;                     // exact device-sized byte count
+    };
+
+    // Track which host weights have been permanently device-packed
+    std::unordered_map<ggml_tensor*, PackedHostBytes> host_packed_;
+
+    // We own these new host buffers; free them in ~parameter_offloader()
+    std::vector<ggml_backend_buffer_t> owned_host_buffers_;
+
+    // Permanently transform a host tensor to the device-native layout (stored on host).
+    // Returns false if already transformed or if preconditions are not met.
+    bool transform_cpu_tensor_to_device_layout(ggml_tensor * w_cpu);
+
+    // (optional) helper: transform all collected host weights
+    size_t transform_all_cpu_weights_to_device_layout();
+
     void stream_worker();
+    
+    inline bool no_transform_needed_for_backend_(const ggml_tensor *t) const;
+public:
+    inline void upload_weight_auto(ggml_tensor *w_cpu, ggml_tensor *w_gpu);
 };

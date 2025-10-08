@@ -119,8 +119,8 @@ public:
     {
         // After CUDA is initialized (e.g., right after llama_init_from_model):
         ggml_backend_dev_t cuda_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
-        size_t arena_bytes = /* e.g. */ (size_t)2 * 1024ull * 1024ull * 1024ull; // TODO: parametrize
-        ggml_backend_buffer_t arena = ggml_cuda_arena_create_on(cuda_dev, arena_bytes, /*device_ordinal=*/0);
+        size_t arena_bytes = (size_t)2 * 1024ull * 1024ull * 1024ull; // TODO: parametrize
+        /*ggml_backend_buffer_t arena =*/ ggml_cuda_arena_create_on(cuda_dev, arena_bytes, /*device_ordinal=*/0);
     }
 
     // nothing to own; purely stateless
@@ -179,12 +179,10 @@ static bool llama_slice_only_eval_cb(ggml_tensor * t, bool ask, void * ud)
     if (ask) {
         // you can log boundaries for visibility
         bool wants = diag->wants_observe(t);
-        if (wants) {
-            const char * nm = ggml_get_name(t);
-            //LLAMA_LOG_INFO("[BOUNDARY %s%s]",
-            //               nm ? " " : "",
-            //               nm ? nm : "");
-        }
+        //if (wants) {
+        //    const char * nm = ggml_get_name(t);
+        //    LLAMA_LOG_INFO("[BOUNDARY %s%s]", nm ? " " : "", nm ? nm : "");
+        //}
         return wants;
     } else {
         // post-exec: deliberately no bookkeeping, no copying
