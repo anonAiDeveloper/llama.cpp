@@ -279,6 +279,19 @@ extern "C" {
 
     typedef struct ggml_backend_sched * ggml_backend_sched_t;
 
+    // Pretty-print the current backend schedule in execution order.
+    // Pass the original graph that you gave to the scheduler for this run.
+    // If 'out' is NULL, stdout is used.
+    GGML_API void ggml_backend_sched_dump(
+        ggml_backend_sched_t            sched,
+        const struct ggml_cgraph      * graph,  // original graph used to assign/split
+        FILE                          * out);
+
+    // Convenience: set a debug level (0 = off). Level >= 1 enables dump inside assign.
+    GGML_API void ggml_backend_sched_set_debug(
+        ggml_backend_sched_t sched,
+        int                  level);
+
     // Evaluation callback for each node in the graph (set with ggml_backend_sched_set_eval_callback)
     // when ask == true, the scheduler wants to know if the user wants to observe this node
     // this allows the scheduler to batch nodes together in order to evaluate them in a single call
@@ -287,6 +300,9 @@ extern "C" {
     // if the user returns false, the scheduler will cancel the graph compute
     //
     typedef bool (*ggml_backend_sched_eval_callback)(struct ggml_tensor * t, bool ask, void * user_data);
+
+    // Callback for each backend schedule (set with ggml_backend_sched_set_graph_callback)
+    typedef bool (*ggml_backend_sched_graph_callback)(ggml_backend_sched_t sched, struct ggml_cgraph * graph, void * user_data);
 
     // Initialize a backend scheduler, backends with low index are given priority over backends with high index
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
@@ -323,6 +339,9 @@ extern "C" {
 
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
+
+    // Set a callback to be called for each backend schedule after sched allocation
+    GGML_API void                 ggml_backend_sched_set_graph_callback(ggml_backend_sched_t sched, ggml_backend_sched_graph_callback callback, void * user_data);
 
     //
     // Utils

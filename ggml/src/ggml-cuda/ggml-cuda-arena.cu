@@ -160,4 +160,6 @@ void ggml_cuda_arena_tensor_write_raw(ggml_backend_buffer_t b,
 
     // Raw H2D copy of the entire packed region (padded tail included)
     cudaMemcpy(t->data, src, nbytes, cudaMemcpyHostToDevice);
+
+    cudaStreamSynchronize(0); // force default-stream copy completion before returning
 }

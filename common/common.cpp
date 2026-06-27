@@ -2,6 +2,8 @@
 #define _SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING
 #endif
 
+#define VRAM_GBS 4
+
 #include "ggml.h"
 #include "gguf.h"
 
@@ -926,6 +928,9 @@ struct common_init_result common_init_from_params(common_params & params) {
     parameter_offloader * param_off = new parameter_offloader(model);
     cparams.cb_eval = llama_offloader_eval_cb;
     cparams.cb_eval_user_data = param_off;
+
+    cparams.cb_graph = llama_offloader_graph_cb;
+    cparams.cb_graph_user_data = param_off;
 #endif
 #if defined(LLAMA_SLICE_ONLY_DIAGNOSTIC)
     // do NOT create parameter_offloader
@@ -1039,6 +1044,7 @@ struct common_init_result common_init_from_params(common_params & params) {
 
     // ---- Phase A: collect true first-use order with a single decode ----
 #ifndef DISABLE_OFFLOADER
+    if (false)
     {
         // pick BOS if available
         llama_token tok = 0;
@@ -1058,16 +1064,18 @@ struct common_init_result common_init_from_params(common_params & params) {
     }
 
     // ---- Phase B: mirror & schedule, then enable streaming ----
-    LLAMA_LOG_INFO("%s before parameter_offloader->init()\n", __func__);
+    LLAMA_LOG_INFO("%s before parameter_offloader->init() 1\n", __func__);
     {
         // Create a CUDA arena + twins ctx
         ggml_backend_dev_t cuda_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
         if (cuda_dev)
         {
-            size_t arena_bytes = /* e.g. */ (size_t)2 * 1024ull * 1024ull * 1024ull; // TODO: parametrize
+            LLAMA_LOG_INFO("%s before parameter_offloader->init() 2\n", __func__);
+            size_t arena_bytes = /* e.g. */ (size_t)VRAM_GBS * 1024ull * 1024ull * 1024ull; // TODO: parametrize
             ggml_backend_buffer_t arena = ggml_cuda_arena_create_on(cuda_dev, arena_bytes, /*device_ordinal=*/0);
             if (arena)
             {
+                LLAMA_LOG_INFO("%s before parameter_offloader->init() 3\n", __func__);
                 const size_t MB = 1024ull * 1024ull;
                 ggml_init_params twins{ 64*MB, nullptr, true };
 
@@ -1240,6 +1248,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.flash_attn_type   = params.flash_attn_type;
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
+    cparams.cb_graph           = params.cb_graph;
+    cparams.cb_graph_user_data = params.cb_graph_user_data;
     cparams.offload_kqv       = !params.no_kv_offload;
     cparams.no_perf           = params.no_perf;
     cparams.op_offload        = !params.no_op_offload;

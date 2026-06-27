@@ -16,6 +16,7 @@
 
 // signature must match ggml_backend_sched_eval_callback
 bool llama_offloader_eval_cb(ggml_tensor * t, bool ask, void * ud);
+bool llama_offloader_graph_cb(ggml_backend_sched_t sched, struct ggml_cgraph * graph, void * ud);
 
 struct parameter_offloader
 {
@@ -37,12 +38,32 @@ public:
     size_t                      align = 0;               // ggml_backend_buffer_get_alignment(arena)
     size_t                      cur_off = 0;             // next free offset (bytes) inside arena
 
-    // Scheduling
-    std::vector<int>                      ready_after;       // barrier per feed-order index
-    std::vector<ggml_tensor*>             cpu_tensors_in_order;  // feed-order list of CPU twins
-    std::vector<ggml_tensor*>             gpu_tensors_in_order;  // feed-order list of GPU twins
-    std::unordered_map<ggml_tensor*, int> gpu2index;         // GPU twin -> feed-order index
+    struct offloader_schedule
+    {
+        // Scheduling
+        std::vector<int>                      ready_after;           // per index: last safe copy index before arena overlap risk
+        std::vector<ggml_tensor*>             cpu_tensors_in_order;  // feed-order list of CPU twins
+        std::vector<ggml_tensor*>             gpu_tensors_in_order;  // feed-order list of GPU twins
+        std::unordered_map<ggml_tensor*, int> gpu2index;             // GPU twin -> feed-order index
 
+        std::vector<size_t> start; // arena start offset for each scheduled GPU tensor
+        std::vector<size_t> end;   // arena end offset for each scheduled GPU tensor
+
+        uint64_t generation = 0; // monotonic id for debugging schedule swaps
+    };
+    std::mutex schedule_mu; // protects schedule_current / schedule_next swaps and schedule reads
+    offloader_schedule schedule_current;          // active schedule used by reader and streamer
+    offloader_schedule schedule_next;             // candidate schedule built from latest graph callback
+    std::atomic<uint64_t> schedule_generation{0}; // latest published schedule generation
+    size_t schedule_next_prefix  = 0;       // common prefix length between active and candidate schedules
+    bool schedule_next_identical = false;   // candidate schedule exactly matches active schedule
+    bool schedule_next_valid     = false;   // candidate comparison stats are valid
+
+    void retarget_schedule_tensors(offloader_schedule & schedule);
+
+    bool swap_next_schedule(); // swaps after retargeting and gate build
+
+    void build_schedule_gates(offloader_schedule & schedule); // compute copy barriers
 
     // Fast lookups
     // GPU->CPU: answer “what CPU weight backs this GPU twin?”
@@ -53,7 +74,8 @@ public:
     //map the gpu tensors to hashes recorded at init, to ensure data integrity
     std::unordered_map<ggml_tensor*, uint64_t> gpu_hashes;
 
-    std::unordered_set<ggml_tensor*> weight_set; // CPU weight ptrs
+    std::unordered_set<ggml_tensor*> cpu_weight_set; // CPU weight ptrs
+    std::unordered_set<ggml_tensor*> gpu_weight_set; // GPU weight ptrs
 
     void init(ggml_backend_buffer_t arena,     llama_context_params params,
               ggml_context        * ctx_twins, llama_context      * lctx);
@@ -62,7 +84,6 @@ public:
 
     void copy_host_to_arena_with_transform(ggml_tensor * src_host, ggml_tensor * dst_arena);
 
-    ggml_tensor * cpu_tensor_to_arena(ggml_tensor * w_cpu);
 
     // runtime
     std::thread        copy_thread;
@@ -76,17 +97,14 @@ public:
     void start_streamer();
     void stop_streamer_join();
 
-    void print_snapshot();
+    void print_snapshot(offloader_schedule & schedule);
 private:
+    void seed_all_weights_from_model();
 
-    //std::atomic<int> tensor_idx_loaded{ -1 };  // highest index copied into arena
-    std::atomic<int>       tensor_idx_copied_mod   { -1 };
-    std::atomic<int>       tensor_idx_copied_epoch {  0 };
-    std::atomic<long long> tensor_idx_copied_seq   { -1 };
+    ggml_tensor * init_cpu_tensor_to_arena(ggml_tensor * w_cpu);
 
-    std::atomic<int>       tensor_idx_used_mod{-1};         // last seen feed index this pass
-    std::atomic<int>       tensor_idx_used_epoch{0};        // increments when index decreases (wrap)
-    std::atomic<long long> tensor_idx_used_seq{ -1 }; // tensor_idx_used_epoch*tensor_count + tensor_idx_used_mod
+    std::atomic<long long> tensor_idx_copied_ordinal{-1}; // last copied ordinal in current schedule stream
+    std::atomic<long long> tensor_idx_used_ordinal{-1};   // last read ordinal in current schedule stream
 
     std::mutex              node_mu_;
     std::condition_variable node_cv_;

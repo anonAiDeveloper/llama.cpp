@@ -304,8 +304,10 @@ struct common_params {
     struct cpu_params cpuparams;
     struct cpu_params cpuparams_batch;
 
-    ggml_backend_sched_eval_callback cb_eval = nullptr;
-    void * cb_eval_user_data                 = nullptr;
+    ggml_backend_sched_eval_callback  cb_eval  = nullptr;
+    void * cb_eval_user_data                   = nullptr;
+    ggml_backend_sched_graph_callback cb_graph = nullptr;
+    void * cb_graph_user_data                  = nullptr;
 
     ggml_numa_strategy numa = GGML_NUMA_STRATEGY_DISABLED;
 

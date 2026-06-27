@@ -713,6 +713,9 @@ struct ggml_backend_sched {
     ggml_backend_sched_eval_callback callback_eval;
     void * callback_eval_user_data;
 
+    ggml_backend_sched_graph_callback callback_graph;
+    void * callback_graph_user_data;
+
     char * context_buffer;
     size_t context_buffer_size;
 
@@ -897,6 +900,185 @@ static bool ggml_backend_sched_buffer_supported(ggml_backend_sched_t sched, stru
     return buft != NULL && ggml_backend_supports_buft(sched->backends[backend_id], buft);
 }
 
+static const char * safe_op_name(const ggml_tensor * t) {
+    // ggml_op_name is public in ggml.h
+    // fallback to numeric if needed (very old headers)
+    // ref: ggml_op_name / ggml_op_desc exist in headers
+    // (we prefer simple op name to keep lines short)
+    extern const char * ggml_op_name(enum ggml_op op);
+    if (t) {
+        return ggml_op_name(t->op);
+    }
+    return "NULL";
+}
+
+static const char * safe_tensor_name(const ggml_tensor * t) {
+    if (!t) return "NULL";
+    const char * n = ggml_get_name(t);
+    return n && n[0] ? n : "(unnamed)";
+}
+
+static const char * backend_name_at(const ggml_backend_sched_t sched, int backend_id) {
+    if (backend_id < 0 || backend_id >= sched->n_backends) return "INVALID";
+    return ggml_backend_name(sched->backends[backend_id]);
+}
+
+static int backend_id_from_ptr(ggml_backend_sched_t sched, ggml_backend_t be) {
+    if (!sched || !be) return -1;
+    for (int i = 0; i < sched->n_backends; ++i) {
+        if (sched->backends[i] == be) return i;
+    }
+    return -1;
+}
+
+// returns the backend id assigned by the scheduler for a given tensor
+// relies on the public helper used by compute_splits
+static int tensor_backend_id_public(ggml_backend_sched_t sched, const struct ggml_tensor * t) {
+    ggml_backend_t be = ggml_backend_sched_get_tensor_backend(sched, (struct ggml_tensor *) t);
+    return backend_id_from_ptr(sched, be);
+}
+
+// best-effort check whether the tensor would need a copy when used on 'dst_backend_id'
+static bool needs_copy_to_backend(ggml_backend_sched_t sched, const struct ggml_tensor * t, int dst_backend_id) {
+    const int src_backend_id = tensor_backend_id_public(sched, t);
+    if (src_backend_id == -1) return false; // unknown; treat as not requiring copy
+    if (src_backend_id == dst_backend_id) return false;
+    // if the tensor's current buffer is not usable by the destination backend, the scheduler will insert a copy
+    // uses the same helper used in pass 5 when populating split inputs
+    return !ggml_backend_sched_buffer_supported(sched, (struct ggml_tensor *) t, dst_backend_id);
+}
+
+#include <cinttypes>
+// pretty-print the shape like [n0 x n1 x n2 x n3]
+static void print_shape(FILE * out, const struct ggml_tensor * t) {
+    fprintf(out, "[%" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64 "]",
+            t->ne[0], t->ne[1], t->ne[2], t->ne[3]);
+}
+
+void ggml_backend_sched_set_debug(ggml_backend_sched_t sched, int level) {
+    if (sched)
+        sched->debug = level;
+}
+
+void ggml_backend_sched_dump(
+    ggml_backend_sched_t        sched,
+    const struct ggml_cgraph  * graph,
+    FILE                      * out) {
+
+    if (!sched) return;
+    if (!out) out = stdout;
+
+    if (!graph) {
+        // fall back to the scheduler's internal graph copy (already expanded)
+        graph = &sched->graph;
+    }
+
+    fprintf(out, "==== GGML Backend Schedule Dump ====\n");
+    fprintf(out, "Backends (%d):\n", sched->n_backends);
+    for (int b = 0; b < sched->n_backends; ++b) {
+        const char * bname = ggml_backend_name(sched->backends[b]);
+        const char * tname = ggml_backend_buft_name(sched->bufts[b]);
+        fprintf(out, "  [%d] backend=%s  buft=%s\n", b, bname, tname);
+    }
+    fprintf(out, "n_splits=%d  n_copies=%d  cur_copy=%d\n", sched->n_splits, sched->n_copies, sched->cur_copy);
+    fprintf(out, "\n");
+
+    // Walk each split in submit order. This mirrors the logic that was used to create splits
+    // and the assignment arrays (node_backend_ids / leaf_backend_ids) just before allocation. :contentReference[oaicite:2]{index=2}
+    for (int si = 0; si < sched->n_splits; ++si) {
+        const ggml_backend_sched_split * split = &sched->splits[si];
+        const int sbid = split->backend_id;
+        fprintf(out, "---- Split %d  backend=[%d] %s  nodes=[%d..%d)\n",
+                si, sbid, backend_name_at(sched, sbid), split->i_start, split->i_end);
+
+        // Copy-ins that the scheduler will perform before executing this split.
+        // (This is exactly what pass 5 computed into split->inputs[].) :contentReference[oaicite:3]{index=3}
+        if (split->n_inputs > 0) {
+            fprintf(out, "  Copy-ins (%d):\n", split->n_inputs);
+            for (int j = 0; j < split->n_inputs; ++j) {
+                const ggml_tensor * in = split->inputs[j];
+                const int src_bid = tensor_backend_id_public(sched, in);
+                const bool will_copy = needs_copy_to_backend(sched, in, sbid);
+
+                fprintf(out, "    - %s ", safe_tensor_name(in));
+                print_shape(out, in);
+                fprintf(out, "  src=[%d]%s  -> dst=[%d]%s  action=%s",
+                        src_bid, backend_name_at(sched, src_bid),
+                        sbid, backend_name_at(sched, sbid),
+                        will_copy ? "COPY" : "REUSE");
+
+                if ((in->flags & GGML_TENSOR_FLAG_INPUT) && sched->n_copies > 1) {
+                    // pipeline parallelism: inputs are duplicated across copies
+                    fprintf(out, "  (pipeline: %d copies)\n", sched->n_copies);
+                } else {
+                    fprintf(out, "\n");
+                }
+            }
+        } else {
+            fprintf(out, "  Copy-ins: none\n");
+        }
+
+        // Now list the nodes as they will execute for this split.
+        for (int ni = split->i_start; ni < split->i_end; ++ni) {
+            const ggml_tensor * node = graph->nodes[ni];
+
+            // View ops do not execute; the splitter explicitly skips them when picking backends. :contentReference[oaicite:4]{index=4}
+            const bool is_view = ggml_is_view_op(node->op);
+            const int  nbid    = tensor_backend_id_public(sched, node);
+
+            fprintf(out, "  [%5d] %s  name=%s  ", ni, safe_op_name(node), safe_tensor_name(node));
+            print_shape(out, node);
+            fprintf(out, "  backend=[%d]%s", nbid, backend_name_at(sched, nbid));
+            if (is_view) fprintf(out, "  (view)");
+            fprintf(out, "\n");
+
+            // For each source, indicate where it lives and whether the scheduler will feed a copied version
+            for (int sj = 0; sj < GGML_MAX_SRC; ++sj) {
+                const ggml_tensor * src = node->src[sj];
+                if (!src) continue;
+
+                const int sb = tensor_backend_id_public(sched, src);
+                const bool copy_needed = needs_copy_to_backend(sched, src, nbid);
+
+                fprintf(out, "         src[%d]: %-30s  src_backend=[%d]%s",
+                        sj, safe_tensor_name(src), sb, backend_name_at(sched, sb));
+
+                if (copy_needed) {
+                    // The scheduler will have replaced this edge with a per-split copy living on nbid
+                    // (created during pass 5 with a formatted name "<backend>#<src-name>#<copy>").
+                    // We don't dereference the internal copy array here; we just tell you the action & dest. :contentReference[oaicite:5]{index=5}
+                    if (sched->n_copies > 1) {
+                        fprintf(out, "  => COPY (pipeline copy #%d) -> [%d]%s\n",
+                                sched->cur_copy, nbid, backend_name_at(sched, nbid));
+                    } else {
+                        fprintf(out, "  => COPY -> [%d]%s\n", nbid, backend_name_at(sched, nbid));
+                    }
+                } else {
+                    fprintf(out, "  => DIRECT\n");
+                }
+            }
+        }
+
+        // Small visual separator between splits
+        fprintf(out, "\n");
+    }
+
+    // Leaf allocations that will get allocated ahead of compute (input copies etc.)
+    // This reflects the extra leafs added into sched->graph for pipeline input copies. :contentReference[oaicite:6]{index=6}
+    if (sched->graph.n_leafs > 0) {
+        fprintf(out, "Leafs allocated before compute (internal graph copy): %d\n", sched->graph.n_leafs);
+        for (int li = 0; li < sched->graph.n_leafs; ++li) {
+            const ggml_tensor * lf = sched->graph.leafs[li];
+            const int lbid = sched->leaf_backend_ids ? sched->leaf_backend_ids[li] : tensor_backend_id_public(sched, lf);
+            fprintf(out, "  - %s  ", safe_tensor_name(lf));
+            print_shape(out, lf);
+            fprintf(out, "  backend=[%d]%s\n", lbid, backend_name_at(sched, lbid));
+        }
+    }
+
+    fprintf(out, "==== End of schedule dump ====\n");
+}
+
 static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, struct ggml_tensor * node, int cur_backend_id, int * node_backend_id) {
     if (ggml_backend_supports_op(sched->backends[cur_backend_id], node)) {
         *node_backend_id = cur_backend_id;
@@ -910,6 +1092,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     sched->n_splits = 0;
     sched->n_graph_inputs = 0;
     sched->is_reset = false;
+
+    //GGML_LOG_INFO("%s called with graph %p\n", __func__, graph);
 
     struct ggml_init_params params = {
         /* .mem_size =   */ sched->context_buffer_size,
@@ -1364,6 +1548,12 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         assert(graph_copy->size > graph_copy->n_leafs);
         graph_copy->leafs[graph_copy->n_leafs++] = leaf;
     }
+
+    if (sched->callback_graph)
+        sched->callback_graph(sched, graph, sched->callback_graph_user_data);
+    
+    //ggml_backend_sched_set_debug(sched, 1); // optional, if you also want the existing internal prints
+    //ggml_backend_sched_dump(sched, graph, stdout);
 }
 
 static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
@@ -1762,6 +1952,12 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_eval = callback;
     sched->callback_eval_user_data = user_data;
+}
+
+void ggml_backend_sched_set_graph_callback(ggml_backend_sched_t sched, ggml_backend_sched_graph_callback callback, void * user_data) {
+    GGML_ASSERT(sched);
+    sched->callback_graph = callback;
+    sched->callback_graph_user_data = user_data;
 }
 
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {
