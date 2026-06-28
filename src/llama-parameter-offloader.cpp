@@ -738,7 +738,7 @@ void parameter_offloader::publish_copy_when_ready(long long ordinal, uint64_t ge
     tensor_idx_copied_ordinal.store(ordinal, std::memory_order_release);
 
     #ifdef LLAMA_LOG_COPIES
-        LLAMA_LOG_INFO("[C.%d]", copy_idx);
+        LLAMA_LOG_INFO("[C.%d]", ordinal);
     #endif
 
     lk.unlock();
@@ -764,7 +764,7 @@ void parameter_offloader::publish_copy_now(long long ordinal, uint64_t generatio
     tensor_idx_copied_ordinal.store(ordinal, std::memory_order_release);
 
     #ifdef LLAMA_LOG_COPIES
-        LLAMA_LOG_INFO("[C.%d]", copy_idx);
+        LLAMA_LOG_INFO("[C.%d]", ordinal);
     #endif
 
     lk.unlock();
