@@ -143,6 +143,72 @@ bool ggml_backend_buffer_is_cuda_arena_public(ggml_backend_buffer_t buffer) {
     return ggml_backend_buffer_is_cuda_arena(buffer);   // call the static one
 }
 
+struct ggml_cuda_copy_event
+{
+    int device;
+    cudaEvent_t event;
+};
+
+ggml_cuda_copy_event * ggml_cuda_copy_event_create(ggml_backend_buffer_t b)
+{
+    cuda_arena * ctx = (cuda_arena *) b->context;
+    cudaSetDevice(ctx->device);
+
+    ggml_cuda_copy_event * ev = new ggml_cuda_copy_event;
+    ev->device = ctx->device;
+    ev->event = nullptr;
+
+    cudaEventCreateWithFlags(&ev->event, cudaEventDisableTiming);
+
+    return ev;
+}
+
+void ggml_cuda_copy_event_destroy(ggml_cuda_copy_event * ev)
+{
+    if (!ev)
+        return;
+
+    cudaSetDevice(ev->device);
+
+    if (ev->event)
+        cudaEventDestroy(ev->event);
+
+    delete ev;
+}
+
+void ggml_cuda_copy_event_wait(ggml_cuda_copy_event * ev)
+{
+    GGML_ASSERT(ev);
+
+    cudaSetDevice(ev->device);
+    cudaEventSynchronize(ev->event);
+}
+
+void ggml_cuda_arena_tensor_write_raw_async(ggml_backend_buffer_t b,
+                                            ggml_tensor * t,
+                                            const void * src,
+                                            size_t nbytes,
+                                            ggml_cuda_copy_event * ev) {
+    cuda_arena * ctx = (cuda_arena *) b->context;
+    cudaSetDevice(ctx->device);
+
+    // Safety: destination must belong to this arena
+    GGML_ASSERT(t->buffer == b);
+
+    // And we must not write past the device allocation for this tensor
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(b);
+    const size_t dev_bytes = ggml_backend_buft_get_alloc_size(buft, t);
+    GGML_ASSERT(nbytes <= dev_bytes);
+
+    cudaStream_t stream = 0;
+
+    // Raw H2D copy of the entire packed region (padded tail included)
+    cudaMemcpyAsync(t->data, src, nbytes, cudaMemcpyHostToDevice, stream);
+
+    if (ev)
+        cudaEventRecord(ev->event, stream);
+}
+
 void ggml_cuda_arena_tensor_write_raw(ggml_backend_buffer_t b,
                                       ggml_tensor * t,
                                       const void * src,

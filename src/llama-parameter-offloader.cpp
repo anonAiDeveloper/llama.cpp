@@ -307,8 +307,11 @@ void parameter_offloader::init(
     ggml_tensor *w_cpu = schedule_current.cpu_tensors_in_order[0];
     ggml_tensor *w_gpu = schedule_current.gpu_tensors_in_order[0];
 
-    upload_weight_auto(w_cpu, w_gpu);
-
+    ggml_cuda_copy_event * ev = upload_weight_auto(w_cpu, w_gpu);
+    if (ev) {
+        ggml_cuda_copy_event_wait(ev);
+        ggml_cuda_copy_event_destroy(ev);
+    }
 
     tensor_idx_copied_ordinal.store((long long)tensor_count, std::memory_order_release);
 #else
@@ -645,8 +648,11 @@ ggml_tensor * parameter_offloader::init_cpu_tensor_to_arena(ggml_tensor * w_cpu)
     GGML_ASSERT(ggml_backend_tensor_alloc(arena, w_gpu, base + off) == GGML_STATUS_SUCCESS);
 
     // Upload
-    upload_weight_auto(w_cpu, w_gpu);
-
+    ggml_cuda_copy_event * ev = upload_weight_auto(w_cpu, w_gpu);
+    if (ev) {
+        ggml_cuda_copy_event_wait(ev);
+        ggml_cuda_copy_event_destroy(ev);
+    }
 
     // Register mappings
     gpu2cpu.emplace(w_gpu, w_cpu);
@@ -677,36 +683,92 @@ ggml_tensor * parameter_offloader::init_cpu_tensor_to_arena(ggml_tensor * w_cpu)
     return w_gpu;
 }
 
-inline void parameter_offloader::upload_weight_auto(ggml_tensor *w_cpu, ggml_tensor *w_gpu) {
+inline ggml_cuda_copy_event * parameter_offloader::upload_weight_auto(ggml_tensor *w_cpu, ggml_tensor *w_gpu) {
     GGML_ASSERT(w_cpu && w_gpu);
     GGML_ASSERT(ggml_backend_buffer_is_host(w_cpu->buffer));
     GGML_ASSERT(w_gpu->buffer == arena);
 
-    // Path B: already host-prepacked into device layout (must copy full dev_bytes)
     auto it = host_packed_.find(w_cpu);
     if (it != host_packed_.end()) {
-        // Prefer raw arena H2D copy to include the packed tail:
         if (ggml_backend_buffer_is_cuda_arena_public(arena)) {
             const size_t dev_bytes = ggml_backend_buft_get_alloc_size(buft, w_cpu);
-            ggml_cuda_arena_tensor_write_raw(arena, w_gpu, it->second.base, dev_bytes);
-            //ggml_backend_tensor_copy(w_cpu, w_gpu);
+            ggml_cuda_copy_event * ev = ggml_cuda_copy_event_create(arena);
+
+            ggml_cuda_arena_tensor_write_raw_async(arena, w_gpu, it->second.base, dev_bytes, ev);
+
+            return ev;
         } else {
-            // Non-CUDA arenas: best we can do is logical; consider adding analogous backends.
             const size_t logical = ggml_nbytes(w_gpu);
             ggml_backend_tensor_set(w_gpu, it->second.base, 0, logical);
+            return nullptr;
         }
-        return;
     }
 
-    // Path A: layout-identical -> simple H2D of logical bytes
     if (no_transform_needed_for_backend_(w_cpu)) {
         const size_t logical = ggml_nbytes(w_cpu);
         ggml_backend_tensor_set(w_gpu, w_cpu->data, 0, logical);
-        return;
+        return nullptr;
     }
 
-    // Path C: backend must pack/transform
     copy_host_to_arena_with_transform(w_cpu, w_gpu);
+    return nullptr;
+}
+
+void parameter_offloader::publish_copy_when_ready(long long ordinal, uint64_t generation, ggml_cuda_copy_event * ev)
+{
+    ggml_cuda_copy_event_wait(ev);
+    ggml_cuda_copy_event_destroy(ev);
+
+    std::unique_lock<std::mutex> lk(node_mu_);
+
+    node_cv_.wait(lk, [&] {
+        return stop_stream.load(std::memory_order_acquire) ||
+               schedule_generation.load(std::memory_order_acquire) != generation ||
+               tensor_idx_copied_ordinal.load(std::memory_order_acquire) == ordinal - 1;
+    });
+
+    if (stop_stream.load(std::memory_order_acquire))
+        return;
+
+    if (schedule_generation.load(std::memory_order_acquire) != generation)
+        return;
+
+    GGML_ASSERT(tensor_idx_copied_ordinal.load(std::memory_order_acquire) == ordinal - 1);
+
+    tensor_idx_copied_ordinal.store(ordinal, std::memory_order_release);
+
+    #ifdef LLAMA_LOG_COPIES
+        LLAMA_LOG_INFO("[C.%d]", copy_idx);
+    #endif
+
+    lk.unlock();
+    node_cv_.notify_all();
+}
+
+void parameter_offloader::publish_copy_now(long long ordinal, uint64_t generation)
+{
+    std::unique_lock<std::mutex> lk(node_mu_);
+
+    node_cv_.wait(lk, [&] {
+        return stop_stream.load(std::memory_order_acquire) ||
+            schedule_generation.load(std::memory_order_acquire) != generation ||
+            tensor_idx_copied_ordinal.load(std::memory_order_acquire) == ordinal - 1;
+    });
+
+    if (stop_stream.load(std::memory_order_acquire))
+        return;
+
+    if (schedule_generation.load(std::memory_order_acquire) != generation)
+        return;
+
+    tensor_idx_copied_ordinal.store(ordinal, std::memory_order_release);
+
+    #ifdef LLAMA_LOG_COPIES
+        LLAMA_LOG_INFO("[C.%d]", copy_idx);
+    #endif
+
+    lk.unlock();
+    node_cv_.notify_all();
 }
 
 void parameter_offloader::retarget_schedule_tensors(offloader_schedule & schedule)
@@ -1056,7 +1118,11 @@ bool parameter_offloader::on_eval_tensor(ggml_tensor * node)
         ggml_tensor *w_cpu_ = schedule_current.cpu_tensors_in_order[i];
         ggml_tensor *w_gpu_ = schedule_current.gpu_tensors_in_order[i];
 
-        upload_weight_auto(w_cpu_, w_gpu_);
+        ggml_cuda_copy_event * ev = upload_weight_auto(w_cpu_, w_gpu_);
+        if (ev) {
+            ggml_cuda_copy_event_wait(ev);
+            ggml_cuda_copy_event_destroy(ev);
+        }
 
     #ifdef LLAMA_LOG_COPIES
         LLAMA_LOG_INFO("[C.%d]", i);
@@ -1163,6 +1229,9 @@ void parameter_offloader::stream_worker()
 {
     LLAMA_LOG_INFO("%s started\n", __func__);
 
+    long long submitted_ordinal = tensor_idx_copied_ordinal.load(std::memory_order_acquire);
+    uint64_t submitted_generation = schedule_generation.load(std::memory_order_acquire);
+
     for (;;)
     {
         if (stop_stream.load(std::memory_order_acquire))
@@ -1182,16 +1251,22 @@ void parameter_offloader::stream_worker()
             if (tensor_count == 0)
                 return;
 
+            const uint64_t cur_generation = schedule_generation.load(std::memory_order_acquire);
+            if (cur_generation != submitted_generation) {
+                submitted_generation = cur_generation;
+                submitted_ordinal = tensor_idx_copied_ordinal.load(std::memory_order_acquire);
+            }
+
             auto ring_dist = [&](int from, int to) -> int {
                 return (to - from + tensor_count) % tensor_count; // forward distance in active ring
             };
             //We load from the atomic variable because swap_next_schedule can change this
-            const long long copied_ordinal   = tensor_idx_copied_ordinal.load(std::memory_order_relaxed); // last copied ordinal
+            const long long last_submitted_ordinal = submitted_ordinal;                                   // last submitted ordinal
             const long long cur_used_ordinal = tensor_idx_used_ordinal.load(std::memory_order_acquire);   // last reader ordinal
 
             const bool startup = cur_used_ordinal < 0; // true before the first graph read
 
-            const int i = ordinal_mod(copied_ordinal + 1, tensor_count); // next copy index
+            const int i = ordinal_mod(last_submitted_ordinal + 1, tensor_count); // next copy index
             const int r_idx = startup ? tensor_count - 1 : ordinal_mod(cur_used_ordinal, tensor_count); // reader or virtual startup index
             const int bar   = schedule_current.ready_after[r_idx];
             const int di    = ring_dist(r_idx, i);   // distance from reader/startup to copy slot
@@ -1215,9 +1290,17 @@ void parameter_offloader::stream_worker()
                 w_cpu = schedule_current.cpu_tensors_in_order[i];
                 w_gpu = schedule_current.gpu_tensors_in_order[i];
 
-                upload_weight_auto(w_cpu, w_gpu);
+                const long long ordinal = submitted_ordinal + 1;
+                const uint64_t generation = submitted_generation;
 
-                tensor_idx_copied_ordinal.store(copied_ordinal + 1, std::memory_order_release);
+                ggml_cuda_copy_event * ev = upload_weight_auto(w_cpu, w_gpu);
+
+                submitted_ordinal = ordinal;
+
+                if (ev)
+                    std::thread(&parameter_offloader::publish_copy_when_ready, this, ordinal, generation, ev).detach();
+                else
+                    std::thread(&parameter_offloader::publish_copy_now, this, ordinal, generation).detach();
             }
         }
 
@@ -1235,12 +1318,6 @@ void parameter_offloader::stream_worker()
 
             continue;
         }
-
-    #ifdef LLAMA_LOG_COPIES
-        LLAMA_LOG_INFO("[C.%d]", copy_idx);
-    #endif
-
-        node_cv_.notify_all();
     }
 }
 
@@ -1692,7 +1769,11 @@ bool parameter_offloader::swap_next_schedule()
             ggml_tensor *w_cpu_ = schedule_current.cpu_tensors_in_order[i];
             ggml_tensor *w_gpu_ = schedule_current.gpu_tensors_in_order[i];
 
-            upload_weight_auto(w_cpu_, w_gpu_);
+            ggml_cuda_copy_event * ev = upload_weight_auto(w_cpu_, w_gpu_);
+            if (ev) {
+                ggml_cuda_copy_event_wait(ev);
+                ggml_cuda_copy_event_destroy(ev);
+            }
 
         #ifdef LLAMA_LOG_COPIES
             LLAMA_LOG_INFO("[C.%d]", i);

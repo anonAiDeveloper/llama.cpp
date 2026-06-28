@@ -131,6 +131,9 @@ private:
     void stream_worker();
     
     inline bool no_transform_needed_for_backend_(const ggml_tensor *t) const;
+
+    void publish_copy_when_ready(long long ordinal, uint64_t generation, ggml_cuda_copy_event * ev);
+    void publish_copy_now(long long ordinal, uint64_t generation);
 public:
-    inline void upload_weight_auto(ggml_tensor *w_cpu, ggml_tensor *w_gpu);
+    inline ggml_cuda_copy_event * upload_weight_auto(ggml_tensor *w_cpu, ggml_tensor *w_gpu);
 };

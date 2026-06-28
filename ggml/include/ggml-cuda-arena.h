@@ -9,9 +9,24 @@ extern "C" {
 
 GGML_BACKEND_API bool ggml_backend_buffer_is_cuda_arena_public(ggml_backend_buffer_t buffer);
 
+struct ggml_cuda_copy_event;
+
+GGML_BACKEND_API ggml_cuda_copy_event * ggml_cuda_copy_event_create(ggml_backend_buffer_t arena);
+
+GGML_BACKEND_API void ggml_cuda_copy_event_destroy(ggml_cuda_copy_event * ev);
+
+GGML_BACKEND_API void ggml_cuda_copy_event_wait(ggml_cuda_copy_event * ev);
+
 // Copy arbitrary number of bytes (up to alloc size) from host -> device tensor memory.
 // Bypasses the ggml_nbytes() logical limit.
-void ggml_cuda_arena_tensor_write_raw(ggml_backend_buffer_t arena,
+GGML_BACKEND_API void ggml_cuda_arena_tensor_write_raw_async(
+    ggml_backend_buffer_t arena,
+    ggml_tensor * t,
+    const void * src,
+    size_t nbytes,
+    ggml_cuda_copy_event * ev);
+
+GGML_BACKEND_API void ggml_cuda_arena_tensor_write_raw(ggml_backend_buffer_t arena,
                                       ggml_tensor * t,
                                       const void * src,
                                       size_t nbytes);
