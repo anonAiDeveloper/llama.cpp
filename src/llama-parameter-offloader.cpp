@@ -1221,8 +1221,14 @@ void parameter_offloader::start_streamer() {
 void parameter_offloader::stop_streamer_join() {
     stop_stream.store(true, std::memory_order_release);
     node_cv_.notify_all();
+
     if (copy_thread.joinable())
         copy_thread.join();
+
+    std::unique_lock<std::mutex> lk(node_mu_);
+    node_cv_.wait(lk, [&] {
+        return copy_publishers_in_flight.load(std::memory_order_acquire) == 0;
+    });
 }
 
 void parameter_offloader::stream_worker()
@@ -1231,6 +1237,7 @@ void parameter_offloader::stream_worker()
 
     long long submitted_ordinal = tensor_idx_copied_ordinal.load(std::memory_order_acquire);
     uint64_t submitted_generation = schedule_generation.load(std::memory_order_acquire);
+    const int max_in_flight_copies = 8;
 
     for (;;)
     {
@@ -1241,6 +1248,7 @@ void parameter_offloader::stream_worker()
         ggml_tensor * w_gpu = nullptr;        // GPU arena tensor selected for this copy
         long long wait_used_ordinal = -1;     // reader ordinal that blocked this copy
         uint64_t wait_generation = 0;         // schedule generation observed before blocking
+        bool throttled = false;               // true when copy was blocked only by in-flight copy cap
         bool allowed = false;                 // true when selected copy is inside safe window
         int copy_idx = -1;                    // schedule index selected for copy. TODO: Why do we have this function? When its read doesn't it always equal i? Seems redundant, consider removing
 
@@ -1276,11 +1284,20 @@ void parameter_offloader::stream_worker()
 
             allowed = (di <= dbar);
 
+            if (allowed && copy_publishers_in_flight.load(std::memory_order_acquire) >= max_in_flight_copies)
+            {
+            #if LLAMA_LOG_COPIES > 1
+                LLAMA_LOG_INFO("[CT.%d]", i);
+            #endif
+                allowed = false;
+                throttled = true;
+            }
+
             if (!allowed)
             {
-    #if LLAMA_LOG_COPIES > 1
+            #if LLAMA_LOG_COPIES > 1
                 LLAMA_LOG_INFO("[CB.%d.%d.%d.%d.%d]", i, r_idx, bar, di, dbar);
-    #endif
+            #endif
                 wait_used_ordinal = cur_used_ordinal;
                 wait_generation = schedule_generation.load(std::memory_order_acquire);
             }
@@ -1297,10 +1314,21 @@ void parameter_offloader::stream_worker()
 
                 submitted_ordinal = ordinal;
 
-                if (ev)
-                    std::thread(&parameter_offloader::publish_copy_when_ready, this, ordinal, generation, ev).detach();
-                else
-                    std::thread(&parameter_offloader::publish_copy_now, this, ordinal, generation).detach();
+                copy_publishers_in_flight.fetch_add(1, std::memory_order_acq_rel);
+
+                if (ev) {
+                    std::thread([this, ordinal, generation, ev] {
+                        publish_copy_when_ready(ordinal, generation, ev);
+                        copy_publishers_in_flight.fetch_sub(1, std::memory_order_acq_rel);
+                        node_cv_.notify_all();
+                    }).detach();
+                } else {
+                    std::thread([this, ordinal, generation] {
+                        publish_copy_now(ordinal, generation);
+                        copy_publishers_in_flight.fetch_sub(1, std::memory_order_acq_rel);
+                        node_cv_.notify_all();
+                    }).detach();
+                }
             }
         }
 
@@ -1310,7 +1338,8 @@ void parameter_offloader::stream_worker()
             node_cv_.wait(lk, [&]{
                 return stop_stream.load(std::memory_order_acquire) ||
                     tensor_idx_used_ordinal.load(std::memory_order_acquire) != wait_used_ordinal ||
-                    schedule_generation.load(std::memory_order_acquire) != wait_generation;
+                    schedule_generation.load(std::memory_order_acquire) != wait_generation ||
+                    (throttled && copy_publishers_in_flight.load(std::memory_order_acquire) < max_in_flight_copies);
             });
 
             if (stop_stream.load(std::memory_order_acquire))
@@ -1678,6 +1707,14 @@ bool parameter_offloader::swap_next_schedule()
             schedule_next_prefix = 0;
             schedule_next_identical = false;
             return false;
+        }
+
+        //wait for in-flight copies to complete
+        {
+            std::unique_lock<std::mutex> lk(node_mu_);
+            node_cv_.wait(lk, [&] {
+                return copy_publishers_in_flight.load(std::memory_order_acquire) == 0;
+            });
         }
 
         std::unordered_map<ggml_tensor *, size_t> old_offsets; // old arena offsets before retarget

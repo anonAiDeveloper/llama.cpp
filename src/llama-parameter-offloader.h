@@ -132,6 +132,7 @@ private:
     
     inline bool no_transform_needed_for_backend_(const ggml_tensor *t) const;
 
+    std::atomic<int> copy_publishers_in_flight{0};
     void publish_copy_when_ready(long long ordinal, uint64_t generation, ggml_cuda_copy_event * ev);
     void publish_copy_now(long long ordinal, uint64_t generation);
 public:
