@@ -1154,6 +1154,7 @@ void parameter_offloader::start_streamer() {
 }
 void parameter_offloader::stop_streamer_join() {
     stop_stream.store(true, std::memory_order_release);
+    node_cv_.notify_all();
     if (copy_thread.joinable())
         copy_thread.join();
 }
