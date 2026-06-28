@@ -127,21 +127,32 @@ void parameter_offloader::seed_all_weights_from_model()
             return s.size() >= n && s.compare(s.size() - n, n, suffix) == 0;
         };
 
+        //Deepseek 2 weights
         const bool supported =
-            ends(kv.first, ".attn_q_a.weight")      ||
-            ends(kv.first, ".attn_q_b.weight")      ||
-            ends(kv.first, ".attn_k_b.weight")      ||
-            ends(kv.first, ".attn_kv_a_mqa.weight") ||
-            ends(kv.first, ".attn_v_b.weight")      ||
-            ends(kv.first, ".attn_output.weight")   ||
-            ends(kv.first, ".ffn_gate.weight")      ||
-            ends(kv.first, ".ffn_up.weight")        ||
-            ends(kv.first, ".ffn_down.weight")      ||
-            ends(kv.first, ".ffn_gate_inp.weight")  ||
-            ends(kv.first, ".ffn_gate_shexp.weight")||
-            ends(kv.first, ".ffn_up_shexp.weight")  ||
-            ends(kv.first, ".ffn_down_shexp.weight")||
-            kv.first == "output.weight";
+            //ends(kv.first, ".attn_norm.weight")      || // RMSNorm scale before attention block; 1D vector applied to residual stream before Q/K/V work
+            ends(kv.first, ".attn_q_a.weight")       ||   // First low-rank Q projection: hidden -> q_lora_rank before q_a_norm/q_b
+            //ends(kv.first, ".attn_q_a_norm.weight")  || // RMSNorm scale on low-rank Q activation between q_a and q_b; 1D vector
+            ends(kv.first, ".attn_q_b.weight")       ||   // Second low-rank Q projection: q_lora_rank -> full per-head Q
+            ends(kv.first, ".attn_k_b.weight")       ||   // MLA absorbed K projection used after KV compression in MLA path
+            ends(kv.first, ".attn_kv_a_mqa.weight")  ||   // Shared KV compression projection: hidden -> kv_lora_rank + rope K part
+            //ends(kv.first, ".attn_kv_a_norm.weight") || // RMSNorm scale on compressed KV activation before K/V expansion; 1D vector
+            ends(kv.first, ".attn_v_b.weight")       ||   // MLA absorbed V projection used by attention output path
+            //ends(kv.first, ".attn_kv_b.weight")      || // Legacy unsplit KV expansion tensor for older/non-MLA GGUFs; replaces separate k_b/v_b
+            ends(kv.first, ".attn_output.weight")    ||   // Attention output projection back to model hidden size
+            //ends(kv.first, ".ffn_norm.weight")       || // RMSNorm scale before FFN/MoE block; 1D vector
+            ends(kv.first, ".ffn_gate.weight")       ||   // Dense-layer FFN gate projection for leading non-MoE layers
+            ends(kv.first, ".ffn_up.weight")         ||   // Dense-layer FFN up projection for leading non-MoE layers
+            ends(kv.first, ".ffn_down.weight")       ||   // Dense-layer FFN down projection for leading non-MoE layers
+            ends(kv.first, ".ffn_gate_inp.weight")   ||   // MoE router/gating projection: hidden -> expert scores
+            //ends(kv.first, ".exp_probs_b.bias")      || // Optional MoE expert-score/probability bias; 1D vector over experts
+            //ends(kv.first, ".ffn_gate_exps.weight")  || // Routed MoE expert-bank gate matrices; packed per expert
+            //ends(kv.first, ".ffn_up_exps.weight")    || // Routed MoE expert-bank up matrices; packed per expert
+            //ends(kv.first, ".ffn_down_exps.weight")  || // Routed MoE expert-bank down matrices; packed per expert
+            ends(kv.first, ".ffn_gate_shexp.weight") ||   // Shared expert FFN gate projection; always used, not routed by top-k
+            ends(kv.first, ".ffn_up_shexp.weight")   ||   // Shared expert FFN up projection; always used, not routed by top-k
+            ends(kv.first, ".ffn_down_shexp.weight") ||   // Shared expert FFN down projection; always used, not routed by top-k
+            //kv.first == "output_norm.weight"         || // Final RMSNorm scale before logits
+            kv.first == "output.weight";                  // LM head / output projection from hidden state to vocabulary logits
 
         if (!supported)
             continue;
