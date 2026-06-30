@@ -451,20 +451,36 @@ void patch_model_refs_for(llama_model * model, ggml_tensor * w_cpu, ggml_tensor 
     SET(model->output_b);
     SET(model->output_norm_enc);
 
+    SET(model->output_s);
+    SET(model->output_in_s);
+
+    SET(model->nextn_proj_pre);
+    SET(model->nextn_proj_post);
+
     SET(model->cls);
     SET(model->cls_b);
     SET(model->cls_out);
     SET(model->cls_out_b);
+    SET(model->cls_norm);
 
     SET(model->conv1d);
     SET(model->conv1d_b);
 
+    SET(model->altup_proj);
+    SET(model->altup_unembd_proj);
+    SET(model->per_layer_tok_embd);
+    SET(model->per_layer_model_proj);
+    SET(model->per_layer_proj_norm);
+
+    SET(model->fc);
+    SET(model->d2t);
+
     // -------------------
     // per-layer
     // -------------------
-    const int nl = (int) model->hparams.n_layer;
+    const int nl = (int) model->hparams.n_layer();
     for (int il = 0; il < nl; ++il) {
-        auto & L = model->layers[il];
+        llama_layer & L = model->layers[il];
 
         // normalization
         SET(L.attn_norm);        SET(L.attn_norm_b);
@@ -475,92 +491,159 @@ void patch_model_refs_for(llama_model * model, ggml_tensor * w_cpu, ggml_tensor 
         SET(L.attn_q_a_norm);    SET(L.attn_kv_a_norm);
         SET(L.attn_sub_norm);    SET(L.attn_post_norm);
         SET(L.ffn_sub_norm);     SET(L.attn_norm_cross);
-        SET(L.attn_norm_enc);
+        SET(L.attn_norm_enc);    SET(L.ssm_norm);
+        SET(L.ssm_dt_norm);      SET(L.ssm_b_norm);
+        SET(L.ssm_c_norm);
 
-        // attention weights
-        SET(L.wq);     SET(L.wk);     SET(L.wv);     SET(L.wo);
-        SET(L.wqkv);   SET(L.wq_a);   SET(L.wq_b);   SET(L.wkv_a_mqa);
-        SET(L.wkv_b);  SET(L.wk_b);   SET(L.wv_b);
+        // attention
+        SET(L.wq);        SET(L.wk);        SET(L.wv);        SET(L.wo);
+        SET(L.wqkv);      SET(L.wq_a);      SET(L.wq_b);      SET(L.wkv_a_mqa);
+        SET(L.wkv_b);     SET(L.wk_b);      SET(L.wv_b);
+        SET(L.wqkv_b);    SET(L.wo_b);
         SET(L.wq_cross);  SET(L.wk_cross);  SET(L.wv_cross);  SET(L.wo_cross);
         SET(L.wq_enc);    SET(L.wk_enc);    SET(L.wv_enc);    SET(L.wo_enc);
+        SET(L.wqkv_gate);
 
-        // attention bias & relpos
-        SET(L.bq); SET(L.bk); SET(L.bv); SET(L.bo); SET(L.bqkv);
-        SET(L.attn_rel_b);
-        SET(L.attn_rel_b_enc);
+        // relative position bias
+        SET(L.attn_rel_b);       SET(L.attn_rel_b_enc);
         SET(L.attn_rel_b_cross);
 
-        // ffn core
-        SET(L.ffn_gate);
-        SET(L.ffn_down);
-        SET(L.ffn_up);
-        SET(L.ffn_gate_enc);
-        SET(L.ffn_down_enc);
-        SET(L.ffn_up_enc);
-
-        // ffn MoE
-        SET(L.ffn_gate_inp);
-        SET(L.ffn_gate_exps);
-        SET(L.ffn_down_exps);
-        SET(L.ffn_up_exps);
-
-        // ffn shared expert
-        SET(L.ffn_gate_inp_shexp);
-        SET(L.ffn_gate_shexp);
-        SET(L.ffn_down_shexp);
-        SET(L.ffn_up_shexp);
-
-        // ffn extras / bias
-        SET(L.ffn_norm);   SET(L.ffn_norm_b);
-        SET(L.ffn_post_norm);
-        SET(L.layer_out_norm); SET(L.layer_out_norm_b);
+        // normalization
+        SET(L.ffn_norm);       SET(L.ffn_norm_b);
+        SET(L.ffn_post_norm);  SET(L.ffn_post_norm_1); SET(L.ffn_post_norm_2);
+        SET(L.ffn_pre_norm_2); SET(L.layer_out_norm);  SET(L.layer_out_norm_b);
         SET(L.ffn_norm_exps);  SET(L.ffn_norm_enc);
-        SET(L.ffn_gate_b);
-        SET(L.ffn_down_b);
-        SET(L.ffn_up_b);
-        SET(L.ffn_act);
+
+        // ff
+        SET(L.ffn_gate);       SET(L.ffn_down);
+        SET(L.ffn_up);         SET(L.ffn_gate_enc);
+        SET(L.ffn_down_enc);   SET(L.ffn_up_enc);
+
+        // ff MoE
+        SET(L.ffn_gate_inp);      SET(L.ffn_gate_inp_s);
+        SET(L.ffn_gate_exps);     SET(L.ffn_down_exps);
+        SET(L.ffn_up_exps);       SET(L.ffn_gate_up_exps);
+        SET(L.ffn_gate_inp_b);    SET(L.ffn_gate_exps_b);
+        SET(L.ffn_down_exps_b);   SET(L.ffn_up_exps_b);
+        SET(L.ffn_gate_up_exps_b);
+
+        // ff MoE per-expert scales (NVFP4 per-tensor scale2)
+        SET(L.ffn_gate_exps_s);     SET(L.ffn_down_exps_s);
+        SET(L.ffn_up_exps_s);
+
+        // ff MoE latent proj
+        SET(L.ffn_latent_down);     SET(L.ffn_latent_up);
+
+        // ffn shared expert (shexp)
+        SET(L.ffn_gate_inp_shexp);  SET(L.ffn_gate_shexp);
+        SET(L.ffn_down_shexp);      SET(L.ffn_up_shexp);
+
+        // ff adjugate experts (chexps)
+        SET(L.ffn_gate_chexps);     SET(L.ffn_down_chexps);
+        SET(L.ffn_up_chexps);
+
+        // ffn bias
+        SET(L.ffn_gate_b);   SET(L.ffn_down_b);
+        SET(L.ffn_up_b);     SET(L.ffn_act);
         SET(L.ffn_exp_probs_b);
 
         // mamba proj
-        SET(L.ssm_in);  SET(L.ssm_x);  SET(L.ssm_dt);  SET(L.ssm_out);
+        SET(L.ssm_in);   SET(L.ssm_x);
+        SET(L.ssm_dt);   SET(L.ssm_out);
 
-        // mamba core/bias
-        SET(L.ssm_conv1d);  SET(L.ssm_a);  SET(L.ssm_d);
+        // mamba
+        SET(L.ssm_conv1d);   SET(L.ssm_a);
+        SET(L.ssm_d);
+
+        // mamba bias
         SET(L.ssm_conv1d_b); SET(L.ssm_dt_b);
 
-        // RWKV / RWKV7 family
-        SET(L.time_mix_w1); SET(L.time_mix_w2);
+        // qwen3next
+        SET(L.ssm_beta_alpha);
+
+        // qwen3.5
+        SET(L.ssm_alpha);
+
+        // rwkv
+        SET(L.time_mix_w1);     SET(L.time_mix_w2);
         SET(L.time_mix_lerp_x); SET(L.time_mix_lerp_w);
         SET(L.time_mix_lerp_k); SET(L.time_mix_lerp_v);
         SET(L.time_mix_lerp_r); SET(L.time_mix_lerp_g);
         SET(L.time_mix_lerp_fused);
 
-        SET(L.time_mix_first); SET(L.time_mix_decay);
-        SET(L.time_mix_decay_w1); SET(L.time_mix_decay_w2);
-        SET(L.time_mix_key);  SET(L.time_mix_key_b);
-        SET(L.time_mix_value); SET(L.time_mix_value_b);
+        SET(L.time_mix_first);      SET(L.time_mix_decay);
+        SET(L.time_mix_decay_w1);   SET(L.time_mix_decay_w2);
+        SET(L.time_mix_key);        SET(L.time_mix_key_b);
+        SET(L.time_mix_value);      SET(L.time_mix_value_b);
         SET(L.time_mix_receptance); SET(L.time_mix_receptance_b);
         SET(L.time_mix_gate);
 
+        // rwkv7
         SET(L.time_mix_w0);
-        SET(L.time_mix_a0); SET(L.time_mix_a1); SET(L.time_mix_a2);
-        SET(L.time_mix_v0); SET(L.time_mix_v1); SET(L.time_mix_v2);
-        SET(L.time_mix_g1); SET(L.time_mix_g2);
+        SET(L.time_mix_a0);  SET(L.time_mix_a1);  SET(L.time_mix_a2);
+        SET(L.time_mix_v0);  SET(L.time_mix_v1);  SET(L.time_mix_v2);
+        SET(L.time_mix_g1);  SET(L.time_mix_g2);
         SET(L.time_mix_k_k); SET(L.time_mix_k_a); SET(L.time_mix_r_k);
 
-        SET(L.time_mix_ln);   SET(L.time_mix_ln_b);
+        SET(L.time_mix_ln);  SET(L.time_mix_ln_b);
         SET(L.time_mix_output);
 
-        SET(L.channel_mix_lerp_k);
-        SET(L.channel_mix_lerp_r);
-        SET(L.channel_mix_key);
-        SET(L.channel_mix_receptance);
+        SET(L.channel_mix_lerp_k);   SET(L.channel_mix_lerp_r);
+
+        SET(L.channel_mix_key);      SET(L.channel_mix_receptance);
         SET(L.channel_mix_value);
 
-        // rope & bitnet scales
+        // long rope factors
         SET(L.rope_long); SET(L.rope_short); SET(L.rope_freqs);
-        SET(L.wq_scale); SET(L.wk_scale); SET(L.wv_scale); SET(L.wo_scale);
-        SET(L.ffn_gate_scale); SET(L.ffn_up_scale); SET(L.ffn_down_scale);
+
+        // bitnet scale
+        SET(L.wq_s);   SET(L.wk_s);   SET(L.wv_s);   SET(L.wo_s);
+        SET(L.wqkv_s); SET(L.wqkv_gate_s);
+        SET(L.ffn_gate_s);       SET(L.ffn_up_s);       SET(L.ffn_down_s);
+        SET(L.ffn_gate_shexp_s); SET(L.ffn_up_shexp_s); SET(L.ffn_down_shexp_s);
+        SET(L.ssm_in_s);    SET(L.ssm_out_s);
+        SET(L.ssm_alpha_s); SET(L.ssm_beta_s);
+
+        // input scales
+        SET(L.wq_in_s);   SET(L.wk_in_s);   SET(L.wv_in_s);   SET(L.wo_in_s);
+        SET(L.wqkv_in_s); SET(L.wqkv_gate_in_s);
+        SET(L.ffn_gate_in_s);       SET(L.ffn_up_in_s);        SET(L.ffn_down_in_s);
+        SET(L.ffn_gate_exps_in_s);  SET(L.ffn_down_exps_in_s); SET(L.ffn_up_exps_in_s);
+        SET(L.ffn_gate_shexp_in_s); SET(L.ffn_up_shexp_in_s);  SET(L.ffn_down_shexp_in_s);
+        SET(L.ssm_in_in_s);    SET(L.ssm_out_in_s);
+        SET(L.ssm_alpha_in_s); SET(L.ssm_beta_in_s);
+
+        // altup & laurel
+        SET(L.per_layer_inp_gate); SET(L.per_layer_proj); SET(L.per_layer_post_norm);
+        SET(L.altup_correct_coef);  SET(L.altup_correct_scale);
+        SET(L.altup_predict_coef);  SET(L.altup_router);
+        SET(L.altup_router_norm);
+        SET(L.laurel_l);  SET(L.laurel_r);
+        SET(L.laurel_post_norm);
+
+        // openai-moe
+        SET(L.attn_sinks);
+
+        // cogvlm
+        SET(L.visexp_attn_wqkv);  SET(L.visexp_attn_wo);
+        SET(L.visexp_ffn_gate);   SET(L.visexp_ffn_down);
+        SET(L.visexp_ffn_up);
+
+        // xIELU activation parameters for Apertus
+        SET(L.ffn_act_alpha_n);  SET(L.ffn_act_alpha_p);
+        SET(L.ffn_act_beta);     SET(L.ffn_act_eps);
+
+        // Kimi Linear KDA
+        SET(L.ssm_q_conv); SET(L.ssm_k_conv); SET(L.ssm_v_conv);
+        SET(L.ssm_f_a);    SET(L.ssm_f_b);    SET(L.ssm_beta);
+        SET(L.ssm_g_a);    SET(L.ssm_g_b);    SET(L.ssm_o_norm);
+
+        // DSA
+        SET(L.indexer_k_norm); SET(L.indexer_k_norm_b); SET(L.indexer_proj);
+        SET(L.indexer_attn_k); SET(L.indexer_attn_q_b);
+
+        // gemma4 layer output scale, reused for talkie embedding skip scale
+        SET(L.out_scale);
     }
 
     // keep the name map coherent too

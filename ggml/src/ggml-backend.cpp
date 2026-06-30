@@ -743,6 +743,10 @@ static struct ggml_tensor * ggml_dup_tensor_layout(struct ggml_context * ctx, co
     return dup;
 }
 
+struct ggml_tensor * ggml_dup_tensor_layout_public(struct ggml_context * ctx, const struct ggml_tensor * tensor) {
+    return ggml_dup_tensor_layout(ctx, tensor);
+}
+
 static bool ggml_is_view_op(enum ggml_op op) {
     return op == GGML_OP_VIEW || op == GGML_OP_RESHAPE || op == GGML_OP_PERMUTE || op == GGML_OP_TRANSPOSE;
 }
@@ -812,6 +816,9 @@ struct ggml_backend_sched {
 
     ggml_backend_sched_eval_callback callback_eval;
     void * callback_eval_user_data;
+
+    ggml_backend_sched_graph_callback callback_graph;
+    void * callback_graph_user_data;
 
     char * context_buffer;
     size_t context_buffer_size;
@@ -1484,6 +1491,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     for (int i = 0; i < sched->n_splits; ++i) {
         sched->splits[i].graph.uid = ggml_graph_next_uid();
     }
+
+    if (sched->callback_graph)
+        sched->callback_graph(sched, graph, sched->callback_graph_user_data);
 }
 
 static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
@@ -1922,6 +1932,12 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_eval = callback;
     sched->callback_eval_user_data = user_data;
+}
+
+void ggml_backend_sched_set_graph_callback(ggml_backend_sched_t sched, ggml_backend_sched_graph_callback callback, void * user_data) {
+    GGML_ASSERT(sched);
+    sched->callback_graph = callback;
+    sched->callback_graph_user_data = user_data;
 }
 
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {

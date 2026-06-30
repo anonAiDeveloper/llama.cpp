@@ -92,6 +92,8 @@ static const ggml_backend_buffer_i cuda_arena_iface = {
     /*memset_tensor*/ nullptr,
     /*set_tensor*/    cuda_arena_set_tensor,
     /*get_tensor*/    cuda_arena_get_tensor,
+    /*set_tensor_2d*/ nullptr,
+    /*get_tensor_2d*/ nullptr,
     /*cpy_tensor*/    cuda_arena_cpy_tensor,
     /*clear*/         cuda_arena_clear,
     /*reset*/         nullptr,

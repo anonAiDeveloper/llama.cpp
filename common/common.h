@@ -486,6 +486,8 @@ struct common_params {
 
     ggml_backend_sched_eval_callback cb_eval = nullptr;
     void * cb_eval_user_data                 = nullptr;
+    ggml_backend_sched_graph_callback cb_graph = nullptr;
+    void * cb_graph_user_data                  = nullptr;
 
     ggml_numa_strategy numa = GGML_NUMA_STRATEGY_DISABLED;
 
@@ -891,6 +893,8 @@ struct common_init_result {
     void reset_samplers();
 
     std::vector<llama_adapter_lora_ptr> & lora();
+
+    void init_parameter_offloader(common_params & params);
 
 private:
     struct impl;

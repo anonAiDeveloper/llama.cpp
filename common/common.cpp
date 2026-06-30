@@ -55,9 +55,15 @@
 #include <pwd.h>
 #endif
 
+#include "../src/llama-context.h"
+#include "../src/llama-parameter-offloader.h"
+#include "../ggml/include/ggml-cuda-arena.h"
+
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
 #endif
+
+#define VRAM_GBS 4
 
 common_time_meas::common_time_meas(int64_t & t_acc, bool disable) : t_start_us(disable ? -1 : ggml_time_us()), t_acc(t_acc) {}
 
@@ -1187,6 +1193,8 @@ struct common_init_result::impl {
     llama_model_ptr   model;
     llama_context_ptr context;
 
+    std::unique_ptr<parameter_offloader> param_offloader;
+
     std::vector<llama_adapter_lora_ptr> lora;
 
     std::vector<common_sampler_ptr> samplers;
@@ -1289,6 +1297,16 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         cparams.n_samplers = pimpl->samplers_seq_config.size();
     }
 
+#ifndef DISABLE_OFFLOADER
+    pimpl->param_offloader.reset(new parameter_offloader(model));
+
+    cparams.cb_eval = llama_offloader_eval_cb;
+    cparams.cb_eval_user_data = pimpl->param_offloader.get();
+
+    cparams.cb_graph = llama_offloader_graph_cb;
+    cparams.cb_graph_user_data = pimpl->param_offloader.get();
+#endif
+
     llama_context * lctx = llama_init_from_model(model, cparams);
     if (lctx == NULL) {
         COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
@@ -1321,6 +1339,42 @@ void common_init_result::reset_samplers() {
 
 std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
     return pimpl->lora;
+}
+
+void common_init_result::init_parameter_offloader(common_params & params) {
+#ifndef DISABLE_OFFLOADER
+    if (!pimpl->param_offloader) {
+        return;
+    }
+
+    llama_model * model = pimpl->model.get();
+    llama_context * lctx = pimpl->context.get();
+
+    if (!model || !lctx) {
+        return;
+    }
+
+    ggml_backend_dev_t cuda_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (!cuda_dev) {
+        return;
+    }
+
+    const size_t arena_bytes = (size_t) VRAM_GBS * 1024ull * 1024ull * 1024ull;
+
+    ggml_backend_buffer_t arena = ggml_cuda_arena_create_on(cuda_dev, arena_bytes, 0);
+    if (!arena) {
+        return;
+    }
+
+    const size_t MB = 1024ull * 1024ull;
+    ggml_init_params twins = { 64 * MB, nullptr, true };
+
+    auto cparams = common_context_params_to_llama(params);
+
+    pimpl->param_offloader->init(arena, cparams, ggml_init(twins), lctx);
+#else
+    (void) params;
+#endif
 }
 
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
@@ -1397,6 +1451,8 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
     if (!params.lora_init_without_apply) {
         common_set_adapter_lora(lctx, params.lora_adapters);
     }
+
+    res->init_parameter_offloader(params);
 
     if (params.warmup) {
         COM_TRC("%s", "warming up the model with an empty run - please wait ... (--no-warmup to disable)\n");
@@ -1592,6 +1648,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.flash_attn_type   = params.flash_attn_type;
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
+    cparams.cb_graph           = params.cb_graph;
+    cparams.cb_graph_user_data = params.cb_graph_user_data;
     cparams.offload_kqv       = !params.no_kv_offload;
     cparams.no_perf           = params.no_perf;
     cparams.op_offload        = !params.no_op_offload;

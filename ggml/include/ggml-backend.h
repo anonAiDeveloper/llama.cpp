@@ -313,6 +313,9 @@ extern "C" {
     //
     typedef bool (*ggml_backend_sched_eval_callback)(struct ggml_tensor * t, bool ask, void * user_data);
 
+    // Callback for each backend schedule (set with ggml_backend_sched_set_graph_callback)
+    typedef bool (*ggml_backend_sched_graph_callback)(ggml_backend_sched_t sched, struct ggml_cgraph * graph, void * user_data);
+
     // Initialize a backend scheduler, backends with low index are given priority over backends with high index
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
@@ -350,6 +353,9 @@ extern "C" {
 
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
+
+    // Set a callback to be called for each backend schedule after sched allocation
+    GGML_API void                 ggml_backend_sched_set_graph_callback(ggml_backend_sched_t sched, ggml_backend_sched_graph_callback callback, void * user_data);
 
     //
     // Meta backend
@@ -412,6 +418,8 @@ extern "C" {
         struct ggml_context * ctx_unallocated;
         struct ggml_cgraph * graph;
     };
+
+    GGML_API struct ggml_tensor * ggml_dup_tensor_layout_public(struct ggml_context * ctx, const struct ggml_tensor * tensor);
 
     // Copy a graph to a different backend
     GGML_API struct ggml_backend_graph_copy ggml_backend_graph_copy(ggml_backend_t backend, struct ggml_cgraph * graph);
