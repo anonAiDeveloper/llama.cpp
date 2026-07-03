@@ -34,6 +34,10 @@
 #include "ggml-cuda.h"
 #endif
 
+#ifdef GGML_USE_CUDA_ARENA
+#include "ggml-cuda-arena.h"
+#endif
+
 #ifdef GGML_USE_METAL
 #include "ggml-metal.h"
 #endif
@@ -113,6 +117,9 @@ struct ggml_backend_registry {
     std::vector<ggml_backend_dev_t> devices;
 
     ggml_backend_registry() {
+#if defined GGML_USE_CUDA_ARENA
+        register_backend(ggml_backend_cuda_arena_reg());
+#endif
 #ifdef GGML_USE_CUDA
         register_backend(ggml_backend_cuda_reg());
 #endif

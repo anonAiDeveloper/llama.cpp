@@ -18,6 +18,8 @@
 #include <limits>
 #include <stdexcept>
 
+#include "../ggml/include/ggml-cuda-arena.h"
+
 //
 // llama_context
 //
@@ -295,6 +297,60 @@ llama_context::llama_context(
             throw std::runtime_error("failed to initialize CPU backend");
         }
         backends.emplace_back(backend_cpu);
+
+        // bind CUDA_ARENA delegates here
+        // CUDA_ARENA requires a pointer to the CUDA and CPU backends
+        for (auto & backend_arena_ptr : backends)
+        {
+            ggml_backend_t backend_arena = backend_arena_ptr.get();
+
+            if (!ggml_backend_is_cuda_arena(backend_arena))
+                continue;
+
+            ggml_backend_dev_t arena_dev = ggml_backend_get_device(backend_arena);
+            const char * arena_name = ggml_backend_dev_name(arena_dev);
+
+            ggml_backend_t backend_cuda = nullptr;
+
+            for (auto & backend_gpu_ptr : backends)
+            {
+                ggml_backend_t candidate = backend_gpu_ptr.get();
+
+                if (candidate == backend_arena)
+                    continue;
+
+                ggml_backend_dev_t candidate_dev = ggml_backend_get_device(candidate);
+                if (candidate_dev == nullptr)
+                    continue;
+
+                const char * candidate_name = ggml_backend_dev_name(candidate_dev);
+
+                // crude version; replace with device ordinal / pci_bus_id match if preferred
+                // e.g. CUDA_ARENA0 -> CUDA0
+                if (strncmp(arena_name, "CUDA_ARENA", strlen("CUDA_ARENA")) == 0)
+                {
+                    int arena_device = atoi(arena_name + strlen("CUDA_ARENA"));
+
+                    char cuda_name[32];
+                    snprintf(cuda_name, sizeof(cuda_name), "CUDA%d", arena_device);
+
+                    if (strcmp(candidate_name, cuda_name) == 0)
+                    {
+                        backend_cuda = candidate;
+                        break;
+                    }
+                }
+            }
+
+            if (backend_cuda == nullptr)
+                throw std::runtime_error(format("failed to find CUDA delegate for %s", arena_name));
+
+            ggml_backend_cuda_arena_set_delegates(
+                backend_arena,
+                backend_cuda,
+                backend_cpu
+            );
+        }
 
         // create a list of the set_n_threads functions in the backends
         for (auto & backend : backends) {
