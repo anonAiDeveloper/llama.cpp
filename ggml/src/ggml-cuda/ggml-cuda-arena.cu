@@ -279,11 +279,35 @@ static enum ggml_status ggml_backend_cuda_arena_graph_compute(
     ggml_backend_t backend,
     ggml_cgraph * graph
 ) {
-    GGML_UNUSED(backend);
-    GGML_UNUSED(graph);
+    auto * ctx = (ggml_backend_cuda_arena_context *) backend->context;
 
-    GGML_LOG_ERROR("%s: CUDA_ARENA received graph_compute while supports_op=false\n", __func__);
-    return GGML_STATUS_FAILED;
+    if (ctx->backend_cpu == nullptr) {
+        GGML_LOG_ERROR("%s: missing CPU delegate\n", __func__);
+        return GGML_STATUS_FAILED;
+    }
+
+    if (ctx->backend_cuda == nullptr) {
+        GGML_LOG_ERROR("%s: missing CUDA delegate\n", __func__);
+        return GGML_STATUS_FAILED;
+    }
+
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        ggml_tensor * node = graph->nodes[i];
+
+        if (node->op != GGML_OP_MUL_MAT_ID) {
+            GGML_LOG_ERROR(
+                "%s: unexpected op %s node=%s\n",
+                __func__,
+                ggml_op_name(node->op),
+                ggml_get_name(node)
+            );
+            return GGML_STATUS_FAILED;
+        }
+    }
+
+    GGML_LOG_INFO("%s: delegating %d MoE node(s) to CPU\n", __func__, graph->n_nodes);
+
+    return ggml_backend_graph_compute(ctx->backend_cpu, graph);
 }
 
 static const ggml_backend_i ggml_backend_cuda_arena_interface = {
@@ -431,14 +455,11 @@ static void ggml_backend_cuda_arena_device_get_memory(ggml_backend_dev_t dev, si
 }
 
 static enum ggml_backend_dev_type ggml_backend_cuda_arena_device_get_type(ggml_backend_dev_t dev) {
-    ggml_backend_cuda_arena_device_context * ctx = (ggml_backend_cuda_arena_device_context *) dev->context;
+    GGML_UNUSED(dev);
 
-    cudaDeviceProp prop;
-    CUDA_CHECK(cudaGetDeviceProperties(&prop, ctx->device));
-
-    return prop.integrated
-        ? GGML_BACKEND_DEVICE_TYPE_IGPU
-        : GGML_BACKEND_DEVICE_TYPE_GPU;
+    // CUDA_ARENA is not a model placement GPU.
+    // It is a scheduler-side accelerator backend for selected MoE ops.
+    return GGML_BACKEND_DEVICE_TYPE_ACCEL;
 }
 
 static void ggml_backend_cuda_arena_device_get_props(ggml_backend_dev_t dev, ggml_backend_dev_props * props) {
@@ -447,7 +468,11 @@ static void ggml_backend_cuda_arena_device_get_props(ggml_backend_dev_t dev, ggm
     props->name        = ggml_backend_cuda_arena_device_get_name(dev);
     props->description = ggml_backend_cuda_arena_device_get_description(dev);
     props->type        = ggml_backend_cuda_arena_device_get_type(dev);
-    props->device_id   = ctx->pci_bus_id.empty() ? nullptr : ctx->pci_bus_id.c_str();
+
+    // CUDA_ARENA must not claim the physical CUDA PCI id.
+    // Otherwise llama_prepare_model_devices deduplicates it against CUDA0.
+    props->device_id   = nullptr;
+
     ggml_backend_cuda_arena_device_get_memory(dev, &props->memory_free, &props->memory_total);
 
     bool host_buffer = getenv("GGML_CUDA_NO_PINNED") == nullptr;
@@ -484,13 +509,29 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_arena_device_get_buffer_type
     return ggml_backend_cuda_buffer_type(ctx->device);
 }
 
-//TODO: support GGML_OP_MUL_MAT_ID for MoE
 static bool ggml_backend_cuda_arena_device_supports_op(
     ggml_backend_dev_t dev,
     const ggml_tensor * op
 ) {
     GGML_UNUSED(dev);
-    GGML_UNUSED(op);
+
+    if (op->op != GGML_OP_MUL_MAT_ID)
+        return false;
+
+    const char * name = ggml_get_name(op);
+
+    // Start narrow. Adjust names to whatever your graph actually emits.
+    if (name
+         && (strstr(name, "ffn_moe")  ||
+        strstr(name, "ffn_gate") ||
+        strstr(name, "ffn_up")   ||
+        strstr(name, "ffn_down"))
+    )
+    {
+        GGML_LOG_INFO("%s: returning true for %s\n", __func__, name);
+        return true;
+    }
+
     return false;
 }
 
@@ -513,6 +554,30 @@ static bool ggml_backend_cuda_arena_device_supports_buft(
     return false;
 }
 
+static bool ggml_backend_cuda_arena_device_offload_op(
+    ggml_backend_dev_t dev,
+    const ggml_tensor * op
+) {
+    GGML_UNUSED(dev);
+
+    if (op->op != GGML_OP_MUL_MAT_ID)
+        return false;
+
+    const char * name = ggml_get_name(op);
+
+    if (name 
+         && (strstr(name, "ffn_moe_gate") ||
+        strstr(name, "ffn_moe_up")   ||
+        strstr(name, "ffn_moe_down"))
+    )
+    {
+        GGML_LOG_INFO("%s: returning true for %s\n", __func__, name);
+        return true;
+    }
+
+    return false;
+}
+
 static const ggml_backend_device_i ggml_backend_cuda_arena_device_interface = {
     /* .get_name                = */ ggml_backend_cuda_arena_device_get_name,
     /* .get_description         = */ ggml_backend_cuda_arena_device_get_description,
@@ -525,7 +590,7 @@ static const ggml_backend_device_i ggml_backend_cuda_arena_device_interface = {
     /* .buffer_from_host_ptr    = */ NULL,
     /* .supports_op             = */ ggml_backend_cuda_arena_device_supports_op,
     /* .supports_buft           = */ ggml_backend_cuda_arena_device_supports_buft,
-    /* .offload_op              = */ NULL,
+    /* .offload_op              = */ ggml_backend_cuda_arena_device_offload_op,
     /* .event_new               = */ NULL,
     /* .event_free              = */ NULL,
     /* .event_synchronize       = */ NULL,

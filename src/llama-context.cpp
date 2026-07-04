@@ -18,7 +18,10 @@
 #include <limits>
 #include <stdexcept>
 
+#ifdef GGML_USE_CUDA_ARENA
 #include "../ggml/include/ggml-cuda-arena.h"
+#include <utility>
+#endif
 
 //
 // llama_context
@@ -298,6 +301,7 @@ llama_context::llama_context(
         }
         backends.emplace_back(backend_cpu);
 
+#ifdef GGML_USE_CUDA_ARENA
         // bind CUDA_ARENA delegates here
         // CUDA_ARENA requires a pointer to the CUDA and CPU backends
         for (auto & backend_arena_ptr : backends)
@@ -351,6 +355,36 @@ llama_context::llama_context(
                 backend_cpu
             );
         }
+
+        // Give CUDA_ARENA scheduler priority over normal CUDA.
+        std::stable_sort(backends.begin(), backends.end(),
+            [](const ggml_backend_ptr & a, const ggml_backend_ptr & b) {
+                const bool a_arena = ggml_backend_is_cuda_arena(a.get());
+                const bool b_arena = ggml_backend_is_cuda_arena(b.get());
+
+                if (a_arena != b_arena) {
+                    return a_arena;
+                }
+
+                return false;
+            });
+
+        LLAMA_LOG_INFO("%s: backend order after CUDA_ARENA binding:\n", __func__);
+        for (size_t i = 0; i < backends.size(); ++i) {
+            ggml_backend_t backend = backends[i].get();
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+
+            const char * backend_name = backend ? ggml_backend_name(backend) : "(null backend)";
+            const char * dev_name     = dev ? ggml_backend_dev_name(dev) : "(null dev)";
+
+            LLAMA_LOG_INFO("%s:   backends[%zu] backend=%s dev=%s%s\n",
+                __func__,
+                i,
+                backend_name,
+                dev_name,
+                ggml_backend_is_cuda_arena(backend) ? "  <-- CUDA_ARENA" : "");
+        }
+#endif
 
         // create a list of the set_n_threads functions in the backends
         for (auto & backend : backends) {
