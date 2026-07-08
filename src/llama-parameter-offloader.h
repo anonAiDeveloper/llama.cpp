@@ -14,6 +14,8 @@
 #include <mutex>
 #include <unordered_set>
 
+#define USE_UNMANAGED_WEIGHTS
+
 // signature must match ggml_backend_sched_eval_callback
 bool llama_offloader_eval_cb(ggml_tensor * t, bool ask, void * ud);
 bool llama_offloader_graph_cb(ggml_backend_sched_t sched, struct ggml_cgraph * graph, void * ud);
@@ -66,10 +68,22 @@ public:
     void build_schedule_gates(offloader_schedule & schedule); // compute copy barriers
 
     // Fast lookups
-    // GPU->CPU: answer “what CPU weight backs this GPU twin?”
+    // GPU->CPU: answer "what CPU weight backs this GPU twin?"
     std::unordered_map<ggml_tensor*, ggml_tensor*> gpu2cpu;
-    // CPU->GPU: answer “do we already have a GPU twin for this CPU weight?”
+    // CPU->GPU: answer "do we already have a GPU twin for this CPU weight?"
     std::unordered_map<ggml_tensor*, ggml_tensor*> cpu2gpu;
+
+#ifdef USE_UNMANAGED_WEIGHTS
+    std::unordered_map<ggml_tensor *, ggml_tensor *> unmanaged_gpu2cpu;
+    std::unordered_map<ggml_tensor *, ggml_tensor *> unmanaged_cpu2gpu;
+
+    // Must preserve original CPU tensors by name even after patch_model_refs_for()
+    // changes model->tensors_by_name to point at GPU/placeholder twins.
+    std::unordered_map<std::string, ggml_tensor *> cpu_weight_by_name;
+
+    void init_unmanaged_moe_placeholders();
+    ggml_tensor * init_cpu_tensor_to_unmanaged_arena_placeholder(ggml_tensor * w_cpu);
+#endif
 
     //map the gpu tensors to hashes recorded at init, to ensure data integrity
     std::unordered_map<ggml_tensor*, uint64_t> gpu_hashes;
@@ -136,5 +150,10 @@ private:
     void publish_copy_when_ready(long long ordinal, uint64_t generation, ggml_cuda_copy_event * ev);
     void publish_copy_now(long long ordinal, uint64_t generation);
 public:
-    inline ggml_cuda_copy_event * upload_weight_auto(ggml_tensor *w_cpu, ggml_tensor *w_gpu);
+    inline ggml_cuda_copy_event * upload_weight_auto(ggml_tensor *w_cpu, ggml_tensor *w_gpu);       //TODO: Why is this public?
+
+    ggml_tensor * get_cpu_mirror_for_arena(const ggml_tensor * t) const;
+    ggml_tensor * get_gpu_twin_for_arena(const ggml_tensor * t) const;
+
+    void bind_cuda_arena_backend(ggml_backend_t backend_arena);
 };

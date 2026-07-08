@@ -1372,6 +1372,11 @@ void common_init_result::init_parameter_offloader(common_params & params) {
     auto cparams = common_context_params_to_llama(params);
 
     pimpl->param_offloader->init(arena, cparams, ggml_init(twins), lctx);
+
+    ggml_backend_t backend_arena = lctx->get_backend_cuda_arena();
+    if (backend_arena)
+        pimpl->param_offloader->bind_cuda_arena_backend(backend_arena);
+
 #else
     (void) params;
 #endif

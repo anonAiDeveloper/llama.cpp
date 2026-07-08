@@ -528,6 +528,20 @@ llama_context::~llama_context() {
     ggml_opt_free(opt_ctx);
 }
 
+ggml_backend_t llama_context::get_backend_cuda_arena() const {
+#ifdef GGML_USE_CUDA_ARENA
+    for (const auto & backend_ptr : backends) {
+        ggml_backend_t backend = backend_ptr.get();
+
+        if (ggml_backend_is_cuda_arena(backend)) {
+            return backend;
+        }
+    }
+#endif
+
+    return nullptr;
+}
+
 void llama_context::sched_reserve() {
     if (!sched_need_reserve) {
         return;

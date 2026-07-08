@@ -102,6 +102,9 @@ struct llama_context {
     const llama_token * get_sampled_candidates_ith(int32_t idx);
     size_t get_sampled_candidates_count(int32_t idx);
 
+    //TODO: Is there a more elegant way to get the cuda_arena? This seems ham-fisted
+    ggml_backend_t get_backend_cuda_arena() const;
+
     void attach_threadpool(
             ggml_threadpool_t threadpool,
             ggml_threadpool_t threadpool_batch);

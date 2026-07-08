@@ -52,6 +52,15 @@ GGML_BACKEND_API bool   ggml_cuda_arena_place(ggml_backend_buffer_t arena,
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cuda_arena_reg(void);
 
+struct ggml_cuda_arena_offloader_i
+{
+    void * user_data;
+
+    ggml_tensor * (*get_cpu_mirror)(   void * user_data, const ggml_tensor * tensor);
+    ggml_tensor * (*get_gpu_twin)(     void * user_data, const ggml_tensor * tensor);
+};
+GGML_BACKEND_API void ggml_backend_cuda_arena_set_offloader(ggml_backend_t backend_arena, const ggml_cuda_arena_offloader_i * offloader);
+
 #ifdef  __cplusplus
 }
 #endif
