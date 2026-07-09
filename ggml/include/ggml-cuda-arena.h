@@ -61,6 +61,8 @@ struct ggml_cuda_arena_offloader_i
 };
 GGML_BACKEND_API void ggml_backend_cuda_arena_set_offloader(ggml_backend_t backend_arena, const ggml_cuda_arena_offloader_i * offloader);
 
+GGML_BACKEND_API enum ggml_status ggml_backend_cuda_arena_prebuild_cpu_fallbacks(ggml_backend_t backend_arena, ggml_cgraph * graph);
+
 #ifdef  __cplusplus
 }
 #endif

@@ -155,5 +155,6 @@ public:
     ggml_tensor * get_cpu_mirror_for_arena(const ggml_tensor * t) const;
     ggml_tensor * get_gpu_twin_for_arena(const ggml_tensor * t) const;
 
+    ggml_backend_t backend_arena = nullptr;
     void bind_cuda_arena_backend(ggml_backend_t backend_arena);
 };

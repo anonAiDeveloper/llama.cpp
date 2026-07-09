@@ -1842,6 +1842,15 @@ bool llama_offloader_graph_cb(ggml_backend_sched_t sched, struct ggml_cgraph * g
 
     const bool schedule_changed = po->swap_next_schedule(); // true if retarget moved tensors for this graph
 
+    if (po->backend_arena) {
+        enum ggml_status st = ggml_backend_cuda_arena_prebuild_cpu_fallbacks(po->backend_arena, graph);
+
+        if (st != GGML_STATUS_SUCCESS) {
+            LLAMA_LOG_ERROR("%s: CUDA_ARENA CPU fallback prebuild failed, status=%d\n", __func__, (int) st);
+            return false;
+        }
+    }
+
 #endif /* ifndef LLAMA_NAIVE_OFFLOADER */
     return true;
 }
@@ -2177,6 +2186,8 @@ static ggml_tensor * po_arena_get_gpu_twin(void * ud, const ggml_tensor * t) {
 }
 
 void parameter_offloader::bind_cuda_arena_backend(ggml_backend_t backend_arena) {
+    this->backend_arena = backend_arena;
+
     ggml_cuda_arena_offloader_i iface = {};
     iface.user_data         = this;
     iface.get_cpu_mirror    = po_arena_get_cpu_mirror;

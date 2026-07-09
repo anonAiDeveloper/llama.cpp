@@ -1,3 +1,4 @@
+#include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"   // for ggml_backend_buffer_init()
 #include "ggml-impl.h"
@@ -255,15 +256,86 @@ struct ggml_backend_cuda_arena_device_context {
     //int op_offload_min_batch_size;
 };
 
+struct ggml_cuda_arena_cpu_fb_key {
+    const ggml_tensor * cpu_src0;
+
+    ggml_type src1_type;
+    ggml_type ids_type;
+    ggml_type dst_type;
+
+    int64_t src1_ne[4];
+    int64_t ids_ne[4];
+    int64_t dst_ne[4];
+
+    size_t src1_nb[4];
+    size_t ids_nb[4];
+    size_t dst_nb[4];
+
+    bool operator==(const ggml_cuda_arena_cpu_fb_key & other) const {
+        if (cpu_src0  != other.cpu_src0)  return false;
+        if (src1_type != other.src1_type) return false;
+        if (ids_type  != other.ids_type)  return false;
+        if (dst_type  != other.dst_type)  return false;
+
+        for (int i = 0; i < 4; ++i) {
+            if (src1_ne[i] != other.src1_ne[i]) return false;
+            if (ids_ne [i] != other.ids_ne [i]) return false;
+            if (dst_ne [i] != other.dst_ne [i]) return false;
+
+            if (src1_nb[i] != other.src1_nb[i]) return false;
+            if (ids_nb [i] != other.ids_nb [i]) return false;
+            if (dst_nb [i] != other.dst_nb [i]) return false;
+        }
+
+        return true;
+    }
+};
+
+struct ggml_cuda_arena_cpu_fb_key_hash {
+    size_t operator()(const ggml_cuda_arena_cpu_fb_key & key) const {
+        size_t h = (size_t) (uintptr_t) key.cpu_src0;
+
+        auto mix = [&](uint64_t v) {
+            h ^= (size_t) v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+        };
+
+        mix((uint64_t) key.src1_type);
+        mix((uint64_t) key.ids_type);
+        mix((uint64_t) key.dst_type);
+
+        for (int i = 0; i < 4; ++i) {
+            mix((uint64_t) key.src1_ne[i]);
+            mix((uint64_t) key.ids_ne [i]);
+            mix((uint64_t) key.dst_ne [i]);
+
+            mix((uint64_t) key.src1_nb[i]);
+            mix((uint64_t) key.ids_nb [i]);
+            mix((uint64_t) key.dst_nb [i]);
+        }
+
+        return h;
+    }
+};
+
+struct ggml_cuda_arena_cpu_fb_plan {
+    ggml_context * ctx = nullptr;
+    ggml_backend_buffer_t buffer = nullptr;
+
+    ggml_tensor * cpu_src1 = nullptr;
+    ggml_tensor * cpu_ids  = nullptr;
+    ggml_tensor * cpu_dst  = nullptr;
+
+    ggml_cgraph * graph = nullptr;
+};
+
 struct ggml_cuda_arena_cpu_fallback_scratch {
     std::mutex mutex;
 
-    ggml_context * meta_ctx = nullptr;
-    void         * meta_mem = nullptr;
-    size_t         meta_size = 0;
-
-    ggml_backend_buffer_t data_buf = nullptr;
-    size_t                data_size = 0;
+    std::unordered_map<
+        ggml_cuda_arena_cpu_fb_key,
+        ggml_cuda_arena_cpu_fb_plan,
+        ggml_cuda_arena_cpu_fb_key_hash
+    > plans;
 };
 
 struct ggml_backend_cuda_arena_context {
@@ -287,246 +359,236 @@ static const char * ggml_backend_cuda_arena_get_name(ggml_backend_t backend) {
 static void ggml_backend_cuda_arena_free(ggml_backend_t backend) {
     ggml_backend_cuda_arena_context * ctx = (ggml_backend_cuda_arena_context *) backend->context;
 
-    if (ctx->cpu_fb.data_buf != nullptr) {
-        ggml_backend_buffer_free(ctx->cpu_fb.data_buf);
-        ctx->cpu_fb.data_buf = nullptr;
+    for (auto & kv : ctx->cpu_fb.plans) {
+        ggml_cuda_arena_cpu_fb_plan & plan = kv.second;
+
+        if (plan.buffer != nullptr) {
+            ggml_backend_buffer_free(plan.buffer);
+            plan.buffer = nullptr;
+        }
+
+        if (plan.ctx != nullptr) {
+            ggml_free(plan.ctx);
+            plan.ctx = nullptr;
+        }
     }
 
-    if (ctx->cpu_fb.meta_ctx != nullptr) {
-        ggml_free(ctx->cpu_fb.meta_ctx);
-        ctx->cpu_fb.meta_ctx = nullptr;
-    }
-
-    if (ctx->cpu_fb.meta_mem != nullptr) {
-        free(ctx->cpu_fb.meta_mem);
-        ctx->cpu_fb.meta_mem = nullptr;
-    }
+    ctx->cpu_fb.plans.clear();
 
     delete ctx;
     delete backend;
 }
 
-static inline size_t ggml_cuda_arena_align_up(size_t x, size_t a) {
-    return (x + (a - 1)) & ~(a - 1);
+static ggml_cuda_arena_cpu_fb_key ggml_cuda_arena_make_cpu_fb_key(
+    const ggml_tensor * cpu_src0,
+    const ggml_tensor * src1,
+    const ggml_tensor * ids,
+    const ggml_tensor * dst
+) {
+    ggml_cuda_arena_cpu_fb_key key = {};
+
+    key.cpu_src0  = cpu_src0;
+    key.src1_type = src1->type;
+    key.ids_type  = ids->type;
+    key.dst_type  = dst->type;
+
+    for (int i = 0; i < 4; ++i) {
+        key.src1_ne[i] = src1->ne[i];
+        key.ids_ne [i] = ids ->ne[i];
+        key.dst_ne [i] = dst ->ne[i];
+
+        key.src1_nb[i] = src1->nb[i];
+        key.ids_nb [i] = ids ->nb[i];
+        key.dst_nb [i] = dst ->nb[i];
+    }
+
+    return key;
 }
 
-static enum ggml_status ggml_cuda_arena_cpu_fallback_mul_mat_id(
-    ggml_backend_t backend,
+static ggml_cuda_arena_cpu_fb_plan * ggml_cuda_arena_get_or_create_cpu_fb_plan(
+    ggml_backend_cuda_arena_context * ctx,
+    const ggml_cuda_arena_cpu_fb_key & key,
+    ggml_tensor * cpu_src0,
+    ggml_tensor * src1,
+    ggml_tensor * ids,
     ggml_tensor * node
 ) {
-    auto * ctx = (ggml_backend_cuda_arena_context *) backend->context;
+    auto it = ctx->cpu_fb.plans.find(key);
+    if (it != ctx->cpu_fb.plans.end())
+        return &it->second;
 
-    GGML_ASSERT(ctx);
-    GGML_ASSERT(node);
-    GGML_ASSERT(node->op == GGML_OP_MUL_MAT_ID);
+    ggml_init_params params = {
+        /* .mem_size   = */ 256 * 1024,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
 
-    ggml_tensor * src0 = node->src[0]; // expert-bank weights
-    ggml_tensor * src1 = node->src[1]; // activation/work tensor
-    ggml_tensor * ids  = node->src[2]; // selected expert ids
+    // Create one persistent metadata context for this CPU fallback shape.
+    ggml_context * plan_ctx = ggml_init(params);
 
-    if (src0 == nullptr || src1 == nullptr || ids == nullptr) {
-        GGML_LOG_ERROR("%s: malformed MUL_MAT_ID node=%s src0=%p src1=%p ids=%p\n",
-            __func__,
-            ggml_get_name(node) ? ggml_get_name(node) : "(null)",
-            (void *) src0,
-            (void *) src1,
-            (void *) ids);
-        return GGML_STATUS_FAILED;
+    if (plan_ctx == nullptr) {
+        GGML_LOG_ERROR("%s: ggml_init failed\n", __func__);
+        return nullptr;
     }
 
-    GGML_ASSERT(ctx->backend_cpu != nullptr);
+    // Create persistent CPU input metadata matching the live activation layout.
+    ggml_tensor * cpu_src1 = ggml_dup_tensor_layout_public(plan_ctx, src1);
 
-    //if (ctx->offloader.get_cpu_mirror == nullptr) {
-    //    GGML_LOG_ERROR("%s: missing parameter_offloader bridge\n", __func__);
-    //    return GGML_STATUS_FAILED;
-    //}
-
-    // Resolve the CUDA_ARENA/proxy expert weight tensor back to its permanent CPU mirror
-    ggml_tensor * cpu_src0 = ctx->offloader.get_cpu_mirror(ctx->offloader.user_data, src0);
-
-    if (cpu_src0 == nullptr) {
-        GGML_LOG_ERROR("%s: no CPU mirror for src0=%s node=%s\n",
-            __func__,
-            ggml_get_name(src0) ? ggml_get_name(src0) : "(null)",
-            ggml_get_name(node) ? ggml_get_name(node) : "(null)");
-        return GGML_STATUS_FAILED;
-    }
-
-    if (!(cpu_src0->buffer && ggml_backend_buffer_is_host(cpu_src0->buffer))) {
-        GGML_LOG_ERROR("%s: CPU mirror is not host-backed: src0=%s cpu_src0=%s\n",
-            __func__,
-            ggml_get_name(src0) ? ggml_get_name(src0) : "(null)",
-            ggml_get_name(cpu_src0) ? ggml_get_name(cpu_src0) : "(null)");
-        return GGML_STATUS_FAILED;
-    }
-
-    // Use persistent backend-owned CPU fallback scratch instead of allocating per call.
-    ggml_cuda_arena_cpu_fallback_scratch & scratch = ctx->cpu_fb;
-
-    // Serialize use of the shared scratch context and data buffer.
-    std::lock_guard<std::mutex> lock(scratch.mutex);
-
-    if (scratch.meta_ctx == nullptr) {
-        scratch.meta_size = 1024 * 1024;
-        scratch.meta_mem  = malloc(scratch.meta_size);
-
-        if (scratch.meta_mem == nullptr) {
-            GGML_LOG_ERROR("%s: failed to allocate fallback metadata arena\n", __func__);
-            return GGML_STATUS_ALLOC_FAILED;
-        }
-
-        ggml_init_params params = {
-            /* .mem_size   = */ scratch.meta_size,
-            /* .mem_buffer = */ scratch.meta_mem,
-            /* .no_alloc   = */ true,
-        };
-
-        // Create the reusable ggml metadata context used to build tiny CPU fallback graphs.
-        scratch.meta_ctx = ggml_init(params);
-
-        if (scratch.meta_ctx == nullptr) {
-            GGML_LOG_ERROR("%s: ggml_init failed for fallback metadata context\n", __func__);
-            free(scratch.meta_mem);
-            scratch.meta_mem  = nullptr;
-            scratch.meta_size = 0;
-            return GGML_STATUS_ALLOC_FAILED;
-        }
-    }
-
-    // Clear the reusable metadata context so this call can build a fresh tiny graph.
-    ggml_reset(scratch.meta_ctx);
-
-    ggml_context * cpu_ctx = scratch.meta_ctx;
-
-    // Create CPU-side metadata clones for the dynamic activation tensor and expert-id tensor.
-    ggml_tensor * cpu_src1 = ggml_dup_tensor_layout_public(cpu_ctx, src1);
-    ggml_tensor * cpu_ids  = ggml_dup_tensor_layout_public(cpu_ctx, ids);
+    // Create persistent CPU input metadata matching the live expert-id layout.
+    ggml_tensor * cpu_ids = ggml_dup_tensor_layout_public(plan_ctx, ids);
 
     if (cpu_src1 == nullptr || cpu_ids == nullptr) {
-        GGML_LOG_ERROR("%s: failed to create CPU fallback input metadata for node=%s\n", __func__, ggml_get_name(node) ? ggml_get_name(node) : "(null)");
-        return GGML_STATUS_ALLOC_FAILED;
+        ggml_free(plan_ctx);
+        return nullptr;
     }
 
     ggml_set_name(cpu_src1, "cuda_arena_fb_src1");
     ggml_set_name(cpu_ids,  "cuda_arena_fb_ids");
 
-    // Build the CPU-side MUL_MAT_ID op using CPU expert weights and CPU temp inputs.
-    ggml_tensor * cpu_dst = ggml_mul_mat_id(cpu_ctx, cpu_src0, cpu_src1, cpu_ids);
+    // Build the persistent CPU MUL_MAT_ID op using the permanent CPU expert weight.
+    ggml_tensor * cpu_dst = ggml_mul_mat_id(plan_ctx, cpu_src0, cpu_src1, cpu_ids);
 
     if (cpu_dst == nullptr) {
-        GGML_LOG_ERROR("%s: ggml_mul_mat_id failed for node=%s\n",
-            __func__,
-            ggml_get_name(node) ? ggml_get_name(node) : "(null)");
-        return GGML_STATUS_FAILED;
+        ggml_free(plan_ctx);
+        return nullptr;
     }
 
     ggml_set_name(cpu_dst, "cuda_arena_fb_dst");
 
-    if (cpu_dst->type != node->type ||
-        cpu_dst->ne[0] != node->ne[0] ||
-        cpu_dst->ne[1] != node->ne[1] ||
-        cpu_dst->ne[2] != node->ne[2] ||
-        cpu_dst->ne[3] != node->ne[3]) {
-        GGML_LOG_ERROR(
-            "%s: CPU dst layout mismatch node=%s cpu=[%lld,%lld,%lld,%lld type=%s] dst=[%lld,%lld,%lld,%lld type=%s]\n",
-            __func__,
-            ggml_get_name(node) ? ggml_get_name(node) : "(null)",
-            (long long) cpu_dst->ne[0],
-            (long long) cpu_dst->ne[1],
-            (long long) cpu_dst->ne[2],
-            (long long) cpu_dst->ne[3],
-            ggml_type_name(cpu_dst->type),
-            (long long) node->ne[0],
-            (long long) node->ne[1],
-            (long long) node->ne[2],
-            (long long) node->ne[3],
-            ggml_type_name(node->type));
-        return GGML_STATUS_FAILED;
+    // Build the persistent tiny CPU graph for this fallback op.
+    ggml_cgraph * cpu_graph = ggml_new_graph(plan_ctx);
+
+    if (cpu_graph == nullptr) {
+        ggml_free(plan_ctx);
+        return nullptr;
     }
 
-    // Use the real CPU backend buffer type for all fallback temporary tensor storage.
-    ggml_backend_buffer_type_t cpu_buft = ggml_backend_get_default_buffer_type(ctx->backend_cpu);
+    // Attach the CPU fallback output to the persistent tiny graph.
+    ggml_build_forward_expand(cpu_graph, cpu_dst);
 
-    const size_t align = GGML_MEM_ALIGN;
+    // Allocate persistent CPU backend storage for this fallback plan.
+    ggml_backend_buffer_t cpu_buffer = ggml_backend_alloc_ctx_tensors(plan_ctx, ctx->backend_cpu);
 
-    // Compute how much CPU scratch space is needed for src1, ids, and dst.
-    const size_t src1_size = ggml_backend_buft_get_alloc_size(cpu_buft, cpu_src1);
-    const size_t ids_size  = ggml_backend_buft_get_alloc_size(cpu_buft, cpu_ids);
-    const size_t dst_size  = ggml_backend_buft_get_alloc_size(cpu_buft, cpu_dst);
+    if (cpu_buffer == nullptr) {
+        ggml_free(plan_ctx);
+        return nullptr;
+    }
 
-    // Lay out the three CPU temporary tensors inside the reusable scratch buffer.
-    size_t off_src1 = 0;
-    size_t off_ids  = ggml_cuda_arena_align_up(off_src1 + src1_size, align);
-    size_t off_dst  = ggml_cuda_arena_align_up(off_ids  + ids_size,  align);
-    size_t required = ggml_cuda_arena_align_up(off_dst  + dst_size,  align);
+    ggml_cuda_arena_cpu_fb_plan plan = {};
+    plan.ctx      = plan_ctx;
+    plan.buffer   = cpu_buffer;
+    plan.cpu_src1 = cpu_src1;
+    plan.cpu_ids  = cpu_ids;
+    plan.cpu_dst  = cpu_dst;
+    plan.graph    = cpu_graph;
 
-    if (scratch.data_buf == nullptr || scratch.data_size < required) {
-        if (scratch.data_buf != nullptr) {
-            ggml_backend_buffer_free(scratch.data_buf);
-            scratch.data_buf = nullptr;
-            scratch.data_size = 0;
-        }
+    // Cache the completed CPU fallback plan for reuse during graph_compute.
+    auto inserted = ctx->cpu_fb.plans.emplace(key, plan);
 
-        // Grow the persistent CPU fallback data buffer when the current op needs more space.
-        scratch.data_buf = ggml_backend_buft_alloc_buffer(cpu_buft, required);
+    GGML_LOG_INFO("%s: created CPU fallback plan for %s\n", __func__, ggml_get_name(node) ? ggml_get_name(node) : "(null)");
 
-        if (scratch.data_buf == nullptr) {
-            GGML_LOG_ERROR("%s: failed to allocate fallback CPU data buffer, required=%zu\n", __func__, required);
+    return &inserted.first->second;
+}
+
+enum ggml_status ggml_backend_cuda_arena_prebuild_cpu_fallbacks(ggml_backend_t backend_arena, ggml_cgraph * graph)
+{
+    auto * ctx = (ggml_backend_cuda_arena_context *) backend_arena->context;
+
+    GGML_ASSERT(ctx->backend_cpu != nullptr);
+    GGML_ASSERT(ctx->offloader.get_cpu_mirror != nullptr);
+
+    int prepared = 0;
+
+    std::lock_guard<std::mutex> lock(ctx->cpu_fb.mutex);
+
+    for (int i = 0; i < graph->n_nodes; ++i)
+    {
+        ggml_tensor * node = graph->nodes[i];
+
+        if (node->op != GGML_OP_MUL_MAT_ID)
+            continue;
+
+        ggml_tensor * src0 = node->src[0];
+        ggml_tensor * src1 = node->src[1];
+        ggml_tensor * ids  = node->src[2];
+
+        if (!src0 || !src1 || !ids)
+            continue;
+
+        // Resolve the graph's CUDA_ARENA/proxy expert weight to its permanent CPU mirror.
+        ggml_tensor * cpu_src0 = ctx->offloader.get_cpu_mirror(ctx->offloader.user_data, src0);
+
+        if (cpu_src0 == nullptr)
+            continue;
+
+        // Create the stable cache key for this CPU fallback shape.
+        ggml_cuda_arena_cpu_fb_key key = ggml_cuda_arena_make_cpu_fb_key(cpu_src0, src1, ids, node);
+
+        // Build or reuse the persistent CPU fallback graph for this MoE matmul.
+        ggml_cuda_arena_cpu_fb_plan * plan = ggml_cuda_arena_get_or_create_cpu_fb_plan(ctx, key, cpu_src0, src1, ids, node);
+
+        if (plan == nullptr) {
+            GGML_LOG_ERROR("%s: failed to create CPU fallback plan for node=%s\n", __func__, ggml_get_name(node) ? ggml_get_name(node) : "(null)");
             return GGML_STATUS_ALLOC_FAILED;
         }
 
-        scratch.data_size = required;
-
-        GGML_LOG_INFO("%s: resized CPU fallback scratch to %zu bytes\n", __func__, scratch.data_size);
+        ++prepared;
     }
 
-    char * base = (char *) ggml_backend_buffer_get_base(scratch.data_buf);
+    GGML_LOG_INFO("%s: prepared %d CPU fallback plan(s), cached total=%zu\n", __func__, prepared, ctx->cpu_fb.plans.size());
 
-    // Bind the CPU activation temp to its slice of the reusable scratch buffer.
-    if (ggml_backend_tensor_alloc(scratch.data_buf, cpu_src1, base + off_src1) != GGML_STATUS_SUCCESS) {
-        GGML_LOG_ERROR("%s: failed to bind cpu_src1\n", __func__);
-        return GGML_STATUS_ALLOC_FAILED;
+    return GGML_STATUS_SUCCESS;
+}
+
+static enum ggml_status ggml_cuda_arena_cpu_fallback_mul_mat_id(ggml_backend_t backend, ggml_tensor * node)
+{
+    auto * ctx = (ggml_backend_cuda_arena_context *) backend->context;
+
+    GGML_ASSERT(ctx->backend_cpu != nullptr);
+    GGML_ASSERT(ctx->offloader.get_cpu_mirror != nullptr);
+
+    ggml_tensor * src0 = node->src[0];
+    ggml_tensor * src1 = node->src[1];
+    ggml_tensor * ids  = node->src[2];
+
+    // Resolve the CUDA_ARENA/proxy expert weight tensor back to its permanent CPU mirror.
+    ggml_tensor * cpu_src0 = ctx->offloader.get_cpu_mirror(ctx->offloader.user_data, src0);
+
+    if (cpu_src0 == nullptr) {
+        GGML_LOG_ERROR("%s: no CPU mirror for src0=%s node=%s\n", __func__, ggml_get_name(src0) ? ggml_get_name(src0) : "(null)", ggml_get_name(node) ? ggml_get_name(node) : "(null)");
+        return GGML_STATUS_FAILED;
     }
 
-    // Bind the CPU expert-id temp to its slice of the reusable scratch buffer.
-    if (ggml_backend_tensor_alloc(scratch.data_buf, cpu_ids, base + off_ids) != GGML_STATUS_SUCCESS) {
-        GGML_LOG_ERROR("%s: failed to bind cpu_ids\n", __func__);
-        return GGML_STATUS_ALLOC_FAILED;
+    // Recreate the same key used during graph-time CPU fallback prebuild.
+    ggml_cuda_arena_cpu_fb_key key = ggml_cuda_arena_make_cpu_fb_key(cpu_src0, src1, ids, node);
+
+    std::lock_guard<std::mutex> lock(ctx->cpu_fb.mutex);
+
+    auto it = ctx->cpu_fb.plans.find(key);
+
+    if (it == ctx->cpu_fb.plans.end()) {
+        GGML_LOG_ERROR("%s: missing prebuilt CPU fallback plan for node=%s\n", __func__, ggml_get_name(node) ? ggml_get_name(node) : "(null)");
+        return GGML_STATUS_FAILED;
     }
 
-    // Bind the CPU output temp to its slice of the reusable scratch buffer.
-    if (ggml_backend_tensor_alloc(scratch.data_buf, cpu_dst, base + off_dst) != GGML_STATUS_SUCCESS) {
-        GGML_LOG_ERROR("%s: failed to bind cpu_dst\n", __func__);
-        return GGML_STATUS_ALLOC_FAILED;
-    }
+    ggml_cuda_arena_cpu_fb_plan & plan = it->second;
 
-    // Copy the dynamic activation/work tensor from its original backend into CPU scratch.
-    ggml_backend_tensor_copy(src1, cpu_src1);
+    // Copy the live activation/work tensor into the prebuilt CPU fallback input.
+    ggml_backend_tensor_copy(src1, plan.cpu_src1);
 
-    // Copy the selected expert IDs into CPU scratch.
-    ggml_backend_tensor_copy(ids,  cpu_ids);
+    // Copy the live selected expert IDs into the prebuilt CPU fallback input.
+    ggml_backend_tensor_copy(ids, plan.cpu_ids);
 
-    // Create a tiny graph containing only the CPU fallback MUL_MAT_ID dependency chain.
-    ggml_cgraph * cpu_graph = ggml_new_graph(cpu_ctx);
-
-    if (cpu_graph == nullptr) {
-        GGML_LOG_ERROR("%s: ggml_new_graph failed for node=%s\n", __func__, ggml_get_name(node) ? ggml_get_name(node) : "(null)");
-        return GGML_STATUS_ALLOC_FAILED;
-    }
-
-    // Add the fallback MUL_MAT_ID output to the tiny CPU graph.
-    ggml_build_forward_expand(cpu_graph, cpu_dst);
-
-    // Execute the tiny graph on the borrowed CPU backend.
-    enum ggml_status status = ggml_backend_graph_compute(ctx->backend_cpu, cpu_graph);
+    // Execute the prebuilt tiny CPU fallback graph.
+    enum ggml_status status = ggml_backend_graph_compute(ctx->backend_cpu, plan.graph);
 
     if (status != GGML_STATUS_SUCCESS) {
         GGML_LOG_ERROR("%s: CPU fallback graph_compute failed for node=%s status=%d\n", __func__, ggml_get_name(node) ? ggml_get_name(node) : "(null)", (int) status);
         return status;
     }
 
-    // Copy the CPU fallback result back into the original CUDA_ARENA output tensor.
-    ggml_backend_tensor_copy(cpu_dst, node);
+    // Copy the CPU fallback output back into the original CUDA_ARENA node output.
+    ggml_backend_tensor_copy(plan.cpu_dst, node);
 
     return GGML_STATUS_SUCCESS;
 }
@@ -549,14 +611,11 @@ static enum ggml_status ggml_backend_cuda_arena_graph_compute(
             return GGML_STATUS_FAILED;
         }
 
-        const char * name = ggml_get_name(node);
-
-        GGML_LOG_INFO("%s: CPU fallback for node[%d] %s\n", __func__, i, name ? name : "(null)");
-
+        // Execute this CUDA_ARENA MoE matmul through its prebuilt CPU fallback plan.
         enum ggml_status status = ggml_cuda_arena_cpu_fallback_mul_mat_id(backend, node);
 
         if (status != GGML_STATUS_SUCCESS) {
-            GGML_LOG_ERROR("%s: CPU fallback failed for node[%d] %s\n", __func__, i, name ? name : "(null)");
+            GGML_LOG_ERROR("%s: CPU fallback failed for node[%d] %s status=%d\n", __func__, i, ggml_get_name(node) ? ggml_get_name(node) : "(null)", (int) status);
             return status;
         }
     }
