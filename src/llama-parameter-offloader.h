@@ -14,7 +14,9 @@
 #include <mutex>
 #include <unordered_set>
 
+#ifdef GGML_USE_CUDA_ARENA
 #define USE_UNMANAGED_WEIGHTS
+#endif
 
 // signature must match ggml_backend_sched_eval_callback
 bool llama_offloader_eval_cb(ggml_tensor * t, bool ask, void * ud);
@@ -77,13 +79,13 @@ public:
     std::unordered_map<ggml_tensor *, ggml_tensor *> unmanaged_gpu2cpu;
     std::unordered_map<ggml_tensor *, ggml_tensor *> unmanaged_cpu2gpu;
 
-    // Must preserve original CPU tensors by name even after patch_model_refs_for()
-    // changes model->tensors_by_name to point at GPU/placeholder twins.
-    std::unordered_map<std::string, ggml_tensor *> cpu_weight_by_name;
-
     void init_unmanaged_moe_placeholders();
     ggml_tensor * init_cpu_tensor_to_unmanaged_arena_placeholder(ggml_tensor * w_cpu);
 #endif
+
+    // Must preserve original CPU tensors by name even after patch_model_refs_for()
+    // changes model->tensors_by_name to point at GPU/placeholder twins.
+    std::unordered_map<std::string, ggml_tensor *> cpu_weight_by_name;
 
     //map the gpu tensors to hashes recorded at init, to ensure data integrity
     std::unordered_map<ggml_tensor*, uint64_t> gpu_hashes;

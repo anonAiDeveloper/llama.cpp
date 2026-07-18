@@ -2101,33 +2101,21 @@ ggml_tensor * parameter_offloader::get_cpu_mirror_for_arena(const ggml_tensor * 
     while (key->view_src)
         key = key->view_src;
 
-    {
-        auto it = gpu2cpu.find(key);
-        if (it != gpu2cpu.end()) {
-            return it->second;
-        }
-    }
+    auto it_gpu2cpu = gpu2cpu.find(key);
+    if (it_gpu2cpu != gpu2cpu.end())
+        return it_gpu2cpu->second;
 
-    {
-        auto it = unmanaged_gpu2cpu.find(key);
-        if (it != unmanaged_gpu2cpu.end()) {
-            return it->second;
-        }
-    }
+    if (cpu2gpu.find(key) != cpu2gpu.end())
+        return key;
 
-    {
-        auto it = cpu2gpu.find(key);
-        if (it != cpu2gpu.end()) {
-            return key;
-        }
-    }
+#ifdef USE_UNMANAGED_WEIGHTS
+    auto it_unmanaged_gpu2cpu = unmanaged_gpu2cpu.find(key);
+    if (it_unmanaged_gpu2cpu != unmanaged_gpu2cpu.end())
+        return it_unmanaged_gpu2cpu->second;
 
-    {
-        auto it = unmanaged_cpu2gpu.find(key);
-        if (it != unmanaged_cpu2gpu.end()) {
-            return key;
-        }
-    }
+    if (unmanaged_cpu2gpu.find(key) != unmanaged_cpu2gpu.end())
+        return key;
+#endif
 
     if (cpu_weight_set.find(key) != cpu_weight_set.end()) {
         return key;
@@ -2146,33 +2134,21 @@ ggml_tensor * parameter_offloader::get_gpu_twin_for_arena(const ggml_tensor * t)
     while (key->view_src)
         key = key->view_src;
 
-    {
-        auto it = cpu2gpu.find(key);
-        if (it != cpu2gpu.end()) {
-            return it->second;
-        }
-    }
+    auto it_cpu2gpu = cpu2gpu.find(key);
+    if (it_cpu2gpu != cpu2gpu.end())
+        return it_cpu2gpu->second;
 
-    {
-        auto it = unmanaged_cpu2gpu.find(key);
-        if (it != unmanaged_cpu2gpu.end()) {
-            return it->second;
-        }
-    }
+    if (gpu2cpu.find(key) != gpu2cpu.end())
+        return key;
 
-    {
-        auto it = gpu2cpu.find(key);
-        if (it != gpu2cpu.end()) {
-            return key;
-        }
-    }
+#ifdef USE_UNMANAGED_WEIGHTS
+    auto it_unmanaged_cpu2gpu = unmanaged_cpu2gpu.find(key);
+    if (it_unmanaged_cpu2gpu != unmanaged_cpu2gpu.end())
+        return it_unmanaged_cpu2gpu->second;
 
-    {
-        auto it = unmanaged_gpu2cpu.find(key);
-        if (it != unmanaged_gpu2cpu.end()) {
-            return key;
-        }
-    }
+    if (unmanaged_gpu2cpu.find(key) != unmanaged_gpu2cpu.end())
+        return key;
+#endif
 
     return nullptr;
 }
