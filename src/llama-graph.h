@@ -692,6 +692,7 @@ struct llm_graph_params {
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
+            cparams.moe_expert_prefetch     == other.cparams.moe_expert_prefetch     &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
@@ -752,10 +753,10 @@ public:
 
     std::vector<llm_graph_input_ptr> inputs;
 
-    ggml_context_ptr ctx_compute;
-
     // memory buffers used to evaluate the model
     std::vector<uint8_t> buf_compute_meta;
+
+    ggml_context_ptr ctx_compute;
 
     ggml_cgraph * gf;
 
@@ -846,6 +847,8 @@ struct llm_graph_context {
 
     void cb(ggml_tensor * cur, const char * name, int il) const;
 
+    bool use_moe_expert_prefetch(int il) const;
+
     //
     // common
     //
@@ -923,6 +926,52 @@ struct llm_graph_context {
              ggml_tensor * down_exps_s = nullptr) const;
 
     ggml_tensor * build_moe_ffn(
+             ggml_tensor * cur,
+             ggml_tensor * gate_inp,
+             ggml_tensor * gate_inp_b,
+             ggml_tensor * up_exps,
+             ggml_tensor * up_exps_b,
+             ggml_tensor * gate_exps,
+             ggml_tensor * gate_exps_b,
+             ggml_tensor * down_exps,
+             ggml_tensor * down_exps_b,
+             ggml_tensor * exp_probs_b,
+                 int64_t   n_expert,
+                 int64_t   n_expert_used,
+         llm_ffn_op_type   type_op,
+                    bool   norm_w,
+                   float   w_scale,
+            llama_expert_gating_func_type gating_op,
+                     int   il,
+             ggml_tensor * probs_in = nullptr,
+             ggml_tensor * gate_up_exps = nullptr,
+             ggml_tensor * gate_up_exps_b = nullptr,
+             ggml_tensor * up_exps_s = nullptr,
+             ggml_tensor * gate_exps_s = nullptr,
+             ggml_tensor * down_exps_s = nullptr) const;
+
+    // build K + 1 CPU/GPU placement variants and attach their ranges and routing inputs to gf
+    ggml_tensor * build_and_register_moe_ffn_block_lanes(
+             ggml_tensor * cur,
+             ggml_tensor * gate_inp,
+             ggml_tensor * up_exps,
+             ggml_tensor * gate_exps,
+             ggml_tensor * down_exps,
+             ggml_tensor * exp_probs_b,
+                 int64_t   n_expert,
+                 int64_t   n_expert_used,
+         llm_ffn_op_type   type_op,
+                    bool   norm_w,
+                   float   w_scale,
+            llama_expert_gating_func_type gating_op,
+                     int   il,
+             ggml_tensor * probs_in = nullptr,
+             ggml_tensor * gate_up_exps = nullptr,
+             ggml_tensor * up_exps_s = nullptr,
+             ggml_tensor * gate_exps_s = nullptr,
+             ggml_tensor * down_exps_s = nullptr) const;
+
+    ggml_tensor * build_and_register_moe_ffn_block_lanes(
              ggml_tensor * cur,
              ggml_tensor * gate_inp,
              ggml_tensor * gate_inp_b,

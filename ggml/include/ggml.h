@@ -2754,6 +2754,38 @@ extern "C" {
     // dump the graph into a file using the dot format
     GGML_API void ggml_graph_dump_dot(const struct ggml_cgraph * gb, const struct ggml_cgraph * cgraph, const char * filename);
 
+    GGML_API int ggml_graph_add_block_lane_set(
+        struct ggml_cgraph * cgraph,
+        int block_id,
+        struct ggml_tensor * ids,
+        struct ggml_tensor * weights,
+        int n_expert_used,
+        int n_lanes);
+
+    GGML_API void ggml_graph_set_block_lane(
+        struct ggml_cgraph * cgraph,
+        int lane_set_id,
+        int lane_id,
+        int i_start,
+        int i_end,
+        struct ggml_tensor * cpu_ids,
+        struct ggml_tensor * cpu_weights,
+        struct ggml_tensor * cpu_slots,
+        struct ggml_tensor * gpu_ids,
+        struct ggml_tensor * gpu_weights,
+        struct ggml_tensor * gpu_slots);
+
+    GGML_API void ggml_graph_set_block_lane_set_output(
+        struct ggml_cgraph * cgraph,
+        int lane_set_id,
+        struct ggml_tensor * output);
+
+    GGML_API void ggml_graph_set_block_lane_output(
+        struct ggml_cgraph * cgraph,
+        int lane_set_id,
+        int lane_id,
+        struct ggml_tensor * output);
+
     // TODO these functions were sandwiched in the old optimization interface, is there a better place for them?
     typedef void (*ggml_log_callback)(enum ggml_log_level level, const char * text, void * user_data);
 

@@ -384,19 +384,35 @@ llama_model_deepseek2::graph::graph(const llama_model & model, const llm_graph_p
             cb(cur, "ffn_out", il);
         } else {
             // MoE branch
-            ggml_tensor * moe_out = build_moe_ffn(cur,
-                model.layers[il].ffn_gate_inp,
-                model.layers[il].ffn_up_exps,
-                model.layers[il].ffn_gate_exps,
-                model.layers[il].ffn_down_exps,
-                model.layers[il].ffn_exp_probs_b,
-                n_expert, n_expert_used,
-                LLM_FFN_SILU, hparams.expert_weights_norm,
-                hparams.expert_weights_scale,
-                (llama_expert_gating_func_type) hparams.expert_gating_func,
-                il,
-                nullptr,
-                model.layers[il].ffn_gate_up_exps);
+            ggml_tensor * moe_out;
+            if (use_moe_expert_prefetch(il))
+                moe_out = build_and_register_moe_ffn_block_lanes(cur,
+                    model.layers[il].ffn_gate_inp,
+                    model.layers[il].ffn_up_exps,
+                    model.layers[il].ffn_gate_exps,
+                    model.layers[il].ffn_down_exps,
+                    model.layers[il].ffn_exp_probs_b,
+                    n_expert, n_expert_used,
+                    LLM_FFN_SILU, hparams.expert_weights_norm,
+                    hparams.expert_weights_scale,
+                    (llama_expert_gating_func_type) hparams.expert_gating_func,
+                    il,
+                    nullptr,
+                    model.layers[il].ffn_gate_up_exps);
+            else
+                moe_out = build_moe_ffn(cur,
+                    model.layers[il].ffn_gate_inp,
+                    model.layers[il].ffn_up_exps,
+                    model.layers[il].ffn_gate_exps,
+                    model.layers[il].ffn_down_exps,
+                    model.layers[il].ffn_exp_probs_b,
+                    n_expert, n_expert_used,
+                    LLM_FFN_SILU, hparams.expert_weights_norm,
+                    hparams.expert_weights_scale,
+                    (llama_expert_gating_func_type) hparams.expert_gating_func,
+                    il,
+                    nullptr,
+                    model.layers[il].ffn_gate_up_exps);
             cb(moe_out, "ffn_moe_out", il);
 
             // FFN shared expert

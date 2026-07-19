@@ -218,6 +218,8 @@ llama_context::llama_context(
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
 
+    cparams.moe_expert_prefetch = params.moe_expert_prefetch;
+
     // initialized later
     cparams.pipeline_parallel = false;
 
@@ -2435,6 +2437,17 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     for (const auto & lora : model.loras) {
         res += lora->get_n_nodes();
     }
+
+    // Reserve bounded graph capacity for the K+1 alternative MoE block lanes added at each layer.
+    //TODO: 32 is intentionally conservative but bounded
+    if (cparams.moe_expert_prefetch) {
+        const uint64_t extra_nodes = 32ull * model.hparams.n_layer() * (model.hparams.n_expert_used + 1);
+
+        GGML_ASSERT(extra_nodes <= UINT32_MAX - res);
+
+        res += (uint32_t) extra_nodes;
+    }
+
     return res;
 }
 
@@ -3588,6 +3601,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.moe_expert_prefetch         =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,

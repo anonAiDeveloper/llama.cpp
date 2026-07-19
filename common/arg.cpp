@@ -1478,6 +1478,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_UNIFIED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL}));
     add_opt(common_arg(
+        {"--moe-expert-prefetch"},
+        {"--no-moe-expert-prefetch"},
+        "specutaively prefetch MoE expert-slices during compute",
+        [](common_params & params, bool value) {
+            params.moe_expert_prefetch = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_CLI}));   //TODO: find out what I should be setting here
+    add_opt(common_arg(
         {"--cache-idle-slots"},
         {"--no-cache-idle-slots"},
         "save idle slots to the prompt cache on new task, and clear them when using unified KV (default: enabled, requires cache-ram)",
