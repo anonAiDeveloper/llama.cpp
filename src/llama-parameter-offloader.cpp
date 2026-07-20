@@ -110,54 +110,6 @@ parameter_offloader::parameter_offloader(llama_model  * model)
     }
 }
 
-#ifdef USE_UNMANAGED_WEIGHTS
-static bool po_ends_with(const std::string & s, const char * suffix) {
-    const size_t n = std::strlen(suffix);
-    return s.size() >= n && s.compare(s.size() - n, n, suffix) == 0;
-}
-
-static bool po_is_routed_moe_expert_weight_name(const std::string & name) {
-    return po_ends_with(name, ".ffn_gate_exps.weight") ||
-           po_ends_with(name, ".ffn_up_exps.weight")   ||
-           po_ends_with(name, ".ffn_down_exps.weight");
-}
-
-static std::string po_strip_scheduler_copy_name(const char * raw_name) {
-    if (raw_name == nullptr) {
-        return {};
-    }
-
-    std::string name(raw_name);
-
-    // Example:
-    //   CUDA_ARENA#blk.3.ffn_gate_exps.weight#0
-    // becomes:
-    //   blk.3.ffn_gate_exps.weight
-    const size_t first_hash = name.find('#');
-    if (first_hash != std::string::npos) {
-        name.erase(0, first_hash + 1);
-    }
-
-    const size_t last_hash = name.rfind('#');
-    if (last_hash != std::string::npos) {
-        bool numeric_suffix = true;
-
-        for (size_t i = last_hash + 1; i < name.size(); ++i) {
-            if (name[i] < '0' || name[i] > '9') {
-                numeric_suffix = false;
-                break;
-            }
-        }
-
-        if (numeric_suffix) {
-            name.erase(last_hash);
-        }
-    }
-
-    return name;
-}
-#endif
-
 // Call this *before* transform/upload, i.e. at the top of parameter_offloader::init()
 // Guarantees collected_order contains *all* host-backed model weights
 void parameter_offloader::seed_all_weights_from_model()
@@ -267,10 +219,6 @@ void parameter_offloader::init(
 
     for (ggml_tensor * w_cpu : collected_order)
         (void) init_cpu_tensor_to_arena(w_cpu);
-
-#ifdef USE_UNMANAGED_WEIGHTS
-    init_unmanaged_moe_placeholders();
-#endif
 
     //print_model_tensor_stats(model);
 
@@ -2081,74 +2029,3 @@ void parameter_offloader::build_schedule_gates(offloader_schedule & schedule)
         schedule.ready_after[r] = barrier % N;
     }
 }
-
-#ifdef USE_UNMANAGED_WEIGHTS
-ggml_tensor * parameter_offloader::init_cpu_tensor_to_unmanaged_arena_placeholder(
-    ggml_tensor * w_cpu
-) {
-    GGML_ASSERT(ctx_gpu_twins);
-    GGML_ASSERT(arena);
-    GGML_ASSERT(w_cpu);
-    GGML_ASSERT(w_cpu->buffer && ggml_backend_buffer_is_host(w_cpu->buffer));
-    GGML_ASSERT(w_cpu->view_src == nullptr);
-
-    auto it = unmanaged_cpu2gpu.find(w_cpu);
-    if (it != unmanaged_cpu2gpu.end()) {
-        return it->second;
-    }
-
-    ggml_tensor * w_gpu = ggml_dup_tensor_layout_public(ctx_gpu_twins, w_cpu);
-    GGML_ASSERT(w_gpu);
-
-    ggml_set_name(w_gpu, ggml_get_name(w_cpu));
-
-    // Critical:
-    // Do NOT call ggml_backend_tensor_alloc(arena, w_gpu, ...).
-    // That would initialize/zero/copy actual backend storage.
-    //
-    // For Step 1 this tensor must only be a backend identity placeholder.
-    // CPU fallback will never read w_gpu->data.
-    w_gpu->buffer = arena;
-    w_gpu->data   = ggml_backend_buffer_get_base(arena);
-
-    unmanaged_gpu2cpu.emplace(w_gpu, w_cpu);
-    unmanaged_cpu2gpu.emplace(w_cpu, w_gpu);
-
-    patch_model_refs_for(model, w_cpu, w_gpu);
-
-    LLAMA_LOG_INFO("%s: unmanaged CUDA_ARENA placeholder %s cpu=%p gpu=%p data=%p\n",
-        __func__,
-        ggml_get_name(w_cpu) ? ggml_get_name(w_cpu) : "(null)",
-        (void *) w_cpu,
-        (void *) w_gpu,
-        w_gpu->data);
-
-    return w_gpu;
-}
-
-void parameter_offloader::init_unmanaged_moe_placeholders() {
-    int count = 0;
-
-    for (const auto & kv : cpu_weight_by_name) {
-        const std::string & name = kv.first;
-        ggml_tensor * w_cpu = kv.second;
-
-        if (!w_cpu) {
-            continue;
-        }
-
-        if (!po_is_routed_moe_expert_weight_name(name)) {
-            continue;
-        }
-
-        if (!(w_cpu->buffer && ggml_backend_buffer_is_host(w_cpu->buffer))) {
-            continue;
-        }
-
-        (void) init_cpu_tensor_to_unmanaged_arena_placeholder(w_cpu);
-        ++count;
-    }
-
-    LLAMA_LOG_INFO("%s: created %d unmanaged MoE CUDA_ARENA placeholders\n", __func__, count);
-}
-#endif
