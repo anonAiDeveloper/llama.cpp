@@ -153,10 +153,4 @@ private:
     void publish_copy_now(long long ordinal, uint64_t generation);
 public:
     inline ggml_cuda_copy_event * upload_weight_auto(ggml_tensor *w_cpu, ggml_tensor *w_gpu);       //TODO: Why is this public?
-
-    ggml_tensor * get_cpu_mirror_for_arena(const ggml_tensor * t) const;
-    ggml_tensor * get_gpu_twin_for_arena(const ggml_tensor * t) const;
-
-    ggml_backend_t backend_arena = nullptr;
-    void bind_cuda_arena_backend(ggml_backend_t backend_arena);
 };

@@ -8,15 +8,6 @@
 extern "C" {
 #endif
 
-#define GGML_CUDA_ARENA_NAME "CUDA_ARENA"
-
-// backend API
-GGML_BACKEND_API ggml_backend_t ggml_backend_cuda_arena_init(int device);
-
-GGML_BACKEND_API bool ggml_backend_is_cuda_arena(ggml_backend_t backend);
-
-GGML_BACKEND_API void ggml_backend_cuda_arena_set_delegates(ggml_backend_t backend_arena, ggml_backend_t backend_cuda, ggml_backend_t backend_cpu);
-
 GGML_BACKEND_API bool ggml_backend_buffer_is_cuda_arena_public(ggml_backend_buffer_t buffer);
 
 struct ggml_cuda_copy_event;
@@ -34,10 +25,11 @@ GGML_BACKEND_API void ggml_cuda_arena_tensor_write_raw_async(
     size_t nbytes,
     ggml_cuda_copy_event * ev);
 
-GGML_BACKEND_API void ggml_cuda_arena_tensor_write_raw(ggml_backend_buffer_t arena,
-                                      ggml_tensor * t,
-                                      const void * src,
-                                      size_t nbytes);
+GGML_BACKEND_API void ggml_cuda_arena_tensor_write_raw(
+    ggml_backend_buffer_t arena,
+    ggml_tensor * t,
+    const void * src,
+    size_t nbytes);
 
 // Create one big CUDA arena buffer on a given device.
 // Returns a ggml_backend_buffer_t whose buft == ggml_backend_dev_buffer_type(dev),
@@ -46,22 +38,10 @@ GGML_BACKEND_API ggml_backend_buffer_t ggml_cuda_arena_create_on(ggml_backend_de
 
 // Optional helpers:
 GGML_BACKEND_API size_t ggml_cuda_arena_alignment(ggml_backend_buffer_t arena);     // delegate to buft alignment
-GGML_BACKEND_API bool   ggml_cuda_arena_place(ggml_backend_buffer_t arena,
-                             struct ggml_tensor * t,
-                             size_t offset); // calls ggml_backend_tensor_alloc
-
-GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cuda_arena_reg(void);
-
-struct ggml_cuda_arena_offloader_i
-{
-    void * user_data;
-
-    ggml_tensor * (*get_cpu_mirror)(   void * user_data, const ggml_tensor * tensor);
-    ggml_tensor * (*get_gpu_twin)(     void * user_data, const ggml_tensor * tensor);
-};
-GGML_BACKEND_API void ggml_backend_cuda_arena_set_offloader(ggml_backend_t backend_arena, const ggml_cuda_arena_offloader_i * offloader);
-
-GGML_BACKEND_API enum ggml_status ggml_backend_cuda_arena_prebuild_cpu_fallbacks(ggml_backend_t backend_arena, ggml_cgraph * graph);
+GGML_BACKEND_API bool   ggml_cuda_arena_place(
+    ggml_backend_buffer_t arena,
+    struct ggml_tensor * t,
+    size_t offset); // calls ggml_backend_tensor_alloc
 
 #ifdef  __cplusplus
 }

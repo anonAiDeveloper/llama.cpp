@@ -1842,15 +1842,6 @@ bool llama_offloader_graph_cb(ggml_backend_sched_t sched, struct ggml_cgraph * g
 
     const bool schedule_changed = po->swap_next_schedule(); // true if retarget moved tensors for this graph
 
-    if (po->backend_arena) {
-        enum ggml_status st = ggml_backend_cuda_arena_prebuild_cpu_fallbacks(po->backend_arena, graph);
-
-        if (st != GGML_STATUS_SUCCESS) {
-            LLAMA_LOG_ERROR("%s: CUDA_ARENA CPU fallback prebuild failed, status=%d\n", __func__, (int) st);
-            return false;
-        }
-    }
-
 #endif /* ifndef LLAMA_NAIVE_OFFLOADER */
     return true;
 }
@@ -2089,87 +2080,6 @@ void parameter_offloader::build_schedule_gates(offloader_schedule & schedule)
 
         schedule.ready_after[r] = barrier % N;
     }
-}
-
-ggml_tensor * parameter_offloader::get_cpu_mirror_for_arena(const ggml_tensor * t) const
-{
-    if (!t)
-        return nullptr;
-
-    ggml_tensor * key = const_cast<ggml_tensor *>(t);
-
-    while (key->view_src)
-        key = key->view_src;
-
-    auto it_gpu2cpu = gpu2cpu.find(key);
-    if (it_gpu2cpu != gpu2cpu.end())
-        return it_gpu2cpu->second;
-
-    if (cpu2gpu.find(key) != cpu2gpu.end())
-        return key;
-
-#ifdef USE_UNMANAGED_WEIGHTS
-    auto it_unmanaged_gpu2cpu = unmanaged_gpu2cpu.find(key);
-    if (it_unmanaged_gpu2cpu != unmanaged_gpu2cpu.end())
-        return it_unmanaged_gpu2cpu->second;
-
-    if (unmanaged_cpu2gpu.find(key) != unmanaged_cpu2gpu.end())
-        return key;
-#endif
-
-    if (cpu_weight_set.find(key) != cpu_weight_set.end()) {
-        return key;
-    }
-
-    return nullptr;
-}
-
-ggml_tensor * parameter_offloader::get_gpu_twin_for_arena(const ggml_tensor * t) const
-{
-    if (!t)
-        return nullptr;
-
-    ggml_tensor * key = const_cast<ggml_tensor *>(t);
-
-    while (key->view_src)
-        key = key->view_src;
-
-    auto it_cpu2gpu = cpu2gpu.find(key);
-    if (it_cpu2gpu != cpu2gpu.end())
-        return it_cpu2gpu->second;
-
-    if (gpu2cpu.find(key) != gpu2cpu.end())
-        return key;
-
-#ifdef USE_UNMANAGED_WEIGHTS
-    auto it_unmanaged_cpu2gpu = unmanaged_cpu2gpu.find(key);
-    if (it_unmanaged_cpu2gpu != unmanaged_cpu2gpu.end())
-        return it_unmanaged_cpu2gpu->second;
-
-    if (unmanaged_gpu2cpu.find(key) != unmanaged_gpu2cpu.end())
-        return key;
-#endif
-
-    return nullptr;
-}
-
-static ggml_tensor * po_arena_get_cpu_mirror(void * ud, const ggml_tensor * t) {
-    return ((parameter_offloader *) ud)->get_cpu_mirror_for_arena(t);
-}
-
-static ggml_tensor * po_arena_get_gpu_twin(void * ud, const ggml_tensor * t) {
-    return ((parameter_offloader *) ud)->get_gpu_twin_for_arena(t);
-}
-
-void parameter_offloader::bind_cuda_arena_backend(ggml_backend_t backend_arena) {
-    this->backend_arena = backend_arena;
-
-    ggml_cuda_arena_offloader_i iface = {};
-    iface.user_data         = this;
-    iface.get_cpu_mirror    = po_arena_get_cpu_mirror;
-    iface.get_gpu_twin      = po_arena_get_gpu_twin;
-
-    ggml_backend_cuda_arena_set_offloader(backend_arena, &iface);
 }
 
 #ifdef USE_UNMANAGED_WEIGHTS
