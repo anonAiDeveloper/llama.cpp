@@ -864,8 +864,7 @@ struct ggml_backend_sched {
     ggml_backend_sched_graph_callback callback_graph;
     void * callback_graph_user_data;
 
-    //TODO: This callback is just a placeholder, an example of what shape it might take. Expect changes
-    bool (*callback_moe_residency)(int block_id, int32_t expert_id, void * user_data);
+    ggml_backend_sched_moe_residency_callback callback_moe_residency;
     void * callback_moe_residency_user_data;
 
     char * context_buffer;
@@ -1850,13 +1849,23 @@ static int ggml_backend_sched_select_block_lane(
     if (n_tokens == 1 && sched->callback_moe_residency != NULL) {
         for (int slot = 0; slot < n_expert_used; ++slot) {
             const int32_t expert_id = source_ids[slot];
-            if (sched->callback_moe_residency(lane_set->block_id, expert_id, sched->callback_moe_residency_user_data)) {
-                gpu_ids.push_back(expert_id);
+
+            const int32_t gpu_cache_slot = sched->callback_moe_residency(lane_set->block_id, expert_id, sched->callback_moe_residency_user_data);
+
+            //GGML_ASSERT(gpu_cache_slot >= -1);
+
+            if (gpu_cache_slot >= 0) {
+                // Two selected experts cannot occupy the same cache slot during one lane execution.
+                GGML_ASSERT(std::find(gpu_ids.begin(), gpu_ids.end(), gpu_cache_slot) == gpu_ids.end());
+
+                // The GPU expert bank is indexed by cache slot rather than original model expert ID.
+                gpu_ids.push_back(gpu_cache_slot);
                 gpu_slots.push_back(slot);
                 if (!source_weights.empty()) {
                     gpu_weights.push_back(source_weights[slot]);
                 }
             } else {
+                // The CPU expert bank continues to use the original model expert ID.
                 cpu_ids.push_back(expert_id);
                 cpu_slots.push_back(slot);
                 if (!source_weights.empty()) {
@@ -1864,6 +1873,7 @@ static int ggml_backend_sched_select_block_lane(
                 }
             }
         }
+
         lane_id = (int) cpu_ids.size();
     } else {
         cpu_ids = source_ids;
@@ -2412,7 +2422,7 @@ void ggml_backend_sched_set_graph_callback(ggml_backend_sched_t sched, ggml_back
 
 void ggml_backend_sched_set_moe_residency_callback(
         ggml_backend_sched_t sched,
-        bool (*callback)(int block_id, int32_t expert_id, void * user_data),
+        ggml_backend_sched_moe_residency_callback callback,
         void * user_data) {
     GGML_ASSERT(sched);
     sched->callback_moe_residency = callback;

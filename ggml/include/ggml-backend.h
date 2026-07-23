@@ -316,8 +316,8 @@ extern "C" {
     // Callback for each backend schedule (set with ggml_backend_sched_set_graph_callback)
     typedef bool (*ggml_backend_sched_graph_callback)(ggml_backend_sched_t sched, struct ggml_cgraph * graph, void * user_data);
 
-    //TODO: This callback is just a placeholder, an example of what shape it might take. Expect changes
-    typedef bool (*ggml_backend_sched_moe_residency_callback)(int block_id, int32_t expert_id, void * user_data);
+    // Return -1 for a CPU miss, or the GPU cache-slot ID containing the complete expert bundle.
+    typedef int32_t (*ggml_backend_sched_moe_residency_callback)(int block_id, int32_t expert_id, void * user_data);
 
     // Initialize a backend scheduler, backends with low index are given priority over backends with high index
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
