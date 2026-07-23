@@ -21,6 +21,8 @@ bool llama_offloader_graph_cb(ggml_backend_sched_t sched, struct ggml_cgraph * g
 struct parameter_offloader
 {
 public:
+    static constexpr int32_t MOE_CACHE_SLOT_COUNT = 16;     //temporary hardcoded slot count. In the future we will make this configurable, perhaps with per-model recommended defaults
+
     bool ready = false;
 
     std::vector<ggml_tensor*> collected_order;      // CPU weights in first-use order
@@ -30,13 +32,19 @@ public:
     llama_model*                model;
     ggml_backend_buffer_t       arena         = nullptr;  // your CUDA arena buffer
     ggml_context*               ctx_gpu_twins = nullptr;  // no-alloc ctx for duplicated GPU tensors
+    ggml_context*               ctx_moe_cache = nullptr;
+    bool                        owns_arena     = false;
+    int32_t                     moe_cache_n_slots = 0;
 
     // Cached placement info
     ggml_backend_buffer_type_t  buft  = nullptr;          // ggml_backend_buffer_get_type(arena)
     char*                       base  = nullptr;          // ggml_backend_buffer_get_base(arena)
-    size_t                      cap   = 0;               // ggml_backend_buffer_get_size(arena)
-    size_t                      align = 0;               // ggml_backend_buffer_get_alignment(arena)
-    size_t                      cur_off = 0;             // next free offset (bytes) inside arena
+    size_t                      arena_size = 0;           // full arena size
+    size_t                      cap   = 0;                // dense streaming region size
+    size_t                      moe_cache_offset = 0;     // cache tail offset inside arena
+    size_t                      moe_cache_size   = 0;     // cache tail size
+    size_t                      align = 0;                // ggml_backend_buffer_get_alignment(arena)
+    size_t                      cur_off = 0;              // next free offset (bytes) inside arena
 
     struct offloader_schedule
     {
@@ -81,6 +89,8 @@ public:
     std::unordered_set<ggml_tensor*> cpu_weight_set; // CPU weight ptrs
     std::unordered_set<ggml_tensor*> gpu_weight_set; // GPU weight ptrs
 
+    void init_moe_cache(ggml_backend_buffer_t arena, int32_t n_slots);
+
     void init(ggml_backend_buffer_t arena,     llama_context_params params,
               ggml_context        * ctx_twins, llama_context      * lctx);
     parameter_offloader(llama_model * model);
@@ -106,6 +116,9 @@ private:
     void seed_all_weights_from_model();
 
     ggml_tensor * init_cpu_tensor_to_arena(ggml_tensor * w_cpu);
+
+    void attach_arena(ggml_backend_buffer_t arena);
+    void clear_moe_cache_refs();
 
     std::atomic<long long> tensor_idx_copied_ordinal{-1}; // last copied ordinal in current schedule stream
     std::atomic<long long> tensor_idx_used_ordinal{-1};   // last read ordinal in current schedule stream

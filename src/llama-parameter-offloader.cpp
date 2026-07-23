@@ -47,6 +47,69 @@ static inline size_t align_up(size_t x, size_t a)
     return (x + (a - 1)) & ~(a - 1);
 }
 
+static inline size_t align_down(size_t x, size_t a)
+{
+    return x & ~(a - 1);
+}
+
+struct moe_cache_field {
+    const char * name;
+
+    ggml_tensor * llama_layer::* cpu;
+    ggml_tensor * llama_layer::* cache;
+};
+
+static const moe_cache_field moe_cache_fields[] = {
+    {
+        "gate_exps",
+        &llama_layer::ffn_gate_exps,
+        &llama_layer::ffn_gate_exps_cache,
+    },
+    {
+        "down_exps",
+        &llama_layer::ffn_down_exps,
+        &llama_layer::ffn_down_exps_cache,
+    },
+    {
+        "up_exps",
+        &llama_layer::ffn_up_exps,
+        &llama_layer::ffn_up_exps_cache,
+    },
+    {
+        "gate_up_exps",
+        &llama_layer::ffn_gate_up_exps,
+        &llama_layer::ffn_gate_up_exps_cache,
+    },
+    {
+        "gate_chexps",
+        &llama_layer::ffn_gate_chexps,
+        &llama_layer::ffn_gate_chexps_cache,
+    },
+    {
+        "down_chexps",
+        &llama_layer::ffn_down_chexps,
+        &llama_layer::ffn_down_chexps_cache,
+    },
+    {
+        "up_chexps",
+        &llama_layer::ffn_up_chexps,
+        &llama_layer::ffn_up_chexps_cache,
+    },
+};
+
+struct moe_cache_bank_build {
+    int field_id;
+
+    enum ggml_type type;
+
+    int64_t ne0;
+    int64_t ne1;
+
+    ggml_tensor * tensor;
+
+    size_t offset;
+};
+
 static inline int ordinal_mod(long long ordinal, int n)
 {
     return (int)(ordinal % (long long)n);
@@ -187,27 +250,214 @@ void parameter_offloader::seed_all_weights_from_model()
     LLAMA_LOG_INFO("%s: found %d host-backed weights\n", __func__, collected_order.size());
 }
 
+void parameter_offloader::attach_arena(ggml_backend_buffer_t arena)
+{
+    GGML_ASSERT(arena);
+
+    if (this->arena) {
+        GGML_ASSERT(this->arena == arena);
+        return;
+    }
+
+    this->arena = arena;
+
+    buft       = ggml_backend_buffer_get_type(arena);
+    base       = (char *) ggml_backend_buffer_get_base(arena);
+    arena_size = ggml_backend_buffer_get_size(arena);
+    cap        = arena_size;
+    align      = ggml_backend_buffer_get_alignment(arena);
+    cur_off    = 0;
+
+    GGML_ASSERT(buft);
+    GGML_ASSERT(base);
+    GGML_ASSERT(arena_size > 0);
+    GGML_ASSERT(align > 0);
+}
+
+void parameter_offloader::clear_moe_cache_refs()
+{
+    if (!model)
+        return;
+
+    const int n_layers = (int) model->hparams.n_layer();
+    const int n_fields = (int) (sizeof(moe_cache_fields) / sizeof(moe_cache_fields[0]));
+
+    for (int il = 0; il < n_layers; ++il) {
+        llama_layer & layer = model->layers[il];
+
+        for (int field_id = 0; field_id < n_fields; ++field_id) {
+            const moe_cache_field & field = moe_cache_fields[field_id];
+            layer.*(field.cache) = nullptr;
+        }
+    }
+}
+
+void parameter_offloader::init_moe_cache(
+    ggml_backend_buffer_t arena,
+    int32_t n_slots)
+{
+    GGML_ASSERT(model);
+    GGML_ASSERT(n_slots >= 8);
+    GGML_ASSERT(ctx_moe_cache == nullptr);
+
+    attach_arena(arena);
+
+    const int n_layers = (int) model->hparams.n_layer();
+    const int n_fields = (int) (sizeof(moe_cache_fields) / sizeof(moe_cache_fields[0]));
+
+    size_t n_source_banks = 0;
+
+    for (int il = 0; il < n_layers; ++il) {
+        llama_layer & layer = model->layers[il];
+
+        for (int field_id = 0; field_id < n_fields; ++field_id) {
+            const moe_cache_field & field = moe_cache_fields[field_id];
+
+            layer.*(field.cache) = nullptr;
+
+            if (layer.*(field.cpu) != nullptr)
+                ++n_source_banks;
+        }
+    }
+
+    if (n_source_banks == 0) {
+        LLAMA_LOG_INFO("%s: model contains no routed MoE expert weight banks\n", __func__);
+        return;
+    }
+
+    GGML_ASSERT(n_source_banks <= SIZE_MAX / ggml_tensor_overhead());
+
+    const size_t metadata_size = ggml_tensor_overhead() * n_source_banks;
+
+    ggml_init_params params = {
+        /* .mem_size   = */ metadata_size,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+
+    ctx_moe_cache = ggml_init(params);
+    GGML_ASSERT(ctx_moe_cache);
+
+    std::vector<moe_cache_bank_build> banks;
+    banks.reserve(n_source_banks);
+
+    for (int il = 0; il < n_layers; ++il) {
+        llama_layer & layer = model->layers[il];
+
+        for (int field_id = 0; field_id < n_fields; ++field_id) {
+            const moe_cache_field & field = moe_cache_fields[field_id];
+
+            ggml_tensor * cpu = layer.*(field.cpu);
+
+            if (cpu == nullptr)
+                continue;
+
+            GGML_ASSERT(cpu->view_src == nullptr);
+            GGML_ASSERT(ggml_n_dims(cpu) == 3);
+            GGML_ASSERT(cpu->ne[2] > 0);
+            GGML_ASSERT(cpu->ne[3] == 1);
+            GGML_ASSERT(!ggml_is_transposed(cpu));
+            GGML_ASSERT(ggml_is_contiguous(cpu));
+
+            size_t bank_id = banks.size();
+
+            for (size_t i = 0; i < banks.size(); ++i) {
+                const moe_cache_bank_build & bank = banks[i];
+
+                if (bank.field_id == field_id &&
+                    bank.type     == cpu->type &&
+                    bank.ne0      == cpu->ne[0] &&
+                    bank.ne1      == cpu->ne[1])
+                {
+                    bank_id = i;
+                    break;
+                }
+            }
+
+            if (bank_id == banks.size()) {
+                ggml_tensor * cache = ggml_new_tensor_3d(ctx_moe_cache, cpu->type, cpu->ne[0], cpu->ne[1], n_slots);
+
+                GGML_ASSERT(cache);
+
+                ggml_format_name(cache, "moe_cache_%s_%d", field.name, (int) banks.size());
+
+                banks.push_back({
+                    /* .field_id = */ field_id,
+                    /* .type     = */ cpu->type,
+                    /* .ne0      = */ cpu->ne[0],
+                    /* .ne1      = */ cpu->ne[1],
+                    /* .tensor   = */ cache,
+                    /* .offset   = */ 0,
+                });
+            }
+
+            layer.*(field.cache) = banks[bank_id].tensor;
+        }
+    }
+
+    const size_t cache_align = ggml_backend_buft_get_alignment(buft);
+
+    size_t total_size = 0;
+
+    for (moe_cache_bank_build & bank : banks) {
+        total_size = align_up(total_size, cache_align);
+        bank.offset = total_size;
+
+        total_size += ggml_backend_buft_get_alloc_size(buft, bank.tensor);
+    }
+
+    total_size = align_up(total_size, cache_align);
+
+    GGML_ASSERT(total_size > 0);
+    GGML_ASSERT(total_size < arena_size);
+
+    moe_cache_offset = align_down(arena_size - total_size, cache_align);
+    moe_cache_size   = total_size;
+    cap              = moe_cache_offset;
+
+    GGML_ASSERT(cap > 0);
+    GGML_ASSERT(moe_cache_offset + moe_cache_size <= arena_size);
+
+    char * cache_base = base + moe_cache_offset;
+
+    for (moe_cache_bank_build & bank : banks) {
+        GGML_ASSERT(ggml_backend_tensor_alloc(arena, bank.tensor, cache_base + bank.offset) == GGML_STATUS_SUCCESS);
+
+        LLAMA_LOG_INFO("%s: %s type=%s shape=[%lld,%lld,%d] offset=%zu bytes=%zu\n", __func__,
+            ggml_get_name(bank.tensor),
+            ggml_type_name(bank.tensor->type),
+            (long long) bank.tensor->ne[0],
+            (long long) bank.tensor->ne[1],
+            n_slots,
+            moe_cache_offset + bank.offset,
+            ggml_backend_buffer_get_alloc_size(arena, bank.tensor));
+    }
+
+    moe_cache_n_slots = n_slots;
+
+    LLAMA_LOG_INFO("%s: reserved %zu bytes at arena offset %zu for %zu routed MoE cache banks with %d slots each; %zu bytes remain for dense streaming\n",
+        __func__, moe_cache_size, moe_cache_offset, banks.size(), n_slots, cap);
+}
+
 void parameter_offloader::init(
     ggml_backend_buffer_t   arena,
     llama_context_params    cparams,
     ggml_context          * ctx_twins,
     llama_context         * lctx)
 {
-    // Move this to constructor?
-    {
-        this->arena         = arena;
-        this->ctx_gpu_twins = ctx_twins;
+    attach_arena(arena);
 
-        buft  = ggml_backend_buffer_get_type(arena);
-        base  = (char*) ggml_backend_buffer_get_base(arena);
-        cap   = ggml_backend_buffer_get_size(arena);
-        align = ggml_backend_buffer_get_alignment(arena);
-        cur_off = 0;
+    GGML_ASSERT(ctx_gpu_twins == nullptr);
+    GGML_ASSERT(!cparams.moe_expert_prefetch || ctx_moe_cache != nullptr);
 
-        // Optional: reserve to avoid rehash during init
-        gpu2cpu.reserve(4096);
-        cpu2gpu.reserve(4096);
-    }
+    owns_arena     = true;
+    ctx_gpu_twins  = ctx_twins;
+
+    (void) lctx;
+
+    // Optional: reserve to avoid rehash during init
+    gpu2cpu.reserve(4096);
+    cpu2gpu.reserve(4096);
 
 #ifndef LLAMA_NAIVE_OFFLOADER
     seed_all_weights_from_model();
@@ -351,14 +601,19 @@ void parameter_offloader::init(
 parameter_offloader::~parameter_offloader()
 {
     stop_streamer_join();
+    clear_moe_cache_refs();
+    if (ctx_moe_cache) {
+        ggml_free(ctx_moe_cache);
+        ctx_moe_cache = nullptr;
+    }
     if (ctx_gpu_twins) {
         ggml_free(ctx_gpu_twins);
         ctx_gpu_twins = nullptr;
     }
-    if (arena) {
+    if (arena && owns_arena) {
         ggml_backend_buffer_free(arena);
-        arena = nullptr;
     }
+    arena = nullptr;
     for (auto b : owned_host_buffers_)
         if (b)
             ggml_backend_buffer_free(b);
@@ -534,8 +789,8 @@ void patch_model_refs_for(llama_model * model, ggml_tensor * w_cpu, ggml_tensor 
 
         // ff MoE
         SET(L.ffn_gate_inp);      SET(L.ffn_gate_inp_s);
-        SET(L.ffn_gate_exps);     SET(L.ffn_down_exps);
-        SET(L.ffn_up_exps);       SET(L.ffn_gate_up_exps);
+        //SET(L.ffn_gate_exps);     SET(L.ffn_down_exps);       //sparse layers are handled separately
+        //SET(L.ffn_up_exps);       SET(L.ffn_gate_up_exps);
         SET(L.ffn_gate_inp_b);    SET(L.ffn_gate_exps_b);
         SET(L.ffn_down_exps_b);   SET(L.ffn_up_exps_b);
         SET(L.ffn_gate_up_exps_b);
@@ -552,8 +807,8 @@ void patch_model_refs_for(llama_model * model, ggml_tensor * w_cpu, ggml_tensor 
         SET(L.ffn_down_shexp);      SET(L.ffn_up_shexp);
 
         // ff adjugate experts (chexps)
-        SET(L.ffn_gate_chexps);     SET(L.ffn_down_chexps);
-        SET(L.ffn_up_chexps);
+        //SET(L.ffn_gate_chexps);     SET(L.ffn_down_chexps);       //sparse layers are handled separately
+        //SET(L.ffn_up_chexps);
 
         // ffn bias
         SET(L.ffn_gate_b);   SET(L.ffn_down_b);
@@ -1357,7 +1612,6 @@ void parameter_offloader::stream_worker()
         uint64_t wait_generation = 0;         // schedule generation observed before blocking
         bool throttled = false;               // true when copy was blocked only by in-flight copy cap
         bool allowed = false;                 // true when selected copy is inside safe window
-        int copy_idx = -1;                    // schedule index selected for copy. TODO: Why do we have this function? When its read doesn't it always equal i? Seems redundant, consider removing
 
         {
             std::lock_guard<std::mutex> schedule_lk(schedule_mu); // blocks schedule swap during copy selection/upload
@@ -1410,7 +1664,6 @@ void parameter_offloader::stream_worker()
             }
             else
             {
-                copy_idx = i;
                 w_cpu = schedule_current.cpu_tensors_in_order[i];
                 w_gpu = schedule_current.gpu_tensors_in_order[i];
 
