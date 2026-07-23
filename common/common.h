@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include "ggml-backend.h"
 #include "llama-cpp.h"
 
 #include "ggml-opt.h"
@@ -488,6 +489,8 @@ struct common_params {
     void * cb_eval_user_data                 = nullptr;
     ggml_backend_sched_graph_callback cb_graph = nullptr;
     void * cb_graph_user_data                  = nullptr;
+    ggml_backend_sched_moe_residency_callback cb_moe_residency = nullptr;
+    void * cb_moe_residency_user_data                          = nullptr;
 
     ggml_numa_strategy numa = GGML_NUMA_STRATEGY_DISABLED;
 

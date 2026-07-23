@@ -439,6 +439,103 @@ void parameter_offloader::init_moe_cache(
         __func__, moe_cache_size, moe_cache_offset, banks.size(), n_slots, cap);
 }
 
+//TODO: This is a proof of concept test function. It does no intelligent moe slice prefetching, it simply fetches each slice as its requested
+int32_t parameter_offloader::debug_cache_moe_expert(
+    int block_id,
+    int32_t expert_id)
+{
+    std::lock_guard<std::mutex> lock(moe_cache_mu);
+
+    if (!model || !ctx_moe_cache || moe_cache_n_slots <= 0) {
+        return -1;
+    }
+
+    const int n_layers = (int) model->hparams.n_layer();
+
+    GGML_ASSERT(block_id >= 0);
+    GGML_ASSERT(block_id < n_layers);
+
+    llama_layer & layer = model->layers[block_id];
+
+    const int32_t cache_slot = moe_cache_next_slot;
+    bool copied_any = false;
+
+    const int n_fields =
+        (int) (sizeof(moe_cache_fields) / sizeof(moe_cache_fields[0]));
+
+    for (int field_id = 0; field_id < n_fields; ++field_id) {
+        const moe_cache_field & field = moe_cache_fields[field_id];
+
+        ggml_tensor * cpu   = layer.*(field.cpu);
+        ggml_tensor * cache = layer.*(field.cache);
+
+        GGML_ASSERT((cpu == nullptr) == (cache == nullptr));
+
+        if (cpu == nullptr) {
+            continue;
+        }
+
+        GGML_ASSERT(cpu->buffer);
+        GGML_ASSERT(ggml_backend_buffer_is_host(cpu->buffer));
+        GGML_ASSERT(cpu->data);
+
+        GGML_ASSERT(cache->buffer == arena);
+        GGML_ASSERT(cache->data);
+
+        GGML_ASSERT(cpu->type == cache->type);
+        GGML_ASSERT(cpu->ne[0] == cache->ne[0]);
+        GGML_ASSERT(cpu->ne[1] == cache->ne[1]);
+
+        GGML_ASSERT(expert_id >= 0);
+        GGML_ASSERT(expert_id < cpu->ne[2]);
+
+        GGML_ASSERT(cache_slot >= 0);
+        GGML_ASSERT(cache_slot < cache->ne[2]);
+
+        GGML_ASSERT(cpu->nb[2] == cache->nb[2]);
+
+        const size_t expert_bytes = cpu->nb[2];
+
+        const void * src =
+            (const char *) cpu->data +
+            (size_t) expert_id * cpu->nb[2];
+
+        const size_t dst_offset =
+            (size_t) cache_slot * cache->nb[2];
+
+        ggml_backend_tensor_set(
+            cache,
+            src,
+            dst_offset,
+            expert_bytes);
+
+        copied_any = true;
+    }
+
+    if (!copied_any) {
+        return -1;
+    }
+
+    moe_cache_next_slot =
+        (cache_slot + 1) % moe_cache_n_slots;
+
+    return cache_slot;
+}
+
+int32_t llama_offloader_moe_residency_cb(
+    int block_id,
+    int32_t expert_id,
+    void * ud)
+{
+    parameter_offloader * po = static_cast<parameter_offloader *>(ud);
+
+    if (!po) {
+        return -1;
+    }
+
+    return po->debug_cache_moe_expert(block_id, expert_id);
+}
+
 void parameter_offloader::init(
     ggml_backend_buffer_t   arena,
     llama_context_params    cparams,

@@ -60,5 +60,8 @@ struct llama_cparams {
     ggml_backend_sched_graph_callback cb_graph;
     void * cb_graph_user_data;
 
+    ggml_backend_sched_moe_residency_callback cb_moe_residency;
+    void * cb_moe_residency_user_data;
+
     llama_context * ctx_other;
 };

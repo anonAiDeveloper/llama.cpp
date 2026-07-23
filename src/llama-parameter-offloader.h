@@ -17,6 +17,7 @@
 // signature must match ggml_backend_sched_eval_callback
 bool llama_offloader_eval_cb(ggml_tensor * t, bool ask, void * ud);
 bool llama_offloader_graph_cb(ggml_backend_sched_t sched, struct ggml_cgraph * graph, void * ud);
+int32_t llama_offloader_moe_residency_cb(int block_id, int32_t expert_id, void * ud);
 
 struct parameter_offloader
 {
@@ -90,6 +91,7 @@ public:
     std::unordered_set<ggml_tensor*> gpu_weight_set; // GPU weight ptrs
 
     void init_moe_cache(ggml_backend_buffer_t arena, int32_t n_slots);
+    int32_t debug_cache_moe_expert(int block_id, int32_t expert_id);
 
     void init(ggml_backend_buffer_t arena,     llama_context_params params,
               ggml_context        * ctx_twins, llama_context      * lctx);
@@ -119,6 +121,8 @@ private:
 
     void attach_arena(ggml_backend_buffer_t arena);
     void clear_moe_cache_refs();
+    std::mutex moe_cache_mu;
+    int32_t moe_cache_next_slot = 0;
 
     std::atomic<long long> tensor_idx_copied_ordinal{-1}; // last copied ordinal in current schedule stream
     std::atomic<long long> tensor_idx_used_ordinal{-1};   // last read ordinal in current schedule stream

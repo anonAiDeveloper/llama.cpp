@@ -363,6 +363,8 @@ extern "C" {
         void * cb_eval_user_data;
         ggml_backend_sched_graph_callback cb_graph;
         void * cb_graph_user_data;
+        ggml_backend_sched_moe_residency_callback cb_moe_residency;
+        void * cb_moe_residency_user_data;
 
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]

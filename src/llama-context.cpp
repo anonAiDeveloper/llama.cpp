@@ -89,6 +89,8 @@ llama_context::llama_context(
     cparams.cb_eval_user_data = params.cb_eval_user_data;
     cparams.cb_graph           = params.cb_graph;
     cparams.cb_graph_user_data = params.cb_graph_user_data;
+    cparams.cb_moe_residency           = params.cb_moe_residency;
+    cparams.cb_moe_residency_user_data = params.cb_moe_residency_user_data;
 
     cparams.ctx_other = nullptr;
 
@@ -1336,6 +1338,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
         ggml_backend_sched_set_graph_callback(sched.get(), cparams.cb_graph, cparams.cb_graph_user_data);
+        ggml_backend_sched_set_moe_residency_callback(sched.get(), cparams.cb_moe_residency, cparams.cb_moe_residency_user_data);
 
         //const auto t_start_us = ggml_time_us();
 
@@ -3487,6 +3490,8 @@ llama_context_params llama_context_default_params() {
         /*.cb_eval_user_data           =*/ nullptr,
         /*.cb_graph                    =*/ nullptr,
         /*.cb_graph_user_data          =*/ nullptr,
+        /*.cb_moe_residency            =*/ nullptr,
+        /*.cb_moe_residency_user_data  =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.abort_callback              =*/ nullptr,

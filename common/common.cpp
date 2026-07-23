@@ -1343,6 +1343,9 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
     cparams.cb_graph = llama_offloader_graph_cb;
     cparams.cb_graph_user_data = pimpl->param_offloader.get();
+
+    cparams.cb_moe_residency = llama_offloader_moe_residency_cb;
+    cparams.cb_moe_residency_user_data = pimpl->param_offloader.get();
 #endif
 
     llama_context * lctx = llama_init_from_model(model, cparams);
@@ -1683,6 +1686,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.cb_eval_user_data = params.cb_eval_user_data;
     cparams.cb_graph           = params.cb_graph;
     cparams.cb_graph_user_data = params.cb_graph_user_data;
+    cparams.cb_moe_residency           = params.cb_moe_residency;
+    cparams.cb_moe_residency_user_data = params.cb_moe_residency_user_data;
     cparams.offload_kqv       = !params.no_kv_offload;
     cparams.no_perf           = params.no_perf;
     cparams.op_offload        = !params.no_op_offload;
