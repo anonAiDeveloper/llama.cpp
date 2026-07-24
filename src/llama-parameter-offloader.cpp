@@ -297,8 +297,17 @@ void parameter_offloader::init_moe_cache(
     int32_t n_slots)
 {
     GGML_ASSERT(model);
-    GGML_ASSERT(n_slots >= 8);
+    GGML_ASSERT(arena);
+    GGML_ASSERT(n_slots >= model->hparams.n_expert_used);
     GGML_ASSERT(ctx_moe_cache == nullptr);
+
+    if (llama_model_n_devices(model) != 1)
+        throw std::runtime_error("MoE expert prefetch currently supports exactly one accelerator device");
+
+    ggml_backend_dev_t arena_device = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(arena));
+    ggml_backend_dev_t model_device = llama_model_get_device(model, 0);
+    if (arena_device != model_device)
+        throw std::runtime_error("MoE expert cache arena is not allocated on the model's accelerator device");
 
     attach_arena(arena);
 
@@ -439,7 +448,9 @@ void parameter_offloader::init_moe_cache(
         __func__, moe_cache_size, moe_cache_offset, banks.size(), n_slots, cap);
 }
 
-//TODO: This is a proof of concept test function. It does no intelligent moe slice prefetching, it simply fetches each slice as its requested
+// TODO: This is a proof-of-concept test function.
+// It performs no intelligent MoE slice prefetching.
+// Every other requested expert is copied to the GPU cache; the rest stay on CPU.
 int32_t parameter_offloader::debug_cache_moe_expert(
     int block_id,
     int32_t expert_id)
@@ -454,6 +465,17 @@ int32_t parameter_offloader::debug_cache_moe_expert(
 
     GGML_ASSERT(block_id >= 0);
     GGML_ASSERT(block_id < n_layers);
+
+    // Debug-only: first request uses the GPU cache, second stays on CPU,
+    // third uses the GPU cache, and so on.
+    static uint64_t debug_request_index = 0;
+
+    const bool fetch_this_request =
+        (debug_request_index++ % 2) == 0;
+
+    if (!fetch_this_request) {
+        return -1;
+    }
 
     llama_layer & layer = model->layers[block_id];
 
