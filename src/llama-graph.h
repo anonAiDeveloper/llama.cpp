@@ -53,6 +53,20 @@ enum llm_ffn_gate_type {
     LLM_FFN_PAR, // ffn_gate is parallel to ffn_up
 };
 
+struct llm_moe_expert_tensors {
+    ggml_tensor * up        = nullptr;
+    ggml_tensor * up_b      = nullptr;
+    ggml_tensor * up_s      = nullptr;
+    ggml_tensor * gate      = nullptr;
+    ggml_tensor * gate_b    = nullptr;
+    ggml_tensor * gate_s    = nullptr;
+    ggml_tensor * down      = nullptr;
+    ggml_tensor * down_b    = nullptr;
+    ggml_tensor * down_s    = nullptr;
+    ggml_tensor * gate_up   = nullptr;
+    ggml_tensor * gate_up_b = nullptr;
+};
+
 enum llm_norm_type {
     LLM_NORM,
     LLM_NORM_RMS,
@@ -954,40 +968,9 @@ struct llm_graph_context {
     ggml_tensor * build_and_register_moe_ffn_block_lanes(
              ggml_tensor * cur,
              ggml_tensor * gate_inp,
-             ggml_tensor * up_exps,
-             ggml_tensor * up_exps_cache,
-             ggml_tensor * gate_exps,
-             ggml_tensor * gate_exps_cache,
-             ggml_tensor * down_exps,
-             ggml_tensor * down_exps_cache,
-             ggml_tensor * exp_probs_b,
-                 int64_t   n_expert,
-                 int64_t   n_expert_used,
-         llm_ffn_op_type   type_op,
-                    bool   norm_w,
-                   float   w_scale,
-            llama_expert_gating_func_type gating_op,
-                     int   il,
-             ggml_tensor * probs_in = nullptr,
-             ggml_tensor * gate_up_exps = nullptr,
-             ggml_tensor * gate_up_exps_cache = nullptr,
-             ggml_tensor * up_exps_s = nullptr,
-             ggml_tensor * gate_exps_s = nullptr,
-             ggml_tensor * down_exps_s = nullptr) const;
-
-    ggml_tensor * build_and_register_moe_ffn_block_lanes(
-             ggml_tensor * cur,
-             ggml_tensor * gate_inp,
              ggml_tensor * gate_inp_b,
-             ggml_tensor * up_exps,
-             ggml_tensor * up_exps_cache,
-             ggml_tensor * up_exps_b,
-             ggml_tensor * gate_exps,
-             ggml_tensor * gate_exps_cache,
-             ggml_tensor * gate_exps_b,
-             ggml_tensor * down_exps,
-             ggml_tensor * down_exps_cache,
-             ggml_tensor * down_exps_b,
+             const llm_moe_expert_tensors & cpu_experts,
+             const llm_moe_expert_tensors & gpu_experts,
              ggml_tensor * exp_probs_b,
                  int64_t   n_expert,
                  int64_t   n_expert_used,
@@ -996,13 +979,7 @@ struct llm_graph_context {
                    float   w_scale,
             llama_expert_gating_func_type gating_op,
                      int   il,
-             ggml_tensor * probs_in = nullptr,
-             ggml_tensor * gate_up_exps = nullptr,
-             ggml_tensor * gate_up_exps_cache = nullptr,
-             ggml_tensor * gate_up_exps_b = nullptr,
-             ggml_tensor * up_exps_s = nullptr,
-             ggml_tensor * gate_exps_s = nullptr,
-             ggml_tensor * down_exps_s = nullptr) const;
+             ggml_tensor * probs_in = nullptr) const;
 
     //
     // inputs

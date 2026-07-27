@@ -1845,66 +1845,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 ggml_tensor * llm_graph_context::build_and_register_moe_ffn_block_lanes(
          ggml_tensor * cur,
          ggml_tensor * gate_inp,
-         ggml_tensor * up_exps,
-         ggml_tensor * up_exps_cache,
-         ggml_tensor * gate_exps,
-         ggml_tensor * gate_exps_cache,
-         ggml_tensor * down_exps,
-         ggml_tensor * down_exps_cache,
-         ggml_tensor * exp_probs_b,
-             int64_t   n_expert,
-             int64_t   n_expert_used,
-     llm_ffn_op_type   type_op,
-                bool   norm_w,
-               float   w_scale,
-        llama_expert_gating_func_type gating_op,
-                 int   il,
-         ggml_tensor * probs_in,
-         ggml_tensor * gate_up_exps,
-         ggml_tensor * gate_up_exps_cache,
-         ggml_tensor * up_exps_s,
-         ggml_tensor * gate_exps_s,
-         ggml_tensor * down_exps_s) const {
-    return build_and_register_moe_ffn_block_lanes(
-        cur,
-        gate_inp,       /* gate_inp_b      */ nullptr,
-        up_exps,
-        up_exps_cache,  /* up_exps_b       */ nullptr,
-        gate_exps,
-        gate_exps_cache, /* gate_exps_b     */ nullptr,
-        down_exps,
-        down_exps_cache, /* down_exps_b     */ nullptr,
-        exp_probs_b,
-        n_expert,
-        n_expert_used,
-        type_op,
-        norm_w,
-        w_scale,
-        gating_op,
-        il,
-        probs_in,
-        gate_up_exps,
-        gate_up_exps_cache,
-        /* gate_up_exps_b */ nullptr,
-        up_exps_s,
-        gate_exps_s,
-        down_exps_s
-    );
-}
-
-ggml_tensor * llm_graph_context::build_and_register_moe_ffn_block_lanes(
-         ggml_tensor * cur,
-         ggml_tensor * gate_inp,
          ggml_tensor * gate_inp_b,
-         ggml_tensor * up_exps,
-         ggml_tensor * up_exps_cache,
-         ggml_tensor * up_exps_b,
-         ggml_tensor * gate_exps,
-         ggml_tensor * gate_exps_cache,
-         ggml_tensor * gate_exps_b,
-         ggml_tensor * down_exps,
-         ggml_tensor * down_exps_cache,
-         ggml_tensor * down_exps_b,
+         const llm_moe_expert_tensors & cpu_experts,
+         const llm_moe_expert_tensors & gpu_experts,
          ggml_tensor * exp_probs_b,
              int64_t   n_expert,
              int64_t   n_expert_used,
@@ -1913,13 +1856,7 @@ ggml_tensor * llm_graph_context::build_and_register_moe_ffn_block_lanes(
                float   w_scale,
         llama_expert_gating_func_type gating_op,
                  int   il,
-         ggml_tensor * probs_in,
-         ggml_tensor * gate_up_exps,
-         ggml_tensor * gate_up_exps_cache,
-         ggml_tensor * gate_up_exps_b,
-         ggml_tensor * up_exps_s,
-         ggml_tensor * gate_exps_s,
-         ggml_tensor * down_exps_s) const {
+         ggml_tensor * probs_in) const {
     if (cparams.warmup) {
         n_expert_used = hparams.n_expert_used;
     }
@@ -2065,34 +2002,46 @@ ggml_tensor * llm_graph_context::build_and_register_moe_ffn_block_lanes(
     GGML_ASSERT(n_expert_used > 0);
     GGML_ASSERT(n_expert_used <= LLAMA_MAX_EXPERTS);
 
-    /*auto assert_cache_bank = [&](const ggml_tensor * cpu, const ggml_tensor * cache) {
+    auto assert_cache_tensor = [&](const ggml_tensor * cpu, const ggml_tensor * cache) {
         GGML_ASSERT((cpu == nullptr) == (cache == nullptr));
 
         if (cpu == nullptr) {
             return;
         }
 
-        GGML_ASSERT(cpu->type  == cache->type);
-        GGML_ASSERT(cpu->ne[0] == cache->ne[0]);
-        GGML_ASSERT(cpu->ne[1] == cache->ne[1]);
-        GGML_ASSERT(cache->ne[2] >= n_expert_used);
+        GGML_ASSERT(cpu->type == cache->type);
+        GGML_ASSERT(ggml_n_dims(cpu) == ggml_n_dims(cache));
+
+        const int n_dims = ggml_n_dims(cpu);
+        const int expert_dim = n_dims - 1;
+
+        GGML_ASSERT(expert_dim >= 0);
+
+        for (int d = 0; d < expert_dim; ++d) {
+            GGML_ASSERT(cpu->ne[d] == cache->ne[d]);
+        }
+
+        GGML_ASSERT(cache->ne[expert_dim] >= n_expert_used);
         GGML_ASSERT(cache->buffer != nullptr);
-        GGML_ASSERT(!ggml_backend_buffer_is_host(cache->buffer));
     };
 
-    assert_cache_bank(up_exps,      up_exps_cache);
-    assert_cache_bank(gate_exps,    gate_exps_cache);
-    assert_cache_bank(down_exps,    down_exps_cache);
-    assert_cache_bank(gate_up_exps, gate_up_exps_cache);*/
+    assert_cache_tensor(cpu_experts.up,        gpu_experts.up);
+    assert_cache_tensor(cpu_experts.up_b,      gpu_experts.up_b);
+    assert_cache_tensor(cpu_experts.up_s,      gpu_experts.up_s);
+    assert_cache_tensor(cpu_experts.gate,      gpu_experts.gate);
+    assert_cache_tensor(cpu_experts.gate_b,    gpu_experts.gate_b);
+    assert_cache_tensor(cpu_experts.gate_s,    gpu_experts.gate_s);
+    assert_cache_tensor(cpu_experts.down,      gpu_experts.down);
+    assert_cache_tensor(cpu_experts.down_b,    gpu_experts.down_b);
+    assert_cache_tensor(cpu_experts.down_s,    gpu_experts.down_s);
+    assert_cache_tensor(cpu_experts.gate_up,   gpu_experts.gate_up);
+    assert_cache_tensor(cpu_experts.gate_up_b, gpu_experts.gate_up_b);
 
     auto build_lane_branch = [&](ggml_tensor * cur,
                                  ggml_tensor * selected_experts,
                                  ggml_tensor * weights,
                                      int64_t   n_expert_used,
-                                 ggml_tensor * branch_up_exps,
-                                 ggml_tensor * branch_gate_exps,
-                                 ggml_tensor * branch_down_exps,
-                                 ggml_tensor * branch_gate_up_exps) -> ggml_tensor * {
+                                 const llm_moe_expert_tensors & branch) -> ggml_tensor * {
 
         cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
@@ -2106,17 +2055,17 @@ ggml_tensor * llm_graph_context::build_and_register_moe_ffn_block_lanes(
         ggml_tensor * up = nullptr;
         ggml_tensor * experts = nullptr;
 
-        if (branch_gate_up_exps) {
+        if (branch.gate_up) {
             // merged gate_up path: one mul_mat_id, then split into gate and up views
-            ggml_tensor * gate_up = build_lora_mm_id(branch_gate_up_exps, cur, selected_experts, up_exps_s); // [n_ff*2, n_expert_used, n_tokens]
+            ggml_tensor * gate_up = build_lora_mm_id(branch.gate_up, cur, selected_experts, branch.up_s); // [n_ff*2, n_expert_used, n_tokens]
             cb(gate_up, "ffn_moe_gate_up", il);
 
-            if (up_exps_s) {
+            if (branch.up_s) {
                 cb(gate_up, "ffn_moe_gate_up_scaled", il);
             }
 
-            if (gate_up_exps_b) {
-                gate_up = ggml_add_id(ctx0, gate_up, gate_up_exps_b, selected_experts);
+            if (branch.gate_up_b) {
+                gate_up = ggml_add_id(ctx0, gate_up, branch.gate_up_b, selected_experts);
                 cb(gate_up, "ffn_moe_gate_up_biased", il);
             }
 
@@ -2127,40 +2076,40 @@ ggml_tensor * llm_graph_context::build_and_register_moe_ffn_block_lanes(
             cb(up, "ffn_moe_up", il);
         } else {
             // separate gate and up path
-            up = build_lora_mm_id(branch_up_exps, cur, selected_experts, up_exps_s); // [n_ff, n_expert_used, n_tokens]
+            up = build_lora_mm_id(branch.up, cur, selected_experts, branch.up_s); // [n_ff, n_expert_used, n_tokens]
             cb(up, "ffn_moe_up", il);
 
-            if (up_exps_s) {
+            if (branch.up_s) {
                 cb(up, "ffn_moe_up_scaled", il);
             }
 
-            if (up_exps_b) {
-                up = ggml_add_id(ctx0, up, up_exps_b, selected_experts);
+            if (branch.up_b) {
+                up = ggml_add_id(ctx0, up, branch.up_b, selected_experts);
                 cb(up, "ffn_moe_up_biased", il);
             }
 
-            if (branch_gate_exps) {
-                cur = build_lora_mm_id(branch_gate_exps, cur, selected_experts, gate_exps_s); // [n_ff, n_expert_used, n_tokens]
+            if (branch.gate) {
+                cur = build_lora_mm_id(branch.gate, cur, selected_experts, branch.gate_s); // [n_ff, n_expert_used, n_tokens]
                 cb(cur, "ffn_moe_gate", il);
             } else {
                 cur = up;
             }
 
-            if (gate_exps_s) {
+            if (branch.gate_s) {
                 cb(cur, "ffn_moe_gate_scaled", il);
             }
 
-            if (gate_exps_b) {
-                cur = ggml_add_id(ctx0, cur, gate_exps_b, selected_experts);
+            if (branch.gate_b) {
+                cur = ggml_add_id(ctx0, cur, branch.gate_b, selected_experts);
                 cb(cur, "ffn_moe_gate_biased", il);
             }
         }
 
-        const bool has_gate = branch_gate_exps || branch_gate_up_exps;
+        const bool has_gate = branch.gate || branch.gate_up;
 
         switch (type_op) {
             case LLM_FFN_SILU:
-                if (branch_gate_exps) {
+                if (branch.gate) {
                     // Step35: per-layer clamp for routed experts
                     if (arch == LLM_ARCH_STEP35 && il >= 0) {
                         const float limit = hparams.swiglu_clamp_exp[il];
@@ -2198,6 +2147,7 @@ ggml_tensor * llm_graph_context::build_and_register_moe_ffn_block_lanes(
                 } break;
             case LLM_FFN_SWIGLU_OAI_MOE:
                 {
+                    // TODO: move to hparams?
                     constexpr float alpha = 1.702f;
                     constexpr float limit = 7.0f;
                     cur = ggml_swiglu_oai(ctx0, cur, up, alpha, limit);
@@ -2223,15 +2173,15 @@ ggml_tensor * llm_graph_context::build_and_register_moe_ffn_block_lanes(
                 GGML_ABORT("fatal error");
         }
 
-        experts = build_lora_mm_id(branch_down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
+        experts = build_lora_mm_id(branch.down, cur, selected_experts, branch.down_s); // [n_embd, n_expert_used, n_tokens]
         cb(experts, "ffn_moe_down", il);
 
-        if (down_exps_s) {
+        if (branch.down_s) {
             cb(experts, "ffn_moe_down_scaled", il);
         }
 
-        if (down_exps_b) {
-            experts = ggml_add_id(ctx0, experts, down_exps_b, selected_experts);
+        if (branch.down_b) {
+            experts = ggml_add_id(ctx0, experts, branch.down_b, selected_experts);
             cb(experts, "ffn_moe_down_biased", il);
         }
 
@@ -2379,17 +2329,23 @@ ggml_tensor * llm_graph_context::build_and_register_moe_ffn_block_lanes(
                 cpu_ids,
                 cpu_weights,
                 n_cpu,
-                up_exps,
-                gate_exps,
-                down_exps,
-                gate_up_exps);
+                cpu_experts);
 
             const int cpu_end = ggml_graph_n_nodes(gf);
 
             for (int i = cpu_start; i < cpu_end; ++i) {
+                ggml_tensor * node = ggml_graph_node(gf, i);
+
+                // Views do not own storage. Their backend placement must follow the
+                // backing tensor so that the scheduler can materialize a cross-backend
+                // copy when a CPU operation consumes a device-backed view.
+                if (node->view_src != nullptr) {
+                    continue;
+                }
+
                 ggml_backend_sched_set_tensor_backend(
                     sched,
-                    ggml_graph_node(gf, i),
+                    node,
                     backend_cpu);
             }
         }
@@ -2402,10 +2358,7 @@ ggml_tensor * llm_graph_context::build_and_register_moe_ffn_block_lanes(
                 gpu_ids,
                 gpu_weights,
                 n_gpu,
-                up_exps_cache,
-                gate_exps_cache,
-                down_exps_cache,
-                gate_up_exps_cache);
+                gpu_experts);
         }
 
         ggml_tensor * lane_out = cpu_out ? cpu_out : gpu_out;

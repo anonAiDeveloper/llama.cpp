@@ -302,15 +302,15 @@ struct llama_layer {
     struct ggml_tensor * ffn_up_exps       = nullptr; struct ggml_tensor * ffn_up_exps_cache       = nullptr;
     struct ggml_tensor * ffn_gate_up_exps  = nullptr; struct ggml_tensor * ffn_gate_up_exps_cache  = nullptr;
     struct ggml_tensor * ffn_gate_inp_b    = nullptr;
-    struct ggml_tensor * ffn_gate_exps_b   = nullptr;
-    struct ggml_tensor * ffn_down_exps_b   = nullptr;
-    struct ggml_tensor * ffn_up_exps_b     = nullptr;
-    struct ggml_tensor * ffn_gate_up_exps_b = nullptr;
+    struct ggml_tensor * ffn_gate_exps_b    = nullptr; struct ggml_tensor * ffn_gate_exps_b_cache    = nullptr;
+    struct ggml_tensor * ffn_down_exps_b    = nullptr; struct ggml_tensor * ffn_down_exps_b_cache    = nullptr;
+    struct ggml_tensor * ffn_up_exps_b      = nullptr; struct ggml_tensor * ffn_up_exps_b_cache      = nullptr;
+    struct ggml_tensor * ffn_gate_up_exps_b = nullptr; struct ggml_tensor * ffn_gate_up_exps_b_cache = nullptr;
 
     // ff MoE per-expert scales (NVFP4 per-tensor scale2)
-    struct ggml_tensor * ffn_gate_exps_s   = nullptr;
-    struct ggml_tensor * ffn_down_exps_s   = nullptr;
-    struct ggml_tensor * ffn_up_exps_s     = nullptr;
+    struct ggml_tensor * ffn_gate_exps_s   = nullptr; struct ggml_tensor * ffn_gate_exps_s_cache   = nullptr;
+    struct ggml_tensor * ffn_down_exps_s   = nullptr; struct ggml_tensor * ffn_down_exps_s_cache   = nullptr;
+    struct ggml_tensor * ffn_up_exps_s     = nullptr; struct ggml_tensor * ffn_up_exps_s_cache     = nullptr;
 
     // ff MoE latent proj
     struct ggml_tensor * ffn_latent_down = nullptr;
@@ -436,9 +436,9 @@ struct llama_layer {
     struct ggml_tensor * ffn_gate_in_s      = nullptr;
     struct ggml_tensor * ffn_up_in_s        = nullptr;
     struct ggml_tensor * ffn_down_in_s      = nullptr;
-    struct ggml_tensor * ffn_gate_exps_in_s = nullptr;
-    struct ggml_tensor * ffn_down_exps_in_s = nullptr;
-    struct ggml_tensor * ffn_up_exps_in_s   = nullptr;
+    struct ggml_tensor * ffn_gate_exps_in_s = nullptr; struct ggml_tensor * ffn_gate_exps_in_s_cache = nullptr;
+    struct ggml_tensor * ffn_down_exps_in_s = nullptr; struct ggml_tensor * ffn_down_exps_in_s_cache = nullptr;
+    struct ggml_tensor * ffn_up_exps_in_s   = nullptr; struct ggml_tensor * ffn_up_exps_in_s_cache   = nullptr;
     struct ggml_tensor * ffn_gate_shexp_in_s= nullptr;
     struct ggml_tensor * ffn_up_shexp_in_s  = nullptr;
     struct ggml_tensor * ffn_down_shexp_in_s= nullptr;

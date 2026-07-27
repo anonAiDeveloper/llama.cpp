@@ -60,6 +60,7 @@ struct moe_cache_field {
 };
 
 static const moe_cache_field moe_cache_fields[] = {
+    // Routed expert matrices
     {
         "gate_exps",
         &llama_layer::ffn_gate_exps,
@@ -80,6 +81,8 @@ static const moe_cache_field moe_cache_fields[] = {
         &llama_layer::ffn_gate_up_exps,
         &llama_layer::ffn_gate_up_exps_cache,
     },
+
+    // Adjugate expert matrices
     {
         "gate_chexps",
         &llama_layer::ffn_gate_chexps,
@@ -95,6 +98,62 @@ static const moe_cache_field moe_cache_fields[] = {
         &llama_layer::ffn_up_chexps,
         &llama_layer::ffn_up_chexps_cache,
     },
+
+    // Routed expert biases
+    {
+        "gate_exps_b",
+        &llama_layer::ffn_gate_exps_b,
+        &llama_layer::ffn_gate_exps_b_cache,
+    },
+    {
+        "down_exps_b",
+        &llama_layer::ffn_down_exps_b,
+        &llama_layer::ffn_down_exps_b_cache,
+    },
+    {
+        "up_exps_b",
+        &llama_layer::ffn_up_exps_b,
+        &llama_layer::ffn_up_exps_b_cache,
+    },
+    {
+        "gate_up_exps_b",
+        &llama_layer::ffn_gate_up_exps_b,
+        &llama_layer::ffn_gate_up_exps_b_cache,
+    },
+
+    // Routed expert NVFP4 scales
+    {
+        "gate_exps_s",
+        &llama_layer::ffn_gate_exps_s,
+        &llama_layer::ffn_gate_exps_s_cache,
+    },
+    {
+        "down_exps_s",
+        &llama_layer::ffn_down_exps_s,
+        &llama_layer::ffn_down_exps_s_cache,
+    },
+    {
+        "up_exps_s",
+        &llama_layer::ffn_up_exps_s,
+        &llama_layer::ffn_up_exps_s_cache,
+    },
+
+    // Routed expert NVFP4 input scales
+    {
+        "gate_exps_in_s",
+        &llama_layer::ffn_gate_exps_in_s,
+        &llama_layer::ffn_gate_exps_in_s_cache,
+    },
+    {
+        "down_exps_in_s",
+        &llama_layer::ffn_down_exps_in_s,
+        &llama_layer::ffn_down_exps_in_s_cache,
+    },
+    {
+        "up_exps_in_s",
+        &llama_layer::ffn_up_exps_in_s,
+        &llama_layer::ffn_up_exps_in_s_cache,
+    },
 };
 
 struct moe_cache_bank_build {
@@ -102,8 +161,8 @@ struct moe_cache_bank_build {
 
     enum ggml_type type;
 
-    int64_t ne0;
-    int64_t ne1;
+    int n_dims;
+    int64_t ne[GGML_MAX_DIMS];
 
     ggml_tensor * tensor;
 
@@ -200,7 +259,7 @@ void parameter_offloader::seed_all_weights_from_model()
         };
 
         //Deepseek 2 weights
-        const bool supported =
+        const bool supported_deepseek2 =
             //ends(kv.first, ".attn_norm.weight")      || // RMSNorm scale before attention block; 1D vector applied to residual stream before Q/K/V work
             ends(kv.first, ".attn_q_a.weight")       ||   // First low-rank Q projection: hidden -> q_lora_rank before q_a_norm/q_b
             //ends(kv.first, ".attn_q_a_norm.weight")  || // RMSNorm scale on low-rank Q activation between q_a and q_b; 1D vector
@@ -226,6 +285,41 @@ void parameter_offloader::seed_all_weights_from_model()
             //kv.first == "token_embd.weight"          ||
             //kv.first == "output_norm.weight"         || // Final RMSNorm scale before logits
             kv.first == "output.weight";                  // LM head / output projection from hidden state to vocabulary logits
+
+        //GPT-OSS weights
+        const bool supported_gpt_oss =
+            //kv.first == "token_embd.weight"            || // Input embedding; leave on CPU with the current streamer
+            //kv.first == "output_norm.weight"           || // Final RMSNorm scale; leave on CPU with the current streamer
+            //ends(kv.first, ".attn_norm.weight")        || // RMSNorm scale before attention; 1D vector
+            //ends(kv.first, ".attn_post_norm.weight")   || // RMSNorm scale before MoE; 1D vector
+            ends(kv.first, ".attn_qkv.weight")         ||   // Optional fused Q/K/V projection
+            //ends(kv.first, ".attn_qkv.bias")          || // Optional fused Q/K/V bias; leave on CPU with the current streamer
+            ends(kv.first, ".attn_q.weight")           ||   // Separate Q projection when fused QKV is absent
+            ends(kv.first, ".attn_k.weight")           ||   // Separate K projection when fused QKV is absent
+            ends(kv.first, ".attn_v.weight")           ||   // Separate V projection when fused QKV is absent
+            //ends(kv.first, ".attn_q.bias")            || // Optional Q bias; leave on CPU with the current streamer
+            //ends(kv.first, ".attn_k.bias")            || // Optional K bias; leave on CPU with the current streamer
+            //ends(kv.first, ".attn_v.bias")            || // Optional V bias; leave on CPU with the current streamer
+            ends(kv.first, ".attn_output.weight")      ||   // Attention output projection
+            //ends(kv.first, ".attn_output.bias")       || // Attention output bias; leave on CPU with the current streamer
+            //ends(kv.first, ".attn_sinks.weight")      || // Attention sinks; 1D vector
+            ends(kv.first, ".ffn_gate_inp.weight")     ||   // MoE router/gating projection
+            //ends(kv.first, ".ffn_gate_inp.bias")      || // Router bias; leave on CPU with the current streamer
+            //ends(kv.first, ".ffn_gate_exps.weight")   || // Routed expert gate matrices; handled by the MoE cache
+            //ends(kv.first, ".ffn_down_exps.weight")   || // Routed expert down matrices; handled by the MoE cache
+            //ends(kv.first, ".ffn_up_exps.weight")     || // Routed expert up matrices; handled by the MoE cache
+            //ends(kv.first, ".ffn_gate_exps.bias")     || // Routed expert gate biases; handled by the MoE cache
+            //ends(kv.first, ".ffn_down_exps.bias")     || // Routed expert down biases; handled by the MoE cache
+            //ends(kv.first, ".ffn_up_exps.bias")       || // Routed expert up biases; handled by the MoE cache
+            //ends(kv.first, ".ffn_gate_exps.scale")    || // Routed expert gate scales; handled by the MoE cache
+            //ends(kv.first, ".ffn_down_exps.scale")    || // Routed expert down scales; handled by the MoE cache
+            //ends(kv.first, ".ffn_up_exps.scale")      || // Routed expert up scales; handled by the MoE cache
+            //ends(kv.first, ".ffn_gate_exps.input_scale") || // Routed expert gate input scales; handled by the MoE cache
+            //ends(kv.first, ".ffn_down_exps.input_scale") || // Routed expert down input scales; handled by the MoE cache
+            //ends(kv.first, ".ffn_up_exps.input_scale")   || // Routed expert up input scales; handled by the MoE cache
+            kv.first == "output.weight";                    // LM head / output projection
+
+        const bool supported = supported_deepseek2 || supported_gpt_oss;
 
         if (!supported)
         {
@@ -362,42 +456,76 @@ void parameter_offloader::init_moe_cache(
                 continue;
 
             GGML_ASSERT(cpu->view_src == nullptr);
-            GGML_ASSERT(ggml_n_dims(cpu) == 3);
-            GGML_ASSERT(cpu->ne[2] > 0);
-            GGML_ASSERT(cpu->ne[3] == 1);
             GGML_ASSERT(!ggml_is_transposed(cpu));
             GGML_ASSERT(ggml_is_contiguous(cpu));
 
+            const int n_dims = ggml_n_dims(cpu);
+
+            GGML_ASSERT(n_dims >= 1);
+            GGML_ASSERT(n_dims <= GGML_MAX_DIMS);
+
+            const int expert_dim = n_dims - 1;
+
+            GGML_ASSERT(cpu->ne[expert_dim] > 0);
+
+            // Copy the source shape and replace the expert count with the cache slot count.
+            int64_t cache_ne[GGML_MAX_DIMS];
+
+            for (int d = 0; d < GGML_MAX_DIMS; ++d)
+                cache_ne[d] = 1;
+
+            for (int d = 0; d < n_dims; ++d)
+                cache_ne[d] = cpu->ne[d];
+
+            cache_ne[expert_dim] = n_slots;
+
             size_t bank_id = banks.size();
 
+            // Reuse a cache bank when the field, type, rank, and shortened shape match.
             for (size_t i = 0; i < banks.size(); ++i) {
                 const moe_cache_bank_build & bank = banks[i];
 
-                if (bank.field_id == field_id &&
-                    bank.type     == cpu->type &&
-                    bank.ne0      == cpu->ne[0] &&
-                    bank.ne1      == cpu->ne[1])
-                {
+                if (bank.field_id != field_id ||
+                    bank.type     != cpu->type ||
+                    bank.n_dims   != n_dims)
+                    continue;
+
+                bool same_shape = true;
+
+                for (int d = 0; d < n_dims; ++d) {
+                    if (bank.ne[d] != cache_ne[d]) {
+                        same_shape = false;
+                        break;
+                    }
+                }
+
+                if (same_shape) {
                     bank_id = i;
                     break;
                 }
             }
 
             if (bank_id == banks.size()) {
-                ggml_tensor * cache = ggml_new_tensor_3d(ctx_moe_cache, cpu->type, cpu->ne[0], cpu->ne[1], n_slots);
+                ggml_tensor * cache = ggml_new_tensor(ctx_moe_cache, cpu->type, n_dims, cache_ne);
 
                 GGML_ASSERT(cache);
+                GGML_ASSERT(!ggml_is_transposed(cache));
+                GGML_ASSERT(ggml_is_contiguous(cache));
 
                 ggml_format_name(cache, "moe_cache_%s_%d", field.name, (int) banks.size());
 
-                banks.push_back({
-                    /* .field_id = */ field_id,
-                    /* .type     = */ cpu->type,
-                    /* .ne0      = */ cpu->ne[0],
-                    /* .ne1      = */ cpu->ne[1],
-                    /* .tensor   = */ cache,
-                    /* .offset   = */ 0,
-                });
+                moe_cache_bank_build bank = {};
+
+                bank.field_id = field_id;
+                bank.type     = cpu->type;
+                bank.n_dims   = n_dims;
+                bank.tensor   = cache;
+                bank.offset   = 0;
+
+                for (int d = 0; d < GGML_MAX_DIMS; ++d)
+                    bank.ne[d] = cache_ne[d];
+
+                banks.push_back(bank);
             }
 
             layer.*(field.cache) = banks[bank_id].tensor;
@@ -432,12 +560,14 @@ void parameter_offloader::init_moe_cache(
     for (moe_cache_bank_build & bank : banks) {
         GGML_ASSERT(ggml_backend_tensor_alloc(arena, bank.tensor, cache_base + bank.offset) == GGML_STATUS_SUCCESS);
 
-        LLAMA_LOG_INFO("%s: %s type=%s shape=[%lld,%lld,%d] offset=%zu bytes=%zu\n", __func__,
+        LLAMA_LOG_INFO("%s: %s type=%s shape=[%lld,%lld,%lld,%lld] rank=%d offset=%zu bytes=%zu\n", __func__,
             ggml_get_name(bank.tensor),
             ggml_type_name(bank.tensor->type),
             (long long) bank.tensor->ne[0],
             (long long) bank.tensor->ne[1],
-            n_slots,
+            (long long) bank.tensor->ne[2],
+            (long long) bank.tensor->ne[3],
+            bank.n_dims,
             moe_cache_offset + bank.offset,
             ggml_backend_buffer_get_alloc_size(arena, bank.tensor));
     }
@@ -498,32 +628,50 @@ int32_t parameter_offloader::debug_cache_moe_expert(
         }
 
         GGML_ASSERT(cpu->buffer);
-        GGML_ASSERT(ggml_backend_buffer_is_host(cpu->buffer));
+        //GGML_ASSERT(ggml_backend_buffer_is_host(cpu->buffer));    //is there an important reason for this here? I have no clue
         GGML_ASSERT(cpu->data);
+        GGML_ASSERT(cpu->view_src == nullptr);
+        GGML_ASSERT(!ggml_is_transposed(cpu));
+        GGML_ASSERT(ggml_is_contiguous(cpu));
 
         GGML_ASSERT(cache->buffer == arena);
         GGML_ASSERT(cache->data);
+        GGML_ASSERT(cache->view_src == nullptr);
+        GGML_ASSERT(!ggml_is_transposed(cache));
+        GGML_ASSERT(ggml_is_contiguous(cache));
 
         GGML_ASSERT(cpu->type == cache->type);
-        GGML_ASSERT(cpu->ne[0] == cache->ne[0]);
-        GGML_ASSERT(cpu->ne[1] == cache->ne[1]);
+
+        const int n_dims = ggml_n_dims(cpu);
+
+        GGML_ASSERT(n_dims >= 1);
+        GGML_ASSERT(n_dims <= GGML_MAX_DIMS);
+        GGML_ASSERT(ggml_n_dims(cache) == n_dims);
+
+        const int expert_dim = n_dims - 1;
+
+        // All dimensions except the final expert dimension must match.
+        for (int d = 0; d < expert_dim; ++d)
+            GGML_ASSERT(cpu->ne[d] == cache->ne[d]);
 
         GGML_ASSERT(expert_id >= 0);
-        GGML_ASSERT(expert_id < cpu->ne[2]);
+        GGML_ASSERT(expert_id < cpu->ne[expert_dim]);
 
         GGML_ASSERT(cache_slot >= 0);
-        GGML_ASSERT(cache_slot < cache->ne[2]);
+        GGML_ASSERT(cache_slot < cache->ne[expert_dim]);
+        GGML_ASSERT(cache->ne[expert_dim] == moe_cache_n_slots);
 
-        GGML_ASSERT(cpu->nb[2] == cache->nb[2]);
+        GGML_ASSERT(cpu->nb[expert_dim] == cache->nb[expert_dim]);
 
-        const size_t expert_bytes = cpu->nb[2];
+        // One final-dimension stride contains one complete expert slice.
+        const size_t expert_bytes = cpu->nb[expert_dim];
 
         const void * src =
             (const char *) cpu->data +
-            (size_t) expert_id * cpu->nb[2];
+            (size_t) expert_id * cpu->nb[expert_dim];
 
         const size_t dst_offset =
-            (size_t) cache_slot * cache->nb[2];
+            (size_t) cache_slot * cache->nb[expert_dim];
 
         ggml_backend_tensor_set(
             cache,
@@ -554,6 +702,8 @@ int32_t llama_offloader_moe_residency_cb(
     if (!po) {
         return -1;
     }
+
+    //return -1; //use this to force 100% cpu rate
 
     return po->debug_cache_moe_expert(block_id, expert_id);
 }
@@ -910,13 +1060,14 @@ void patch_model_refs_for(llama_model * model, ggml_tensor * w_cpu, ggml_tensor 
         SET(L.ffn_gate_inp);      SET(L.ffn_gate_inp_s);
         //SET(L.ffn_gate_exps);     SET(L.ffn_down_exps);       //sparse layers are handled separately
         //SET(L.ffn_up_exps);       SET(L.ffn_gate_up_exps);
-        SET(L.ffn_gate_inp_b);    SET(L.ffn_gate_exps_b);
-        SET(L.ffn_down_exps_b);   SET(L.ffn_up_exps_b);
-        SET(L.ffn_gate_up_exps_b);
+        SET(L.ffn_gate_inp_b);
+        //SET(L.ffn_gate_exps_b);    SET(L.ffn_down_exps_b);
+        //SET(L.ffn_up_exps_b);      SET(L.ffn_gate_up_exps_b);
 
         // ff MoE per-expert scales (NVFP4 per-tensor scale2)
-        SET(L.ffn_gate_exps_s);     SET(L.ffn_down_exps_s);
-        SET(L.ffn_up_exps_s);
+        // Routed expert tensors are handled by the sparse cache.
+        //SET(L.ffn_gate_exps_s);     SET(L.ffn_down_exps_s);
+        //SET(L.ffn_up_exps_s);
 
         // ff MoE latent proj
         SET(L.ffn_latent_down);     SET(L.ffn_latent_up);
@@ -995,7 +1146,8 @@ void patch_model_refs_for(llama_model * model, ggml_tensor * w_cpu, ggml_tensor 
         SET(L.wq_in_s);   SET(L.wk_in_s);   SET(L.wv_in_s);   SET(L.wo_in_s);
         SET(L.wqkv_in_s); SET(L.wqkv_gate_in_s);
         SET(L.ffn_gate_in_s);       SET(L.ffn_up_in_s);        SET(L.ffn_down_in_s);
-        SET(L.ffn_gate_exps_in_s);  SET(L.ffn_down_exps_in_s); SET(L.ffn_up_exps_in_s);
+        // Routed expert tensors are handled by the sparse cache.
+        //SET(L.ffn_gate_exps_in_s);  SET(L.ffn_down_exps_in_s); SET(L.ffn_up_exps_in_s);
         SET(L.ffn_gate_shexp_in_s); SET(L.ffn_up_shexp_in_s);  SET(L.ffn_down_shexp_in_s);
         SET(L.ssm_in_in_s);    SET(L.ssm_out_in_s);
         SET(L.ssm_alpha_in_s); SET(L.ssm_beta_in_s);
@@ -2007,6 +2159,8 @@ static inline size_t common_prefix_len(const std::vector<ggml_tensor *> & a, con
 
 bool llama_offloader_graph_cb(ggml_backend_sched_t sched, struct ggml_cgraph * graph, void * ud)
 {
+    LLAMA_LOG_INFO("%s 1\n", __func__);
+
 #ifndef LLAMA_NAIVE_OFFLOADER
     struct parameter_offloader *po = static_cast<parameter_offloader *>(ud);
     if (!po || !sched || !graph)
@@ -2163,6 +2317,9 @@ bool llama_offloader_graph_cb(ggml_backend_sched_t sched, struct ggml_cgraph * g
     const bool schedule_changed = po->swap_next_schedule(); // true if retarget moved tensors for this graph
 
 #endif /* ifndef LLAMA_NAIVE_OFFLOADER */
+
+    LLAMA_LOG_INFO("%s 2\n", __func__);
+
     return true;
 }
 
