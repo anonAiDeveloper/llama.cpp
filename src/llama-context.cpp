@@ -2329,25 +2329,148 @@ void llama_context::output_reorder() {
 //
 
 uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
-    if (model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_KIMI_LINEAR || model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE) {
-        return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
-    }
-    uint32_t res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
-    for (const auto & lora : model.loras) {
-        res += lora->get_n_nodes();
+    uint64_t res = 0;
+
+    const bool use_large_graph_bound =
+        model.arch == LLM_ARCH_QWEN3NEXT ||
+        model.arch == LLM_ARCH_KIMI_LINEAR ||
+        model.arch == LLM_ARCH_QWEN35 ||
+        model.arch == LLM_ARCH_QWEN35MOE;// ||
+        //model.arch == LLM_ARCH_DEEPSEEK4 ||              //TODO: restore these when merging back with latest
+        //model.arch == LLM_ARCH_NANBEIGE ||
+        //model.arch == LLM_ARCH_MINIMAX_M3;
+
+    if (use_large_graph_bound) {
+        // Preserve the official large-graph sizing policy.
+        res = std::max<uint64_t>(
+            uint64_t(n_tokens) * 40,
+            uint64_t(model.n_tensors()) * 32);
+    } else {
+        // Preserve the official normal sizing policy.
+        res = std::max<uint64_t>(
+            1024,
+            uint64_t(model.n_tensors()) * 8);
+
+        for (const auto & lora : model.loras) {
+            res += lora->get_n_nodes();
+        }
     }
 
-    // Reserve bounded graph capacity for the K+1 alternative MoE block lanes added at each layer.
-    //TODO: 32 is intentionally conservative but bounded
     if (cparams.moe_expert_prefetch) {
-        const uint64_t extra_nodes = 32ull * model.hparams.n_layer() * (model.hparams.n_expert_used + 1);
+        uint64_t n_moe_blocks = 0;
 
-        GGML_ASSERT(extra_nodes <= UINT32_MAX - res);
+        // Only blocks with an expert cache build alternative CPU/GPU lanes.
+        // Every prefetched expert path requires a down projection, so the
+        // down-cache tensor is sufficient to identify such blocks.
+        for (const auto & layer : model.layers) {
+            if (layer.ffn_down_exps_cache != nullptr) {
+                n_moe_blocks++;
+            }
+        }
 
-        res += (uint32_t) extra_nodes;
+        if (n_moe_blocks > 0) {
+            const uint64_t n_slices = model.hparams.n_expert_used;
+            const uint64_t n_loras  = model.loras.size();
+
+            GGML_ASSERT(n_slices > 0);
+            GGML_ASSERT(n_slices <= LLAMA_MAX_EXPERTS);
+
+            /*
+             * Across all K + 1 lanes:
+             *
+             *   CPU branches process 1, 2, ..., K slices.
+             *   GPU branches process K, ..., 2, 1 slices.
+             *
+             * Therefore, the graph contains K CPU branch builds and
+             * K GPU branch builds.
+             */
+
+            /*
+             * Conservative upper bound for the fixed portion of one
+             * build_lane_branch() call:
+             *
+             *   input reshape
+             *   optional input weighting
+             *   gate projection
+             *   up projection
+             *   optional expert scales
+             *   optional expert biases
+             *   activation
+             *   down projection
+             *   optional down scale and bias
+             *   output weighting
+             *
+             * A LoRA can add four nodes for each of the gate, up, and
+             * down projections.
+             */
+            constexpr uint64_t fixed_nodes_per_branch = 25;
+            constexpr uint64_t lora_nodes_per_branch_per_adapter = 12;
+
+            const uint64_t nodes_per_branch =
+                fixed_nodes_per_branch +
+                lora_nodes_per_branch_per_adapter * n_loras;
+
+            // K CPU branch builds plus K GPU branch builds.
+            const uint64_t branch_nodes =
+                2 * n_slices * nodes_per_branch;
+
+            /*
+             * A branch processing M slices creates:
+             *
+             *   M expert output views
+             *   M - 1 additions
+             *
+             * For M == 1, it creates one view and one contiguous copy.
+             *
+             * Summed over M = 1 through K, this is K^2 + 1 nodes
+             * for one side. There are both CPU and GPU sides.
+             */
+            const uint64_t reduction_nodes =
+                2 * (n_slices * n_slices + 1);
+
+            /*
+             * Routing inputs:
+             *
+             *   CPU: 2 tensors for lanes 1 through K - 1
+             *        The all-CPU lane reuses the original IDs and weights.
+             *
+             *   GPU: 2 tensors for lanes 0 through K - 1
+             */
+            const uint64_t routing_input_nodes =
+                2 * (n_slices - 1) +
+                2 * n_slices;
+
+            // Lanes containing both CPU and GPU results require one add.
+            const uint64_t mixed_lane_merge_nodes =
+                n_slices - 1;
+
+            // One shared output tensor represents the selected lane result.
+            constexpr uint64_t common_output_nodes = 1;
+
+            const uint64_t nodes_per_moe_block =
+                branch_nodes +
+                reduction_nodes +
+                routing_input_nodes +
+                mixed_lane_merge_nodes +
+                common_output_nodes;
+
+            GGML_ASSERT(
+                nodes_per_moe_block <=
+                UINT64_MAX / n_moe_blocks);
+
+            const uint64_t extra_nodes =
+                n_moe_blocks * nodes_per_moe_block;
+
+            GGML_ASSERT(res <= UINT32_MAX);
+            GGML_ASSERT(extra_nodes <= UINT32_MAX - res);
+
+            res += extra_nodes;
+        }
     }
 
-    return res;
+    GGML_ASSERT(res <= UINT32_MAX);
+
+    return static_cast<uint32_t>(res);
 }
 
 llm_graph_result * llama_context::get_gf_res_reserve() const {
