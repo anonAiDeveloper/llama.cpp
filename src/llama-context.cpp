@@ -136,6 +136,10 @@ llama_context::llama_context(
 
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
+    cparams.cb_graph           = params.cb_graph;
+    cparams.cb_graph_user_data = params.cb_graph_user_data;
+    cparams.cb_moe_residency           = params.cb_moe_residency;
+    cparams.cb_moe_residency_user_data = params.cb_moe_residency_user_data;
 
     cparams.ctx_other = nullptr;
 
@@ -267,6 +271,8 @@ llama_context::llama_context(
 
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
+
+    cparams.moe_expert_prefetch = params.moe_expert_prefetch;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -1347,6 +1353,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        ggml_backend_sched_set_graph_callback(sched.get(), cparams.cb_graph, cparams.cb_graph_user_data);
+        ggml_backend_sched_set_moe_residency_callback(sched.get(), cparams.cb_moe_residency, cparams.cb_moe_residency_user_data);
 
         //const auto t_start_us = ggml_time_us();
 
@@ -2346,6 +2354,8 @@ void llama_context::output_reorder() {
 //
 
 uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
+    uint64_t res;
+
     if (model.arch == LLM_ARCH_QWEN3NEXT ||
         model.arch == LLM_ARCH_KIMI_LINEAR ||
         model.arch == LLM_ARCH_QWEN35 ||
@@ -2353,13 +2363,59 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         model.arch == LLM_ARCH_DEEPSEEK4 ||
         model.arch == LLM_ARCH_NANBEIGE ||
         model.arch == LLM_ARCH_MINIMAX_M3) {
-        return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
+        res = std::max<uint64_t>(uint64_t(n_tokens) * 40, uint64_t(model.n_tensors()) * 32);
+    } else {
+        res = std::max<uint64_t>(1024, uint64_t(model.n_tensors()) * 8);
+
+        for (const auto & lora : model.loras) {
+            res += lora->get_n_nodes();
+        }
     }
-    uint32_t res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
-    for (const auto & lora : model.loras) {
-        res += lora->get_n_nodes();
+
+    if (cparams.moe_expert_prefetch) {
+        uint64_t n_moe_blocks = 0;
+
+        for (const auto & layer : model.layers) {
+            if (layer.ffn_down_exps_cache != nullptr) {
+                n_moe_blocks++;
+            }
+        }
+
+        if (n_moe_blocks > 0) {
+            const uint64_t n_expert_used = model.hparams.n_expert_used;
+            const uint64_t n_loras       = model.loras.size();
+
+            GGML_ASSERT(n_expert_used > 0);
+            GGML_ASSERT(n_expert_used <= LLAMA_MAX_EXPERTS);
+
+            /*
+             * All K + 1 lanes are present in the graph. Across them there are
+             * K CPU branches, K GPU branches, their reductions and routing
+             * inputs, K - 1 mixed-lane merges, and one shared output.
+             */
+            const uint64_t branch_nodes           = 2 * n_expert_used * (25 + 12 * n_loras);
+            const uint64_t reduction_nodes        = 2 * (n_expert_used * n_expert_used + 1);
+            const uint64_t routing_input_nodes    = 2 * (n_expert_used - 1) + 2 * n_expert_used;
+            const uint64_t mixed_lane_merge_nodes = n_expert_used - 1;
+            const uint64_t common_output_nodes    = 1;
+
+            const uint64_t nodes_per_moe_block =
+                branch_nodes +
+                reduction_nodes +
+                routing_input_nodes +
+                mixed_lane_merge_nodes +
+                common_output_nodes;
+
+            GGML_ASSERT(res <= UINT32_MAX);
+            GGML_ASSERT(n_moe_blocks <= (UINT32_MAX - res) / nodes_per_moe_block);
+
+            res += n_moe_blocks * nodes_per_moe_block;
+        }
     }
-    return res;
+
+    GGML_ASSERT(res <= UINT32_MAX);
+
+    return static_cast<uint32_t>(res);
 }
 
 llm_graph_result * llama_context::get_gf_res_reserve() const {
@@ -3501,6 +3557,10 @@ llama_context_params llama_context_default_params() {
         /*.defrag_thold                =*/ -1.0f,
         /*.cb_eval                     =*/ nullptr,
         /*.cb_eval_user_data           =*/ nullptr,
+        /*.cb_graph                    =*/ nullptr,
+        /*.cb_graph_user_data          =*/ nullptr,
+        /*.cb_moe_residency            =*/ nullptr,
+        /*.cb_moe_residency_user_data  =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.abort_callback              =*/ nullptr,
@@ -3511,6 +3571,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.moe_expert_prefetch         =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,

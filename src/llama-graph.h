@@ -65,6 +65,20 @@ enum llm_ffn_gate_type {
     LLM_FFN_PAR, // ffn_gate is parallel to ffn_up
 };
 
+struct llm_moe_expert_tensors {
+    ggml_tensor * up        = nullptr;
+    ggml_tensor * up_b      = nullptr;
+    ggml_tensor * up_s      = nullptr;
+    ggml_tensor * gate      = nullptr;
+    ggml_tensor * gate_b    = nullptr;
+    ggml_tensor * gate_s    = nullptr;
+    ggml_tensor * down      = nullptr;
+    ggml_tensor * down_b    = nullptr;
+    ggml_tensor * down_s    = nullptr;
+    ggml_tensor * gate_up   = nullptr;
+    ggml_tensor * gate_up_b = nullptr;
+};
+
 enum llm_norm_type {
     LLM_NORM,
     LLM_NORM_RMS,
@@ -777,6 +791,7 @@ struct llm_graph_params {
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
+            cparams.moe_expert_prefetch     == other.cparams.moe_expert_prefetch     &&
             arch  == other.arch  &&
             gtype == other.gtype &&
             cvec  == other.cvec  &&
@@ -848,10 +863,10 @@ public:
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
 
-    ggml_context_ptr ctx_compute;
-
     // memory buffers used to evaluate the model
     std::vector<uint8_t> buf_compute_meta;
+
+    ggml_context_ptr ctx_compute;
 
     ggml_cgraph * gf;
 
@@ -941,6 +956,8 @@ struct llm_graph_context {
     virtual ~llm_graph_context() = default;
 
     void cb(ggml_tensor * cur, const char * name, int il) const;
+
+    bool use_moe_expert_prefetch(int il) const;
 
     //
     // common
@@ -1043,6 +1060,24 @@ struct llm_graph_context {
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr,
+             ggml_tensor * selected_experts_in = nullptr) const;
+
+    // build K + 1 CPU/GPU placement variants and attach their ranges and routing inputs to gf
+    ggml_tensor * build_and_register_moe_ffn_block_lanes(
+             ggml_tensor * cur,
+             ggml_tensor * gate_inp,
+             ggml_tensor * gate_inp_b,
+             const llm_moe_expert_tensors & cpu_experts,
+             const llm_moe_expert_tensors & gpu_experts,
+             ggml_tensor * exp_probs_b,
+                 int64_t   n_expert,
+                 int64_t   n_expert_used,
+         llm_ffn_op_type   type_op,
+                    bool   norm_w,
+                   float   w_scale,
+            llama_expert_gating_func_type gating_op,
+                     int   il,
+             ggml_tensor * probs_in = nullptr,
              ggml_tensor * selected_experts_in = nullptr) const;
 
     //

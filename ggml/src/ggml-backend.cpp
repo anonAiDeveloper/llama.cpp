@@ -21,6 +21,7 @@
 #include <string.h>
 #include <algorithm>
 #include <vector>
+#include <cmath>
 
 #ifdef __APPLE__
 #include <sys/types.h>
@@ -743,6 +744,10 @@ static struct ggml_tensor * ggml_dup_tensor_layout(struct ggml_context * ctx, co
     return dup;
 }
 
+struct ggml_tensor * ggml_dup_tensor_layout_public(struct ggml_context * ctx, const struct ggml_tensor * tensor) {
+    return ggml_dup_tensor_layout(ctx, tensor);
+}
+
 static bool ggml_is_view_op(enum ggml_op op) {
     return op == GGML_OP_VIEW || op == GGML_OP_RESHAPE || op == GGML_OP_PERMUTE || op == GGML_OP_TRANSPOSE;
 }
@@ -769,6 +774,46 @@ struct ggml_backend_sched_split {
     int n_inputs;
     // graph view of this split
     struct ggml_cgraph graph;
+};
+
+// A scheduled list of backend splits. Block-local lanes use the same split
+// representation as the main graph so execution can reuse the existing loop.
+struct ggml_backend_sched_split_sequence {
+    struct ggml_backend_sched_split * splits;
+    int n_splits;
+    int splits_capacity;
+};
+
+// One CPU/GPU placement variant for a dynamic MoE block.
+struct ggml_backend_sched_block_lane {
+    struct ggml_backend_sched_split_sequence sequence;
+
+    struct ggml_tensor * out;
+
+    struct ggml_tensor * cpu_ids;
+    struct ggml_tensor * cpu_weights;
+    struct ggml_tensor * cpu_slots;
+    struct ggml_tensor * gpu_ids;
+    struct ggml_tensor * gpu_weights;
+    struct ggml_tensor * gpu_slots;
+};
+
+// The K + 1 variants associated with one dynamic MoE block.
+struct ggml_backend_sched_block_lane_set {
+    int block_id;
+
+    // The selected lane replaces main splits in [main_split_begin, main_split_end).
+    // Equal values insert the lane between two main splits.
+    int main_split_begin;
+    int main_split_end;
+
+    struct ggml_tensor * ids;
+    struct ggml_tensor * weights;
+    struct ggml_tensor * out;
+    int n_expert_used;
+
+    struct ggml_backend_sched_block_lane * lanes;
+    int n_lanes;
 };
 
 struct ggml_backend_sched {
@@ -800,6 +845,10 @@ struct ggml_backend_sched {
     int n_splits;
     int splits_capacity;
 
+    // Alternate split sequences for dynamic MoE blocks.
+    struct ggml_backend_sched_block_lane_set * block_lane_sets;
+    int n_block_lane_sets;
+
     // pipeline parallelism support
     int n_copies;
     int cur_copy;
@@ -812,6 +861,12 @@ struct ggml_backend_sched {
 
     ggml_backend_sched_eval_callback callback_eval;
     void * callback_eval_user_data;
+
+    ggml_backend_sched_graph_callback callback_graph;
+    void * callback_graph_user_data;
+
+    ggml_backend_sched_moe_residency_callback callback_moe_residency;
+    void * callback_moe_residency_user_data;
 
     char * context_buffer;
     size_t context_buffer_size;
@@ -831,6 +886,20 @@ struct ggml_backend_sched {
 #define tensor_backend_id(tensor) sched->hv_tensor_backend_ids[hash_id(tensor)]
 #define tensor_id_copy(id, backend_id, copy_id) sched->hv_tensor_copies[(id) * sched->n_backends * sched->n_copies + (backend_id) * sched->n_copies + (copy_id)]
 #define tensor_copy(tensor, backend_id, copy_id) tensor_id_copy(hash_id(tensor), backend_id, copy_id)
+
+static void ggml_backend_sched_clear_block_lane_sets(ggml_backend_sched_t sched) {
+    for (int i = 0; i < sched->n_block_lane_sets; ++i) {
+        struct ggml_backend_sched_block_lane_set * lane_set = &sched->block_lane_sets[i];
+        for (int lane_id = 0; lane_id < lane_set->n_lanes; ++lane_id) {
+            free(lane_set->lanes[lane_id].sequence.splits);
+        }
+        free(lane_set->lanes);
+    }
+
+    free(sched->block_lane_sets);
+    sched->block_lane_sets = NULL;
+    sched->n_block_lane_sets = 0;
+}
 
 // returns the priority of the backend, lower id is higher priority
 static int ggml_backend_sched_backend_id(ggml_backend_sched_t sched, ggml_backend_t backend) {
@@ -1025,6 +1094,99 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     sched->n_splits = 0;
     sched->n_graph_inputs = 0;
     sched->is_reset = false;
+
+    ggml_backend_sched_clear_block_lane_sets(sched);
+
+    struct block_lane_range {
+        struct ggml_backend_sched_block_lane_set * lane_set;
+        struct ggml_backend_sched_block_lane * lane;
+        int i_start;
+        int i_end;
+    };
+
+    std::vector<block_lane_range> block_lane_ranges;
+    std::vector<int> node_sequence_ids(graph->n_nodes, 0);
+    std::vector<bool> split_boundaries(graph->n_nodes + 1, false);
+
+    GGML_ASSERT(graph->n_block_lane_sets >= 0);
+    GGML_ASSERT(graph->n_block_lane_sets == 0 || graph->block_lane_sets != NULL);
+
+    sched->n_block_lane_sets = graph->n_block_lane_sets;
+    if (sched->n_block_lane_sets > 0) {
+        sched->block_lane_sets = (ggml_backend_sched_block_lane_set *) calloc(
+            sched->n_block_lane_sets, sizeof(sched->block_lane_sets[0]));
+        GGML_ASSERT(sched->block_lane_sets != NULL);
+    }
+
+    int sequence_id = 1;
+    int previous_set_end = 0;
+
+    // Copy graph lane metadata into scheduler-owned sequences and assign each lane a unique sequence ID.
+    for (int lane_set_id = 0; lane_set_id < graph->n_block_lane_sets; lane_set_id++) {
+        const struct ggml_cgraph_block_lane_set * graph_lane_set = &graph->block_lane_sets[lane_set_id];
+        struct ggml_backend_sched_block_lane_set * lane_set = &sched->block_lane_sets[lane_set_id];
+
+        GGML_ASSERT(graph_lane_set->ids != NULL);
+        GGML_ASSERT(graph_lane_set->n_expert_used > 0);
+        GGML_ASSERT(graph_lane_set->n_lanes == graph_lane_set->n_expert_used + 1);
+        GGML_ASSERT(graph_lane_set->lanes != NULL);
+
+        lane_set->block_id = graph_lane_set->block_id;
+        lane_set->ids = graph_lane_set->ids;
+        lane_set->weights = graph_lane_set->weights;
+        lane_set->out = graph_lane_set->out;
+        lane_set->n_expert_used = graph_lane_set->n_expert_used;
+        lane_set->n_lanes = graph_lane_set->n_lanes;
+        lane_set->lanes = (ggml_backend_sched_block_lane *) calloc(lane_set->n_lanes, sizeof(lane_set->lanes[0]));
+        GGML_ASSERT(lane_set->lanes != NULL);
+        //TODO: These two asserts may need removal if your scheduler re-splits an already allocated graph.
+        GGML_ASSERT(lane_set->out != NULL);
+        GGML_ASSERT(lane_set->out->buffer == NULL);
+
+        int set_end = -1;
+
+        for (int lane_id = 0; lane_id < lane_set->n_lanes; lane_id++) {
+            const struct ggml_cgraph_block_lane * graph_lane = &graph_lane_set->lanes[lane_id];
+            struct ggml_backend_sched_block_lane * lane = &lane_set->lanes[lane_id];
+
+            const int lane_start = graph_lane->i_start;
+            const int lane_end = graph_lane->i_end;
+
+            GGML_ASSERT(lane_start >= 0);
+            GGML_ASSERT(lane_end > lane_start);
+            GGML_ASSERT(lane_end <= graph->n_nodes);
+
+            if (lane_id == 0) {
+                GGML_ASSERT(lane_start >= previous_set_end);
+            } else {
+                GGML_ASSERT(lane_start == set_end);
+            }
+            set_end = lane_end;
+
+            lane->out = graph_lane->out;
+            lane->cpu_ids = graph_lane->cpu_ids;
+            lane->cpu_weights = graph_lane->cpu_weights;
+            lane->cpu_slots = graph_lane->cpu_slots;
+            lane->gpu_ids = graph_lane->gpu_ids;
+            lane->gpu_weights = graph_lane->gpu_weights;
+            lane->gpu_slots = graph_lane->gpu_slots;
+
+            split_boundaries[lane_start] = true;
+            split_boundaries[lane_end] = true;
+
+            for (int i = lane_start; i < lane_end; i++) {
+                GGML_ASSERT(node_sequence_ids[i] == 0);
+                node_sequence_ids[i] = sequence_id;
+            }
+
+            block_lane_ranges.push_back({ lane_set, lane, lane_start, lane_end });
+            sequence_id++;
+        }
+
+        previous_set_end = set_end;
+    }
+
+    std::vector<std::vector<size_t>> sequence_copies(sequence_id);
 
     struct ggml_init_params params = {
         /* .mem_size =   */ sched->context_buffer_size,
@@ -1269,18 +1431,17 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         int cur_backend_id = split->backend_id;
         for (; i < graph->n_nodes; i++) {
             struct ggml_tensor * node = graph->nodes[i];
-
-            if (ggml_is_view_op(node->op)) {
-                continue;
-            }
-
             const int node_backend_id = tensor_backend_id(node);
 
             GGML_ASSERT(node_backend_id != -1); // all nodes should be assigned by now, this can happen if there is no CPU fallback
 
-            // check if we should start a new split based on the sources of the current node
-            bool need_new_split = false;
-            if (node_backend_id == cur_backend_id && split->n_inputs > 0) {
+            // Start a new split at each lane boundary so its splits can be selected independently.
+            bool need_new_split = split_boundaries[i] && i > split->i_start;
+
+            if (ggml_is_view_op(node->op) && !need_new_split)
+                continue;
+
+            if (!ggml_is_view_op(node->op) && node_backend_id == cur_backend_id && split->n_inputs > 0) {
                 for (int j = 0; j < GGML_MAX_SRC; j++) {
                     struct ggml_tensor * src = node->src[j];
                     if (src == NULL) {
@@ -1324,6 +1485,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 split->n_inputs = 0;
                 cur_backend_id = node_backend_id;
             }
+
+            if (ggml_is_view_op(node->op))
+                continue;
 
             // find inputs that are not on the same backend
             for (int j = 0; j < GGML_MAX_SRC; j++) {
@@ -1372,9 +1536,15 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                             tensor_id_copy(src_id, cur_backend_id, c) = tensor_copy;
                             SET_CAUSE(tensor_copy, "4.cpy");
                         }
+                    }
+
+                    std::vector<size_t> & copies = sequence_copies[node_sequence_ids[i]];
+                    const size_t copy_id = src_id * sched->n_backends + cur_backend_id;
+                    if (std::find(copies.begin(), copies.end(), copy_id) == copies.end()) {
                         int n_inputs = split->n_inputs++;
                         GGML_ASSERT(n_inputs < GGML_SCHED_MAX_SPLIT_INPUTS);
                         split->inputs[n_inputs] = src;
+                        copies.push_back(copy_id);
                     }
                     node->src[j] = tensor_id_copy(src_id, cur_backend_id, sched->cur_copy);
                 }
@@ -1399,7 +1569,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         sched->prev_leaf_backend_ids = tmp;
     }
 
-    int graph_size = std::max(graph->n_nodes, graph->n_leafs) + sched->n_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2*sched->n_copies;
+    //int graph_size = std::max(graph->n_nodes, graph->n_leafs) + sched->n_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2*sched->n_copies;
+    // Reserve one additional allocation-only dependency node for each mutually exclusive lane.
+    int graph_size = std::max(graph->n_nodes, graph->n_leafs) + sched->n_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2*sched->n_copies + (int) block_lane_ranges.size();
 
     // remember the actual graph_size for performing reallocation checks later [GGML_SCHED_DEBUG_REALLOC]
     sched->debug_prev_graph_size = sched->debug_graph_size;
@@ -1449,6 +1621,30 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             sched->node_backend_ids[graph_copy->n_nodes] = tensor_backend_id(graph->nodes[j]);
             graph_copy->nodes[graph_copy->n_nodes++] = graph->nodes[j];
         }
+
+        // End each lane output's allocator lifetime here so later mutually exclusive lanes can reuse its storage.
+        for (const block_lane_range & range : block_lane_ranges) {
+            if (range.i_end != split->i_end) {
+                continue;
+            }
+
+            GGML_ASSERT(range.lane != NULL);
+            GGML_ASSERT(range.lane->out != NULL);
+            assert(graph_copy->size > graph_copy->n_nodes);
+
+            struct ggml_tensor * lane_out_dep =
+                ggml_view_tensor(
+                    sched->ctx,
+                    range.lane->out);
+
+            lane_out_dep->src[0] = range.lane->out;
+
+            sched->node_backend_ids[graph_copy->n_nodes] =
+                tensor_backend_id(range.lane->out);
+
+            graph_copy->nodes[graph_copy->n_nodes++] =
+                lane_out_dep;
+        }
     }
 
     if (sched->n_copies > 1) {
@@ -1493,6 +1689,40 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     for (int i = 0; i < sched->n_splits; ++i) {
         sched->splits[i].graph.uid = ggml_graph_next_uid();
     }
+
+    // Extract each lane's contiguous splits into its runtime sequence and record the master split range to skip.
+    for (const block_lane_range & range : block_lane_ranges) {
+        int split_begin = -1;
+        int split_end = -1;
+
+        for (int i = 0; i < sched->n_splits; i++) {
+            if (sched->splits[i].i_start == range.i_start) {
+                split_begin = i;
+            }
+            if (sched->splits[i].i_end == range.i_end) {
+                split_end = i + 1;
+            }
+        }
+
+        GGML_ASSERT(split_begin >= 0);
+        GGML_ASSERT(split_end > split_begin);
+
+        const int n_splits = split_end - split_begin;
+        range.lane->sequence.splits = (ggml_backend_sched_split *) malloc(
+            n_splits * sizeof(range.lane->sequence.splits[0]));
+        GGML_ASSERT(range.lane->sequence.splits != NULL);
+        memcpy(range.lane->sequence.splits, &sched->splits[split_begin], n_splits * sizeof(range.lane->sequence.splits[0]));
+        range.lane->sequence.n_splits = n_splits;
+        range.lane->sequence.splits_capacity = n_splits;
+
+        if (range.lane == &range.lane_set->lanes[0]) {
+            range.lane_set->main_split_begin = split_begin;
+        }
+        range.lane_set->main_split_end = split_end;
+    }
+
+    if (sched->callback_graph)
+        sched->callback_graph(sched, graph, sched->callback_graph_user_data);
 }
 
 static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
@@ -1547,6 +1777,177 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+static void ggml_backend_sched_set_block_lane_input(
+        ggml_backend_sched_t sched,
+        struct ggml_tensor * tensor,
+        const void * data,
+        size_t size) {
+    if (tensor == NULL) {
+        return;
+    }
+
+    GGML_ASSERT(data != NULL);
+    GGML_ASSERT(size > 0);
+    GGML_ASSERT(ggml_nbytes(tensor) == size);
+
+    ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, tensor);
+
+    GGML_ASSERT(backend);
+
+    const int backend_id = ggml_backend_sched_backend_id(sched, backend);
+
+    if (sched->events[backend_id][sched->cur_copy] != NULL) {
+        ggml_backend_event_synchronize(
+            sched->events[backend_id][sched->cur_copy]);
+    } else {
+        ggml_backend_synchronize(backend);
+    }
+
+    ggml_backend_tensor_set(tensor, data, 0, size);
+}
+
+static int ggml_backend_sched_select_block_lane(
+        ggml_backend_sched_t sched,
+        struct ggml_backend_sched_block_lane_set * lane_set) {
+    GGML_ASSERT(lane_set->ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(lane_set->ids));
+    GGML_ASSERT(lane_set->n_expert_used > 0);
+
+    const int n_expert_used = lane_set->n_expert_used;
+    const int64_t n_ids = ggml_nelements(lane_set->ids);
+    GGML_ASSERT(n_ids % n_expert_used == 0);
+
+    const int64_t n_tokens = n_ids / n_expert_used;
+    std::vector<int32_t> source_ids(n_ids);
+    std::vector<float> source_weights;
+
+    ggml_backend_t ids_backend = ggml_backend_sched_get_tensor_backend(sched, lane_set->ids);
+    GGML_ASSERT(ids_backend);
+    ggml_backend_synchronize(ids_backend);
+    ggml_backend_tensor_get(lane_set->ids, source_ids.data(), 0, ggml_nbytes(lane_set->ids));
+
+    if (lane_set->weights != NULL) {
+        GGML_ASSERT(lane_set->weights->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_is_contiguous(lane_set->weights));
+        GGML_ASSERT(ggml_nelements(lane_set->weights) == n_ids);
+
+        ggml_backend_t weights_backend = ggml_backend_sched_get_tensor_backend(sched, lane_set->weights);
+        GGML_ASSERT(weights_backend);
+        if (weights_backend != ids_backend) {
+            ggml_backend_synchronize(weights_backend);
+        }
+
+        source_weights.resize(n_ids);
+        ggml_backend_tensor_get(lane_set->weights, source_weights.data(), 0, ggml_nbytes(lane_set->weights));
+
+        //TODO: remove this from production
+        for (int64_t i = 0; i < n_ids; ++i) {
+            GGML_ASSERT(std::isfinite(source_weights[i]));
+        }
+    }
+
+    std::vector<int32_t> cpu_ids;
+    std::vector<int32_t> cpu_slots;
+    std::vector<float> cpu_weights;
+    std::vector<int32_t> gpu_ids;
+    std::vector<int32_t> gpu_slots;
+    std::vector<float> gpu_weights;
+
+    int lane_id = n_expert_used;
+
+    if (n_tokens == 1 && sched->callback_moe_residency != NULL) {
+        for (int slot = 0; slot < n_expert_used; ++slot) {
+            const int32_t expert_id = source_ids[slot];
+
+            const int32_t gpu_cache_slot = sched->callback_moe_residency(lane_set->block_id, expert_id, sched->callback_moe_residency_user_data);
+
+            //GGML_ASSERT(gpu_cache_slot >= -1);
+
+            if (gpu_cache_slot >= 0) {
+                // Two selected experts cannot occupy the same cache slot during one lane execution.
+                GGML_ASSERT(std::find(gpu_ids.begin(), gpu_ids.end(), gpu_cache_slot) == gpu_ids.end());
+
+                // The GPU expert bank is indexed by cache slot rather than original model expert ID.
+                gpu_ids.push_back(gpu_cache_slot);
+                gpu_slots.push_back(slot);
+                if (!source_weights.empty()) {
+                    gpu_weights.push_back(source_weights[slot]);
+                }
+            } else {
+                // The CPU expert bank continues to use the original model expert ID.
+                cpu_ids.push_back(expert_id);
+                cpu_slots.push_back(slot);
+                if (!source_weights.empty()) {
+                    cpu_weights.push_back(source_weights[slot]);
+                }
+            }
+        }
+
+        lane_id = (int) cpu_ids.size();
+    } else {
+        cpu_ids = source_ids;
+        if (!source_weights.empty()) {
+            cpu_weights = source_weights;
+        }
+        cpu_slots.resize(n_ids);
+        for (int64_t i = 0; i < n_ids; ++i) {
+            cpu_slots[i] = i % n_expert_used;
+        }
+    }
+
+    //TODO: remove this from production
+    GGML_ASSERT(cpu_ids.size() + gpu_ids.size() == (size_t) n_ids);
+    if (!source_weights.empty()) {
+        GGML_ASSERT(cpu_weights.size() + gpu_weights.size() == (size_t) n_ids);
+    }
+
+    GGML_ASSERT(lane_id >= 0 && lane_id < lane_set->n_lanes);
+    struct ggml_backend_sched_block_lane * lane = &lane_set->lanes[lane_id];
+
+    if (!cpu_ids.empty()) {
+        GGML_ASSERT(lane->cpu_ids != NULL);
+    }
+    if (!gpu_ids.empty()) {
+        GGML_ASSERT(lane->gpu_ids != NULL);
+    }
+    if (!cpu_weights.empty()) {
+        GGML_ASSERT(lane->cpu_weights != NULL);
+    }
+    if (!gpu_weights.empty()) {
+        GGML_ASSERT(lane->gpu_weights != NULL);
+    }
+
+    if (lane->cpu_ids != NULL && lane->cpu_ids != lane_set->ids) {
+        GGML_ASSERT(lane->cpu_ids->type == GGML_TYPE_I32);
+        ggml_backend_sched_set_block_lane_input(sched, lane->cpu_ids, cpu_ids.data(), cpu_ids.size() * sizeof(cpu_ids[0]));
+    }
+    if (lane->cpu_weights != NULL && lane->cpu_weights != lane_set->weights) {
+        GGML_ASSERT(lane->cpu_weights->type == GGML_TYPE_F32);
+        ggml_backend_sched_set_block_lane_input(sched, lane->cpu_weights, cpu_weights.data(), cpu_weights.size() * sizeof(cpu_weights[0]));
+    }
+    if (lane->cpu_slots != NULL) {
+        GGML_ASSERT(lane->cpu_slots->type == GGML_TYPE_I32);
+        ggml_backend_sched_set_block_lane_input(sched, lane->cpu_slots, cpu_slots.data(), cpu_slots.size() * sizeof(cpu_slots[0]));
+    }
+    if (lane->gpu_ids != NULL && lane->gpu_ids != lane_set->ids) {
+        GGML_ASSERT(lane->gpu_ids->type == GGML_TYPE_I32);
+        ggml_backend_sched_set_block_lane_input(sched, lane->gpu_ids, gpu_ids.data(), gpu_ids.size() * sizeof(gpu_ids[0]));
+    }
+    if (lane->gpu_weights != NULL && lane->gpu_weights != lane_set->weights) {
+        GGML_ASSERT(lane->gpu_weights->type == GGML_TYPE_F32);
+        ggml_backend_sched_set_block_lane_input(sched, lane->gpu_weights, gpu_weights.data(), gpu_weights.size() * sizeof(gpu_weights[0]));
+    }
+    if (lane->gpu_slots != NULL) {
+        GGML_ASSERT(lane->gpu_slots->type == GGML_TYPE_I32);
+        ggml_backend_sched_set_block_lane_input(sched, lane->gpu_slots, gpu_slots.data(), gpu_slots.size() * sizeof(gpu_slots[0]));
+    }
+
+    //GGML_LOG_INFO("%s: block %d: tokens = %" PRId64 ", experts = %d, lane = %d, cpu = %zu, gpu = %zu\n",
+    //    __func__, lane_set->block_id, n_tokens, n_expert_used, lane_id, cpu_ids.size(), gpu_ids.size());
+
+    return lane_id;
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1555,8 +1956,65 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
 
-    for (int split_id = 0; split_id < sched->n_splits; split_id++) {
-        struct ggml_backend_sched_split * split = &splits[split_id];
+    int main_split_id = 0;
+    int lane_set_id = 0;
+
+    struct ggml_backend_sched_split * active_lane_splits = NULL;
+    int active_lane_split_id = 0;
+    int active_lane_n_splits = 0;
+
+    struct ggml_backend_sched_block_lane_set * active_lane_set = NULL;
+    struct ggml_backend_sched_block_lane * active_lane = NULL;
+
+    while (main_split_id < sched->n_splits ||
+           active_lane_split_id < active_lane_n_splits ||
+           lane_set_id < sched->n_block_lane_sets)
+    {
+        // If no lane is active, check whether the next normal split should be replaced by a block-local lane.
+        if (active_lane_split_id >= active_lane_n_splits) {
+            active_lane_splits = NULL;
+            active_lane_split_id = 0;
+            active_lane_n_splits = 0;
+
+            if (lane_set_id < sched->n_block_lane_sets) {
+                struct ggml_backend_sched_block_lane_set * lane_set = &sched->block_lane_sets[lane_set_id];
+
+                GGML_ASSERT(lane_set->main_split_begin >= main_split_id);
+                GGML_ASSERT(lane_set->main_split_end >= lane_set->main_split_begin);
+                GGML_ASSERT(lane_set->main_split_end <= sched->n_splits);
+
+                if (lane_set->main_split_begin == main_split_id) {
+                    GGML_ASSERT(lane_set->n_lanes == lane_set->n_expert_used + 1);
+
+                    const int lane_id = ggml_backend_sched_select_block_lane(sched, lane_set);
+                    struct ggml_backend_sched_block_lane * lane = &lane_set->lanes[lane_id];
+
+                    active_lane_set = lane_set;
+                    active_lane = lane;
+
+                    active_lane_splits = lane->sequence.splits;
+                    active_lane_n_splits = lane->sequence.n_splits;
+                    GGML_ASSERT(active_lane_n_splits > 0);
+
+                    main_split_id = lane_set->main_split_end;
+                    lane_set_id++;
+                    continue;
+                }
+            }
+        }
+
+        // Take the next split from the active lane, otherwise take it from the normal sequence.
+        const bool split_is_lane = active_lane_split_id < active_lane_n_splits;
+
+        struct ggml_backend_sched_split * split;
+
+        if (split_is_lane) {
+            split = &active_lane_splits[active_lane_split_id++];
+        } else {
+            GGML_ASSERT(main_split_id < sched->n_splits);
+            split = &splits[main_split_id++];
+        }
+
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
 
@@ -1728,6 +2186,34 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
             }
         }
+
+        // Copy the completed selected-lane result into the shared tensor consumed by the common continuation.
+        if (split_is_lane && active_lane_split_id == active_lane_n_splits)
+        {
+            GGML_ASSERT(active_lane_set != NULL);
+            GGML_ASSERT(active_lane != NULL);
+            GGML_ASSERT(active_lane->out != NULL);
+            GGML_ASSERT(active_lane_set->out != NULL);
+            GGML_ASSERT(ggml_are_same_layout(active_lane->out, active_lane_set->out));
+
+            ggml_backend_t lane_out_backend = ggml_backend_sched_get_tensor_backend(sched, active_lane->out);
+
+            ggml_backend_t common_out_backend = ggml_backend_sched_get_tensor_backend(sched, active_lane_set->out);
+
+            GGML_ASSERT(lane_out_backend != NULL);
+            GGML_ASSERT(common_out_backend != NULL);
+            GGML_ASSERT(active_lane->out->buffer != NULL);
+            GGML_ASSERT(active_lane_set->out->buffer != NULL);
+
+            ggml_backend_tensor_copy_async(
+                lane_out_backend,
+                common_out_backend,
+                active_lane->out,
+                active_lane_set->out);
+
+            active_lane_set = NULL;
+            active_lane = NULL;
+        }
     }
 
     return GGML_STATUS_SUCCESS;
@@ -1815,6 +2301,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     ggml_free(sched->ctx);
     ggml_hash_set_free(&sched->hash_set);
     free(sched->splits);
+    ggml_backend_sched_clear_block_lane_sets(sched);
     free(sched->hv_tensor_backend_ids);
     free(sched->hv_tensor_copies);
     free(sched->node_backend_ids);
@@ -1829,6 +2316,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
 
 void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
+    ggml_backend_sched_clear_block_lane_sets(sched);
     // reset state for the next run
     if (!sched->is_reset) {
         ggml_hash_set_reset(&sched->hash_set);
@@ -1927,6 +2415,21 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_eval = callback;
     sched->callback_eval_user_data = user_data;
+}
+
+void ggml_backend_sched_set_graph_callback(ggml_backend_sched_t sched, ggml_backend_sched_graph_callback callback, void * user_data) {
+    GGML_ASSERT(sched);
+    sched->callback_graph = callback;
+    sched->callback_graph_user_data = user_data;
+}
+
+void ggml_backend_sched_set_moe_residency_callback(
+        ggml_backend_sched_t sched,
+        ggml_backend_sched_moe_residency_callback callback,
+        void * user_data) {
+    GGML_ASSERT(sched);
+    sched->callback_moe_residency = callback;
+    sched->callback_moe_residency_user_data = user_data;
 }
 
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {

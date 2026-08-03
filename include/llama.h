@@ -375,6 +375,10 @@ extern "C" {
 
         ggml_backend_sched_eval_callback cb_eval;
         void * cb_eval_user_data;
+        ggml_backend_sched_graph_callback cb_graph;
+        void * cb_graph_user_data;
+        ggml_backend_sched_moe_residency_callback cb_moe_residency;
+        void * cb_moe_residency_user_data;
 
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
@@ -396,6 +400,8 @@ extern "C" {
         bool kv_unified;  // use a unified buffer across the input sequences when computing the attention
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
+
+        bool moe_expert_prefetch;  //speculative MoE expert-slice prefetching
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)

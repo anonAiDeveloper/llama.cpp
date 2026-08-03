@@ -1649,10 +1649,32 @@ struct ggml_context * ggml_init(struct ggml_init_params params) {
     return ctx;
 }
 
+static void ggml_graph_clear_block_lane_sets(struct ggml_cgraph * cgraph) {
+    for (int i = 0; i < cgraph->n_block_lane_sets; ++i) {
+        GGML_FREE(cgraph->block_lane_sets[i].lanes);
+    }
+
+    GGML_FREE(cgraph->block_lane_sets);
+    cgraph->block_lane_sets = NULL;
+    cgraph->n_block_lane_sets = 0;
+    cgraph->block_lane_sets_capacity = 0;
+}
+
+static void ggml_context_clear_graph_block_lane_sets(struct ggml_context * ctx) {
+    for (struct ggml_object * obj = ctx->objects_begin; obj != NULL; obj = obj->next) {
+        if (obj->type == GGML_OBJECT_TYPE_GRAPH) {
+            struct ggml_cgraph * cgraph = (struct ggml_cgraph *) ((char *) ctx->mem_buffer + obj->offs);
+            ggml_graph_clear_block_lane_sets(cgraph);
+        }
+    }
+}
+
 void ggml_reset(struct ggml_context * ctx) {
     if (ctx == NULL) {
         return;
     }
+
+    ggml_context_clear_graph_block_lane_sets(ctx);
 
     ctx->n_objects     = 0;
     ctx->objects_begin = NULL;
@@ -1663,6 +1685,8 @@ void ggml_free(struct ggml_context * ctx) {
     if (ctx == NULL) {
         return;
     }
+
+    ggml_context_clear_graph_block_lane_sets(ctx);
 
     if (ctx->mem_buffer_owned) {
         ggml_aligned_free(ctx->mem_buffer, ctx->mem_size);
@@ -7365,6 +7389,9 @@ struct ggml_cgraph * ggml_new_graph_custom(struct ggml_context * ctx, size_t siz
         /*.use_counts   =*/ use_counts_ptr,
         /*.hash_table   =*/ { hash_size, hash_used, hash_keys_ptr },
         /*.order        =*/ GGML_CGRAPH_EVAL_ORDER_LEFT_TO_RIGHT,
+        /*.block_lane_sets          =*/ NULL,
+        /*.n_block_lane_sets        =*/ 0,
+        /*.block_lane_sets_capacity =*/ 0,
         /*.uid          =*/ 0,
     };
 
@@ -7393,6 +7420,9 @@ struct ggml_cgraph ggml_graph_view(struct ggml_cgraph * cgraph0, int i0, int i1)
         /*.use_counts       =*/ cgraph0->use_counts,
         /*.visited_hash_set =*/ cgraph0->visited_hash_set,
         /*.order            =*/ cgraph0->order,
+        /*.block_lane_sets          =*/ NULL,
+        /*.n_block_lane_sets        =*/ 0,
+        /*.block_lane_sets_capacity =*/ 0,
         /*.uid              =*/ 0
     };
 
@@ -7407,6 +7437,22 @@ void ggml_graph_cpy(struct ggml_cgraph * src, struct ggml_cgraph * dst) {
     dst->n_leafs = src->n_leafs;
     dst->n_nodes = src->n_nodes;
     dst->order   = src->order;
+
+    ggml_graph_clear_block_lane_sets(dst);
+    if (src->n_block_lane_sets > 0) {
+        dst->block_lane_sets = GGML_MALLOC(src->n_block_lane_sets * sizeof(dst->block_lane_sets[0]));
+        dst->n_block_lane_sets = src->n_block_lane_sets;
+        dst->block_lane_sets_capacity = src->n_block_lane_sets;
+
+        for (int i = 0; i < src->n_block_lane_sets; ++i) {
+            const struct ggml_cgraph_block_lane_set * src_lane_set = &src->block_lane_sets[i];
+            struct ggml_cgraph_block_lane_set * dst_lane_set = &dst->block_lane_sets[i];
+
+            *dst_lane_set = *src_lane_set;
+            dst_lane_set->lanes = GGML_MALLOC(src_lane_set->n_lanes * sizeof(dst_lane_set->lanes[0]));
+            memcpy(dst_lane_set->lanes, src_lane_set->lanes, src_lane_set->n_lanes * sizeof(dst_lane_set->lanes[0]));
+        }
+    }
 
     for (int i = 0; i < src->n_leafs; ++i) {
         dst->leafs[i] = src->leafs[i];
@@ -7502,6 +7548,7 @@ void ggml_graph_reset(struct ggml_cgraph * cgraph) {
 }
 
 void ggml_graph_clear(struct ggml_cgraph * cgraph) {
+    ggml_graph_clear_block_lane_sets(cgraph);
     cgraph->n_leafs = 0;
     cgraph->n_nodes = 0;
     ggml_hash_set_reset(&cgraph->visited_hash_set);
@@ -7845,6 +7892,138 @@ void ggml_graph_dump_dot(const struct ggml_cgraph * gb, const struct ggml_cgraph
     fclose(fp);
 
     GGML_LOG_INFO("%s: dot -Tpng %s -o %s.png && open %s.png\n", __func__, filename, filename, filename);
+}
+
+int ggml_graph_add_block_lane_set(
+        struct ggml_cgraph * cgraph,
+        int block_id,
+        struct ggml_tensor * ids,
+        struct ggml_tensor * weights,
+        int n_expert_used,
+        int n_lanes) {
+    GGML_ASSERT(cgraph != NULL);
+    GGML_ASSERT(ids != NULL);
+    GGML_ASSERT(n_expert_used > 0);
+    GGML_ASSERT(n_lanes == n_expert_used + 1);
+
+    if (cgraph->n_block_lane_sets == cgraph->block_lane_sets_capacity) {
+        const int capacity = cgraph->block_lane_sets_capacity > 0
+            ? 2 * cgraph->block_lane_sets_capacity
+            : 4;
+
+        struct ggml_cgraph_block_lane_set * block_lane_sets =
+            GGML_MALLOC(capacity * sizeof(block_lane_sets[0]));
+
+        GGML_ASSERT(block_lane_sets != NULL);
+
+        if (cgraph->n_block_lane_sets > 0) {
+            memcpy(
+                block_lane_sets,
+                cgraph->block_lane_sets,
+                cgraph->n_block_lane_sets * sizeof(block_lane_sets[0]));
+        }
+
+        GGML_FREE(cgraph->block_lane_sets);
+
+        cgraph->block_lane_sets = block_lane_sets;
+        cgraph->block_lane_sets_capacity = capacity;
+    }
+
+    const int lane_set_id = cgraph->n_block_lane_sets++;
+
+    struct ggml_cgraph_block_lane_set * lane_set =
+        &cgraph->block_lane_sets[lane_set_id];
+
+    memset(lane_set, 0, sizeof(*lane_set));
+
+    lane_set->block_id = block_id;
+    lane_set->ids = ids;
+    lane_set->weights = weights;
+    lane_set->n_expert_used = n_expert_used;
+    lane_set->n_lanes = n_lanes;
+
+    lane_set->lanes = GGML_MALLOC(
+        n_lanes * sizeof(lane_set->lanes[0]));
+
+    GGML_ASSERT(lane_set->lanes != NULL);
+
+    memset(
+        lane_set->lanes,
+        0,
+        n_lanes * sizeof(lane_set->lanes[0]));
+
+    return lane_set_id;
+}
+
+void ggml_graph_set_block_lane(
+        struct ggml_cgraph * cgraph,
+        int lane_set_id,
+        int lane_id,
+        int i_start,
+        int i_end,
+        struct ggml_tensor * cpu_ids,
+        struct ggml_tensor * cpu_weights,
+        struct ggml_tensor * cpu_slots,
+        struct ggml_tensor * gpu_ids,
+        struct ggml_tensor * gpu_weights,
+        struct ggml_tensor * gpu_slots) {
+    GGML_ASSERT(cgraph != NULL);
+    GGML_ASSERT(lane_set_id >= 0);
+    GGML_ASSERT(lane_set_id < cgraph->n_block_lane_sets);
+
+    struct ggml_cgraph_block_lane_set * lane_set =
+        &cgraph->block_lane_sets[lane_set_id];
+
+    GGML_ASSERT(lane_id >= 0);
+    GGML_ASSERT(lane_id < lane_set->n_lanes);
+    GGML_ASSERT(i_start >= 0);
+    GGML_ASSERT(i_end >= i_start);
+    GGML_ASSERT(i_end <= cgraph->n_nodes);
+
+    struct ggml_cgraph_block_lane * lane =
+        &lane_set->lanes[lane_id];
+
+    lane->i_start = i_start;
+    lane->i_end = i_end;
+
+    lane->cpu_ids = cpu_ids;
+    lane->cpu_weights = cpu_weights;
+    lane->cpu_slots = cpu_slots;
+
+    lane->gpu_ids = gpu_ids;
+    lane->gpu_weights = gpu_weights;
+    lane->gpu_slots = gpu_slots;
+}
+
+void ggml_graph_set_block_lane_set_output(
+        struct ggml_cgraph * cgraph,
+        int lane_set_id,
+        struct ggml_tensor * output) {
+    GGML_ASSERT(cgraph != NULL);
+    GGML_ASSERT(lane_set_id >= 0);
+    GGML_ASSERT(lane_set_id < cgraph->n_block_lane_sets);
+    GGML_ASSERT(output != NULL);
+
+    cgraph->block_lane_sets[lane_set_id].out = output;
+}
+
+void ggml_graph_set_block_lane_output(
+        struct ggml_cgraph * cgraph,
+        int lane_set_id,
+        int lane_id,
+        struct ggml_tensor * output) {
+    GGML_ASSERT(cgraph != NULL);
+    GGML_ASSERT(lane_set_id >= 0);
+    GGML_ASSERT(lane_set_id < cgraph->n_block_lane_sets);
+    GGML_ASSERT(output != NULL);
+
+    struct ggml_cgraph_block_lane_set * lane_set =
+        &cgraph->block_lane_sets[lane_set_id];
+
+    GGML_ASSERT(lane_id >= 0);
+    GGML_ASSERT(lane_id < lane_set->n_lanes);
+
+    lane_set->lanes[lane_id].out = output;
 }
 
 ////////////////////////////////////////////////////////////////////////////////

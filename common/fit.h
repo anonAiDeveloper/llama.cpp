@@ -20,6 +20,7 @@ common_params_fit_status common_fit_params(
                          const char * path_model,
                  llama_model_params * mparams,
                llama_context_params * cparams,
+              ggml_backend_buffer_t   param_offloader_arena, // used by moe expert prefetch
                               float * tensor_split,          // writable buffer for tensor split, needs at least llama_max_devices elements
    llama_model_tensor_buft_override * tensor_buft_overrides, // writable buffer for overrides, needs at least llama_max_tensor_buft_overrides elements
                              size_t * margins,               // margins of memory to leave per device in bytes

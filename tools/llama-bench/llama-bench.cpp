@@ -2288,6 +2288,7 @@ int llama_bench(int argc, char ** argv) {
             cparams.n_ctx = std::max(cparams.n_ctx, n_ctx_needed);
 
             common_fit_params(inst.model.c_str(), &mparams, &cparams,
+                nullptr,
                 fit_tensor_split.data(),
                 fit_overrides.data(),
                 margins.data(),

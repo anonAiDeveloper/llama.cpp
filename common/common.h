@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include "ggml-backend.h"
 #include "llama-cpp.h"
 
 #include "ggml-opt.h"
@@ -487,6 +488,10 @@ struct common_params {
 
     ggml_backend_sched_eval_callback cb_eval = nullptr;
     void * cb_eval_user_data                 = nullptr;
+    ggml_backend_sched_graph_callback cb_graph = nullptr;
+    void * cb_graph_user_data                  = nullptr;
+    ggml_backend_sched_moe_residency_callback cb_moe_residency = nullptr;
+    void * cb_moe_residency_user_data                          = nullptr;
 
     ggml_numa_strategy numa = GGML_NUMA_STRATEGY_DISABLED;
 
@@ -579,6 +584,8 @@ struct common_params {
     bool no_op_offload     = false; // globally disable offload host tensor operations to device
     bool no_extra_bufts    = false; // disable extra buffer types (used for weight repacking)
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
+
+    bool moe_expert_prefetch = false; // enable speculative MoE expert-slice prefetching
 
     bool single_turn       = false; // single turn chat conversation
 
@@ -910,6 +917,8 @@ struct common_init_result {
     void reset_samplers();
 
     std::vector<llama_adapter_lora_ptr> & lora();
+
+    void init_parameter_offloader(common_params & params);
 
 private:
     struct impl;

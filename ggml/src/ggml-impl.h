@@ -326,6 +326,34 @@ enum ggml_cgraph_eval_order {
     GGML_CGRAPH_EVAL_ORDER_COUNT
 };
 
+struct ggml_cgraph_block_lane {
+    int i_start;
+    int i_end;
+
+    struct ggml_tensor * out;
+
+    struct ggml_tensor * cpu_ids;
+    struct ggml_tensor * cpu_weights;
+    struct ggml_tensor * cpu_slots;
+
+    struct ggml_tensor * gpu_ids;
+    struct ggml_tensor * gpu_weights;
+    struct ggml_tensor * gpu_slots;
+};
+
+struct ggml_cgraph_block_lane_set {
+    int block_id;
+
+    struct ggml_tensor * ids;
+    struct ggml_tensor * weights;
+    struct ggml_tensor * out;
+
+    int n_expert_used;
+
+    struct ggml_cgraph_block_lane * lanes;
+    int n_lanes;
+};
+
 struct ggml_cgraph {
     int size;    // maximum number of nodes/leafs/grads/grad_accs
     int n_nodes; // number of nodes currently in use
@@ -340,6 +368,10 @@ struct ggml_cgraph {
     struct ggml_hash_set visited_hash_set;
 
     enum ggml_cgraph_eval_order order;
+
+    struct ggml_cgraph_block_lane_set * block_lane_sets;
+    int n_block_lane_sets;
+    int block_lane_sets_capacity;
 
     // an optional identifier that can be utilized to recognize same graphs if two non-zero values match
     // a value of 0 means it is not set and should be ignored

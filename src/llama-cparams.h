@@ -53,6 +53,8 @@ struct llama_cparams {
     bool kv_unified;
     bool pipeline_parallel;
 
+    bool moe_expert_prefetch;       //TODO: make these configurable on a per-block basis
+
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 
     enum llama_context_type ctx_type;
@@ -60,6 +62,12 @@ struct llama_cparams {
 
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;
+
+    ggml_backend_sched_graph_callback cb_graph;
+    void * cb_graph_user_data;
+
+    ggml_backend_sched_moe_residency_callback cb_moe_residency;
+    void * cb_moe_residency_user_data;
 
     llama_context * ctx_other;
 };
