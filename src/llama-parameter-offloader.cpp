@@ -319,7 +319,38 @@ void parameter_offloader::seed_all_weights_from_model()
             //ends(kv.first, ".ffn_up_exps.input_scale")   || // Routed expert up input scales; handled by the MoE cache
             kv.first == "output.weight";                    // LM head / output projection
 
-        const bool supported = supported_deepseek2 || supported_gpt_oss;
+        // DeepSeek V4 weights
+        const bool supported_deepseek4 =
+            ends(kv.first, ".hc_attn_fn.weight")              ||   // Hyperconnection projection before attention
+            // Reused later in the same graph; current schedule tracks first use only.
+            //ends(kv.first, ".hc_attn_base.weight")           ||
+            //ends(kv.first, ".hc_attn_scale.weight")          ||
+            ends(kv.first, ".attn_q_a.weight")                ||   // First low-rank Q projection
+            ends(kv.first, ".attn_q_b.weight")                ||   // Second low-rank Q projection
+            ends(kv.first, ".attn_kv.weight")                 ||   // Shared attention KV projection
+            ends(kv.first, ".attn_compressor_kv.weight")      ||   // Conditional compressed-attention KV projection
+            ends(kv.first, ".attn_compressor_gate.weight")    ||   // Conditional compressed-attention score projection
+            ends(kv.first, ".indexer_compressor_kv.weight")   ||   // Conditional indexer-state KV projection
+            ends(kv.first, ".indexer_compressor_gate.weight") ||   // Conditional indexer-state score projection
+            ends(kv.first, ".indexer.attn_q_b.weight")        ||   // Conditional LID query projection
+            ends(kv.first, ".indexer.proj.weight")            ||   // Conditional LID weight projection
+            ends(kv.first, ".attn_output_a.weight")           ||   // Grouped attention output projection A
+            ends(kv.first, ".attn_output_b.weight")           ||   // Grouped attention output projection B
+            ends(kv.first, ".hc_ffn_fn.weight")               ||   // Hyperconnection projection before FFN
+            // Reused later in the same graph; current schedule tracks first use only.
+            //ends(kv.first, ".hc_ffn_base.weight")            ||
+            //ends(kv.first, ".hc_ffn_scale.weight")           ||
+            ends(kv.first, ".ffn_gate_inp.weight")            ||   // Dense MoE router projection
+            //ends(kv.first, ".ffn_gate_exps.weight")          || // Routed expert banks are handled by the MoE cache
+            //ends(kv.first, ".ffn_down_exps.weight")          ||
+            //ends(kv.first, ".ffn_up_exps.weight")            ||
+            ends(kv.first, ".ffn_gate_shexp.weight")          ||   // Shared expert gate projection
+            ends(kv.first, ".ffn_up_shexp.weight")            ||   // Shared expert up projection
+            ends(kv.first, ".ffn_down_shexp.weight")          ||   // Shared expert down projection
+            kv.first == "output_hc_fn.weight"                 ||   // Final hyperconnection projection
+            kv.first == "output.weight";                           // LM head / output projection
+
+        const bool supported = supported_deepseek2 || supported_gpt_oss || supported_deepseek4;
 
         if (!supported)
         {
@@ -990,6 +1021,7 @@ void patch_model_refs_for(llama_model * model, ggml_tensor * w_cpu, ggml_tensor 
 
     SET(model->output_s);
     SET(model->output_in_s);
+    SET(model->hc_head_fn);
 
     SET(model->nextn_proj_pre);
     SET(model->nextn_proj_post);
@@ -1035,8 +1067,8 @@ void patch_model_refs_for(llama_model * model, ggml_tensor * w_cpu, ggml_tensor 
         // attention
         SET(L.wq);        SET(L.wk);        SET(L.wv);        SET(L.wo);
         SET(L.wqkv);      SET(L.wq_a);      SET(L.wq_b);      SET(L.wkv_a_mqa);
-        SET(L.wkv_b);     SET(L.wk_b);      SET(L.wv_b);
-        SET(L.wqkv_b);    SET(L.wo_b);
+        SET(L.wkv);       SET(L.wkv_b);     SET(L.wk_b);      SET(L.wv_b);
+        SET(L.wqkv_b);    SET(L.wo_a);      SET(L.wo_b);
         SET(L.wq_cross);  SET(L.wk_cross);  SET(L.wv_cross);  SET(L.wo_cross);
         SET(L.wq_enc);    SET(L.wk_enc);    SET(L.wv_enc);    SET(L.wo_enc);
         SET(L.wqkv_gate);
@@ -1180,6 +1212,11 @@ void patch_model_refs_for(llama_model * model, ggml_tensor * w_cpu, ggml_tensor 
         // DSA
         SET(L.indexer_k_norm); SET(L.indexer_k_norm_b); SET(L.indexer_proj);
         SET(L.indexer_attn_k); SET(L.indexer_attn_q_b);
+
+        // DeepSeek V4
+        SET(L.hc_attn_fn);       SET(L.hc_ffn_fn);
+        SET(L.attn_comp_wkv);    SET(L.attn_comp_wgate);
+        SET(L.indexer_comp_wkv); SET(L.indexer_comp_wgate);
 
         // gemma4 layer output scale, reused for talkie embedding skip scale
         SET(L.out_scale);
@@ -1543,37 +1580,51 @@ void parameter_offloader::retarget_schedule_tensors(offloader_schedule & schedul
     }
 }
 
+//operations that the graph callback needs to check further
+static bool offloader_node_may_read_dense_weight(const ggml_tensor * node)
+{
+    if (!node)
+        return false;
+
+    switch (node->op) {
+        case GGML_OP_GET_ROWS:
+        case GGML_OP_MUL:
+        case GGML_OP_MUL_MAT:
+        //case GGML_OP_MUL_MAT_ID:      //we exclude this because MoE layers have their own prefetch mechanism
+        case GGML_OP_ROPE:
+        case GGML_OP_ADD:
+        case GGML_OP_SCALE:
+        case GGML_OP_DIV:
+        case GGML_OP_SSM_CONV:
+        case GGML_OP_SSM_SCAN:
+        case GGML_OP_RWKV_WKV6:
+        case GGML_OP_IM2COL:
+            return true;
+        default:
+            return false;
+    }
+}
+
 // Return true if node 't' reads any tracked GPU twin; optionally output the
-// feed-order index you should advance to (choose the furthest-ahead in ring).
+// furthest tracked weight used by the node in the active schedule.
 bool parameter_offloader::node_reads_tracked_weight(ggml_tensor * t, int * out_idx = nullptr)
 {
+    if (!offloader_node_may_read_dense_weight(t))
+        return false;
+
     int best_idx = -1;
     const int N  = (int)schedule_current.gpu_tensors_in_order.size();
 
-    // quick filter by op to reduce callback overhead
-    //switch (t->op) {
-    //    case GGML_OP_MUL_MAT:
-    //    case GGML_OP_ADD:      // only if you mirrored bias tensors
-    //        break;
-    //    default:
-    //        return false;
-    //}
-    //TODO: should we re-add something here? What was the old code?
-
-    // scan node sources
     for (int k = 0; k < GGML_MAX_SRC; ++k)
     {
-        ggml_tensor * s = t->src[k];
-        if (!s)
+        ggml_tensor * source = t->src[k];
+        if (!source)
             break;
 
-        while (s->view_src)
-            s = s->view_src;
+        while (source->view_src)
+            source = source->view_src;
 
-        //if (ggml_n_dims(s) < 2)
-        //    continue; // skip vectors/scalars that are not matmul-style weights
-
-        auto it = schedule_current.gpu2index.find(s);
+        auto it = schedule_current.gpu2index.find(source);
         if (it == schedule_current.gpu2index.end())
             continue;
 
@@ -1601,9 +1652,13 @@ bool parameter_offloader::node_reads_tracked_weight(ggml_tensor * t, int * out_i
             best_idx = idx;
     }
 
-    if (best_idx >= 0 && out_idx)
+    if (best_idx < 0)
+        return false;
+
+    if (out_idx)
         *out_idx = best_idx;
-    return best_idx >= 0;
+
+    return true;
 }
 
 // Ask-phase: only opt in for nodes that read any tracked weight.
@@ -2175,6 +2230,36 @@ bool llama_offloader_graph_cb(ggml_backend_sched_t sched, struct ggml_cgraph * g
     po->schedule_next = parameter_offloader::offloader_schedule{};
     po->collect_seen.clear();
 
+    auto collect_node_weights = [&](ggml_tensor * node) {
+        if (!offloader_node_may_read_dense_weight(node))
+            return;
+
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            ggml_tensor * w_gpu = node->src[k];
+
+            if (!w_gpu)
+                break;
+
+            while (w_gpu->view_src)
+                w_gpu = w_gpu->view_src;
+
+            if (po->gpu_weight_set.find(w_gpu) == po->gpu_weight_set.end())
+                continue;
+
+            if (!po->collect_seen.insert(w_gpu).second) {
+                const char * duplicate_name = ggml_get_name(w_gpu);
+                //throw std::runtime_error(std::string("duplicate weight in graph schedule: ") + (duplicate_name ? duplicate_name : "(unnamed)"));
+            }
+
+            const int idx = (int) po->schedule_next.gpu_tensors_in_order.size();
+            ggml_tensor * w_cpu = po->gpu2cpu.at(w_gpu);
+
+            po->schedule_next.gpu_tensors_in_order.push_back(w_gpu);
+            po->schedule_next.cpu_tensors_in_order.push_back(w_cpu);
+            po->schedule_next.gpu2index.emplace(w_gpu, idx);
+        }
+    };
+
 #if PO_GRAPH_FILTER_BY_BACKEND > 0
     // Optional precise mode: collect only tracked weight reads from scheduler splits
     // assigned to the arena's backend buffer type.
@@ -2195,57 +2280,7 @@ bool llama_offloader_graph_cb(ggml_backend_sched_t sched, struct ggml_cgraph * g
 
         // Walk the original graph nodes covered by this split
         for (int j = sp.i_start; j < sp.i_end; ++j)
-        {
-            ggml_tensor * node = graph->nodes[j];
-            if (!node)
-                continue;
-
-            // Skip pure view ops; they don't introduce new weight reads
-            if (node->view_src)
-                continue;
-
-            //switch (node->op)
-            //{
-            //    case GGML_OP_MUL_MAT:
-            //    case GGML_OP_ADD:
-            //        break;
-            //    default:
-            //        continue;
-            //}
-
-            // Collect unique first-use weights from the node's sources
-            for (int k = 0; k < GGML_MAX_SRC; ++k)
-            {
-                ggml_tensor * s = node->src[k];
-                if (!s)
-                    break;
-
-                // Peel views so we hit the real weight tensor
-                while (s->view_src)
-                    s = s->view_src; // peel views
-                
-                //if (ggml_n_dims(s) < 2)
-                //    continue; // skip vectors/scalars that are not matmul-style weights
-
-                if (po->gpu_weight_set.find(s) == po->gpu_weight_set.end())
-                    continue; // must be a model weight
-
-                if (!po->collect_seen.insert(s).second)
-                {
-                    const char * duplicate_name = ggml_get_name(s);
-                    throw std::runtime_error(std::string("duplicate weight in graph schedule: ") +
-                                            (duplicate_name ? duplicate_name : "(unnamed)"));
-                }
-
-                const int idx = (int)po->schedule_next.gpu_tensors_in_order.size(); // candidate schedule index
-                ggml_tensor * w_gpu = s;                                            // GPU twin referenced by graph
-                ggml_tensor * w_cpu = po->gpu2cpu.at(w_gpu);                         // CPU source for this GPU twin
-
-                po->schedule_next.gpu_tensors_in_order.push_back(w_gpu);
-                po->schedule_next.cpu_tensors_in_order.push_back(w_cpu);
-                po->schedule_next.gpu2index.emplace(w_gpu, idx);
-            }
-        }
+            collect_node_weights(graph->nodes[j]);
     }
 
     // If nothing matched (e.g., you compiled out impl access), fall back to walking the full graph:
@@ -2254,53 +2289,7 @@ bool llama_offloader_graph_cb(ggml_backend_sched_t sched, struct ggml_cgraph * g
     {
         // Simple, robust fallback: walk the whole graph in topo order
         for (int i = 0; i < graph->n_nodes; ++i)
-        {
-            ggml_tensor * node = graph->nodes[i];
-            if (!node)
-                continue;
-            
-            if (node->view_src)
-                continue;
-
-            //switch (node->op)
-            //{
-            //    case GGML_OP_MUL_MAT:
-            //    case GGML_OP_ADD:
-            //        break;
-            //    default:
-            //        continue;
-            //}
-
-            for (int k = 0; k < GGML_MAX_SRC; ++k)
-            {
-                ggml_tensor * s = node->src[k];
-                if (!s)
-                    break;
-                while (s->view_src)
-                    s = s->view_src; // peel views
-
-                //if (ggml_n_dims(s) < 2)
-                //    continue; // skip vectors/scalars that are not matmul-style weights
-
-                if (po->gpu_weight_set.find(s) == po->gpu_weight_set.end())
-                    continue; // must be a model weight
-
-                if (!po->collect_seen.insert(s).second)
-                {
-                    const char * duplicate_name = ggml_get_name(s);
-                    //TODO: Should we be supporting duplicate weights in the graph schedule?
-                    throw std::runtime_error(std::string("duplicate weight in graph schedule: ") + (duplicate_name ? duplicate_name : "(unnamed)"));
-                }
-
-                const int idx = (int)po->schedule_next.gpu_tensors_in_order.size(); // candidate schedule index
-                ggml_tensor * w_gpu = s;                                            // GPU twin referenced by graph
-                ggml_tensor * w_cpu = po->gpu2cpu.at(w_gpu);                         // CPU source for this GPU twin
-
-                po->schedule_next.gpu_tensors_in_order.push_back(w_gpu);
-                po->schedule_next.cpu_tensors_in_order.push_back(w_cpu);
-                po->schedule_next.gpu2index.emplace(w_gpu, idx);
-            }
-        }
+            collect_node_weights(graph->nodes[i]);
     }
 
     // Candidate schedule has been collected; compare it once against the active schedule.

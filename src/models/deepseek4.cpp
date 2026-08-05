@@ -1148,23 +1148,68 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
             exp_probs_b = nullptr;
         }
 
-        ggml_tensor * moe_out = build_moe_ffn(cur,
-                layer.ffn_gate_inp,
-                layer.ffn_up_exps,
-                layer.ffn_gate_exps,
-                layer.ffn_down_exps,
-                exp_probs_b,
-                n_expert, hparams.n_expert_used,
-                LLM_FFN_SILU, hparams.expert_weights_norm,
-                hparams.expert_weights_scale,
-                (llama_expert_gating_func_type) hparams.expert_gating_func,
-                il,
-                nullptr,
-                nullptr,
-                nullptr,
-                nullptr,
-                nullptr,
-                selected_experts);
+        ggml_tensor * moe_out;
+        if (use_moe_expert_prefetch(il)) {
+            const llm_moe_expert_tensors cpu_experts = {
+                /* .up        = */ layer.ffn_up_exps,
+                /* .up_b      = */ nullptr,
+                /* .up_s      = */ nullptr,
+                /* .gate      = */ layer.ffn_gate_exps,
+                /* .gate_b    = */ nullptr,
+                /* .gate_s    = */ nullptr,
+                /* .down      = */ layer.ffn_down_exps,
+                /* .down_b    = */ nullptr,
+                /* .down_s    = */ nullptr,
+                /* .gate_up   = */ nullptr,
+                /* .gate_up_b = */ nullptr,
+            };
+
+            const llm_moe_expert_tensors gpu_experts = {
+                /* .up        = */ layer.ffn_up_exps_cache,
+                /* .up_b      = */ nullptr,
+                /* .up_s      = */ nullptr,
+                /* .gate      = */ layer.ffn_gate_exps_cache,
+                /* .gate_b    = */ nullptr,
+                /* .gate_s    = */ nullptr,
+                /* .down      = */ layer.ffn_down_exps_cache,
+                /* .down_b    = */ nullptr,
+                /* .down_s    = */ nullptr,
+                /* .gate_up   = */ nullptr,
+                /* .gate_up_b = */ nullptr,
+            };
+
+            moe_out = build_and_register_moe_ffn_block_lanes(cur,
+                    layer.ffn_gate_inp,
+                    nullptr,
+                    cpu_experts,
+                    gpu_experts,
+                    exp_probs_b,
+                    n_expert, hparams.n_expert_used,
+                    LLM_FFN_SILU, hparams.expert_weights_norm,
+                    hparams.expert_weights_scale,
+                    (llama_expert_gating_func_type) hparams.expert_gating_func,
+                    il,
+                    nullptr,
+                    selected_experts);
+        } else {
+            moe_out = build_moe_ffn(cur,
+                    layer.ffn_gate_inp,
+                    layer.ffn_up_exps,
+                    layer.ffn_gate_exps,
+                    layer.ffn_down_exps,
+                    exp_probs_b,
+                    n_expert, hparams.n_expert_used,
+                    LLM_FFN_SILU, hparams.expert_weights_norm,
+                    hparams.expert_weights_scale,
+                    (llama_expert_gating_func_type) hparams.expert_gating_func,
+                    il,
+                    nullptr,
+                    nullptr,
+                    nullptr,
+                    nullptr,
+                    nullptr,
+                    selected_experts);
+        }
         cb(moe_out, "ffn_moe_out", il);
 
         ggml_tensor * ffn_shexp = build_ffn(cur,
