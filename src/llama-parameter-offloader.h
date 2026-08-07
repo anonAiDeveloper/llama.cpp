@@ -60,6 +60,7 @@ public:
 
         uint64_t generation = 0; // monotonic id for debugging schedule swaps
     };
+    std::atomic<bool> schedule_swap_requested { false };
     std::mutex schedule_mu; // protects schedule_current / schedule_next swaps and schedule reads
     offloader_schedule schedule_current;          // active schedule used by reader and streamer
     offloader_schedule schedule_next;             // candidate schedule built from latest graph callback
