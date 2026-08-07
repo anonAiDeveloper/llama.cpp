@@ -286,38 +286,38 @@ void parameter_offloader::seed_all_weights_from_model()
             //kv.first == "output_norm.weight"         || // Final RMSNorm scale before logits
             kv.first == "output.weight";                  // LM head / output projection from hidden state to vocabulary logits
 
-        //GPT-OSS weights
+        //GPT-OSS weights. These all fit within 4GB, and yes thats the 120B parameter model. This leads to odd behavior where copies no longer need to wait on reads.
         const bool supported_gpt_oss =
-            //kv.first == "token_embd.weight"            || // Input embedding; leave on CPU with the current streamer
-            //kv.first == "output_norm.weight"           || // Final RMSNorm scale; leave on CPU with the current streamer
-            //ends(kv.first, ".attn_norm.weight")        || // RMSNorm scale before attention; 1D vector
-            //ends(kv.first, ".attn_post_norm.weight")   || // RMSNorm scale before MoE; 1D vector
-            ends(kv.first, ".attn_qkv.weight")         ||   // Optional fused Q/K/V projection
-            //ends(kv.first, ".attn_qkv.bias")          || // Optional fused Q/K/V bias; leave on CPU with the current streamer
-            ends(kv.first, ".attn_q.weight")           ||   // Separate Q projection when fused QKV is absent
-            ends(kv.first, ".attn_k.weight")           ||   // Separate K projection when fused QKV is absent
-            ends(kv.first, ".attn_v.weight")           ||   // Separate V projection when fused QKV is absent
-            //ends(kv.first, ".attn_q.bias")            || // Optional Q bias; leave on CPU with the current streamer
-            //ends(kv.first, ".attn_k.bias")            || // Optional K bias; leave on CPU with the current streamer
-            //ends(kv.first, ".attn_v.bias")            || // Optional V bias; leave on CPU with the current streamer
-            ends(kv.first, ".attn_output.weight")      ||   // Attention output projection
-            //ends(kv.first, ".attn_output.bias")       || // Attention output bias; leave on CPU with the current streamer
-            //ends(kv.first, ".attn_sinks.weight")      || // Attention sinks; 1D vector
-            ends(kv.first, ".ffn_gate_inp.weight")     ||   // MoE router/gating projection
-            //ends(kv.first, ".ffn_gate_inp.bias")      || // Router bias; leave on CPU with the current streamer
-            //ends(kv.first, ".ffn_gate_exps.weight")   || // Routed expert gate matrices; handled by the MoE cache
-            //ends(kv.first, ".ffn_down_exps.weight")   || // Routed expert down matrices; handled by the MoE cache
-            //ends(kv.first, ".ffn_up_exps.weight")     || // Routed expert up matrices; handled by the MoE cache
-            //ends(kv.first, ".ffn_gate_exps.bias")     || // Routed expert gate biases; handled by the MoE cache
-            //ends(kv.first, ".ffn_down_exps.bias")     || // Routed expert down biases; handled by the MoE cache
-            //ends(kv.first, ".ffn_up_exps.bias")       || // Routed expert up biases; handled by the MoE cache
-            //ends(kv.first, ".ffn_gate_exps.scale")    || // Routed expert gate scales; handled by the MoE cache
-            //ends(kv.first, ".ffn_down_exps.scale")    || // Routed expert down scales; handled by the MoE cache
-            //ends(kv.first, ".ffn_up_exps.scale")      || // Routed expert up scales; handled by the MoE cache
-            //ends(kv.first, ".ffn_gate_exps.input_scale") || // Routed expert gate input scales; handled by the MoE cache
-            //ends(kv.first, ".ffn_down_exps.input_scale") || // Routed expert down input scales; handled by the MoE cache
-            //ends(kv.first, ".ffn_up_exps.input_scale")   || // Routed expert up input scales; handled by the MoE cache
-            kv.first == "output.weight";                    // LM head / output projection
+            kv.first == "token_embd.weight"                  ||   // Input embedding table
+            kv.first == "output_norm.weight"                 ||   // Final RMSNorm scale
+            ends(kv.first, ".attn_norm.weight")              ||   // RMSNorm scale before attention
+            ends(kv.first, ".post_attention_norm.weight")    ||   // RMSNorm scale before MoE
+            ends(kv.first, ".attn_qkv.weight")               ||   // Optional fused Q/K/V projection
+            ends(kv.first, ".attn_qkv.bias")                 ||   // Optional fused Q/K/V bias
+            ends(kv.first, ".attn_q.weight")                 ||   // Separate Q projection when fused QKV is absent
+            ends(kv.first, ".attn_k.weight")                 ||   // Separate K projection when fused QKV is absent
+            ends(kv.first, ".attn_v.weight")                 ||   // Separate V projection when fused QKV is absent
+            ends(kv.first, ".attn_q.bias")                   ||   // Optional Q bias
+            ends(kv.first, ".attn_k.bias")                   ||   // Optional K bias
+            ends(kv.first, ".attn_v.bias")                   ||   // Optional V bias
+            ends(kv.first, ".attn_output.weight")            ||   // Attention output projection
+            ends(kv.first, ".attn_output.bias")              ||   // Attention output bias
+            ends(kv.first, ".attn_sinks.weight")             ||   // Attention sinks
+            ends(kv.first, ".ffn_gate_inp.weight")           ||   // MoE router/gating projection
+            ends(kv.first, ".ffn_gate_inp.bias")             ||   // MoE router/gating bias
+            //ends(kv.first, ".ffn_gate_exps.weight")         || // SPARSE: routed expert gate matrices
+            //ends(kv.first, ".ffn_down_exps.weight")         || // SPARSE: routed expert down matrices
+            //ends(kv.first, ".ffn_up_exps.weight")           || // SPARSE: routed expert up matrices
+            //ends(kv.first, ".ffn_gate_exps.bias")           || // SPARSE: routed expert gate biases
+            //ends(kv.first, ".ffn_down_exps.bias")           || // SPARSE: routed expert down biases
+            //ends(kv.first, ".ffn_up_exps.bias")             || // SPARSE: routed expert up biases
+            //ends(kv.first, ".ffn_gate_exps.scale")          || // SPARSE: routed expert gate scales
+            //ends(kv.first, ".ffn_down_exps.scale")          || // SPARSE: routed expert down scales
+            //ends(kv.first, ".ffn_up_exps.scale")            || // SPARSE: routed expert up scales
+            //ends(kv.first, ".ffn_gate_exps.input_scale")    || // SPARSE: routed expert gate input scales
+            //ends(kv.first, ".ffn_down_exps.input_scale")    || // SPARSE: routed expert down input scales
+            //ends(kv.first, ".ffn_up_exps.input_scale")      || // SPARSE: routed expert up input scales
+            kv.first == "output.weight";                          // LM head / output projection
 
         // DeepSeek V4 weights
         const bool supported_deepseek4 =
@@ -1580,7 +1580,7 @@ void parameter_offloader::retarget_schedule_tensors(offloader_schedule & schedul
     }
 }
 
-//operations that the graph callback needs to check further
+//Op filter to speed up graph walking. These ops may contain reads.
 static bool offloader_node_may_read_dense_weight(const ggml_tensor * node)
 {
     if (!node)
@@ -1595,6 +1595,8 @@ static bool offloader_node_may_read_dense_weight(const ggml_tensor * node)
         case GGML_OP_ADD:
         case GGML_OP_SCALE:
         case GGML_OP_DIV:
+        case GGML_OP_SOFT_MAX:
+        case GGML_OP_FLASH_ATTN_EXT:
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
         case GGML_OP_RWKV_WKV6:
@@ -1932,6 +1934,22 @@ void parameter_offloader::stream_worker()
         if (stop_stream.load(std::memory_order_acquire))
             return;
 
+        // Give a pending schedule swap priority over new copy submissions.
+        if (schedule_swap_requested.load(std::memory_order_acquire))
+        {
+            std::unique_lock<std::mutex> lk(node_mu_);
+
+            node_cv_.wait(lk, [&] {
+                return stop_stream.load(std::memory_order_acquire) ||
+                    !schedule_swap_requested.load(std::memory_order_acquire);
+            });
+
+            if (stop_stream.load(std::memory_order_acquire))
+                return;
+
+            continue;
+        }
+
         ggml_tensor * w_cpu = nullptr;        // CPU source selected for this copy
         ggml_tensor * w_gpu = nullptr;        // GPU arena tensor selected for this copy
         long long wait_used_ordinal = -1;     // reader ordinal that blocked this copy
@@ -1941,6 +1959,10 @@ void parameter_offloader::stream_worker()
 
         {
             std::lock_guard<std::mutex> schedule_lk(schedule_mu); // blocks schedule swap during copy selection/upload
+
+            // A swap may have been requested after the check above but before this thread acquired schedule_mu.
+            if (schedule_swap_requested.load(std::memory_order_acquire))
+                continue;
 
             const int tensor_count = (int)schedule_current.gpu_tensors_in_order.size(); // active schedule size
             if (tensor_count == 0)
@@ -2248,7 +2270,7 @@ bool llama_offloader_graph_cb(ggml_backend_sched_t sched, struct ggml_cgraph * g
 
             if (!po->collect_seen.insert(w_gpu).second) {
                 const char * duplicate_name = ggml_get_name(w_gpu);
-                //throw std::runtime_error(std::string("duplicate weight in graph schedule: ") + (duplicate_name ? duplicate_name : "(unnamed)"));
+                throw std::runtime_error(std::string("duplicate weight in graph schedule: ") + (duplicate_name ? duplicate_name : "(unnamed)"));
             }
 
             const int idx = (int) po->schedule_next.gpu_tensors_in_order.size();
@@ -2303,11 +2325,13 @@ bool llama_offloader_graph_cb(ggml_backend_sched_t sched, struct ggml_cgraph * g
 
     po->schedule_next_valid = true;
 
+    LLAMA_LOG_INFO("%s 2\n", __func__);
+
     const bool schedule_changed = po->swap_next_schedule(); // true if retarget moved tensors for this graph
 
 #endif /* ifndef LLAMA_NAIVE_OFFLOADER */
 
-    LLAMA_LOG_INFO("%s 2\n", __func__);
+    LLAMA_LOG_INFO("%s 3\n", __func__);
 
     return true;
 }
@@ -2317,12 +2341,28 @@ bool parameter_offloader::swap_next_schedule()
     long long new_copied_ordinal = -1; // copied ordinal required before graph may start reading
     bool changed = false; // true when a new schedule was published
 
+    GGML_ASSERT(schedule_next_valid);
+
+    if (schedule_next_identical)
+    {
+        schedule_next_valid = false;
+        schedule_next = offloader_schedule{};
+        schedule_next_prefix = 0;
+        schedule_next_identical = false;
+
+        return false;
+    }
+
+    // Stop the streamer from beginning any more old-schedule uploads.
+    schedule_swap_requested.store(true, std::memory_order_release);
+    node_cv_.notify_all();
+
     {
         std::lock_guard<std::mutex> schedule_lk(schedule_mu); // blocks streamer while tensor pointers move
+        
+        LLAMA_LOG_INFO("%s 1\n", __func__);
 
-        GGML_ASSERT(schedule_next_valid);
-
-        const bool identical = schedule_next_identical; // true if graph order did not change
+        /*const bool identical = schedule_next_identical; // true if graph order did not change
         schedule_next_valid = false;
 
         //LLAMA_LOG_INFO("%s identical == %d\n", __func__, identical);
@@ -2332,7 +2372,7 @@ bool parameter_offloader::swap_next_schedule()
             schedule_next_prefix = 0;
             schedule_next_identical = false;
             return false;
-        }
+        }*/
 
         //wait for in-flight copies to complete
         {
@@ -2451,6 +2491,8 @@ bool parameter_offloader::swap_next_schedule()
         print_snapshot(schedule_current);
     }
 
+    // The new schedule is now completely published and schedule_mu is free.
+    schedule_swap_requested.store(false, std::memory_order_release);
     node_cv_.notify_all();
 
     //TODO: This must block if we don't have the first tensor copied into the new schedule. If the first schedule changed between schedules, this should always fire

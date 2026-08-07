@@ -1839,11 +1839,6 @@ static int ggml_backend_sched_select_block_lane(
 
         source_weights.resize(n_ids);
         ggml_backend_tensor_get(lane_set->weights, source_weights.data(), 0, ggml_nbytes(lane_set->weights));
-
-        //TODO: remove this from production
-        for (int64_t i = 0; i < n_ids; ++i) {
-            GGML_ASSERT(std::isfinite(source_weights[i]));
-        }
     }
 
     std::vector<int32_t> cpu_ids;
