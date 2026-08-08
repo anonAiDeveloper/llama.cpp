@@ -24,6 +24,11 @@ struct parameter_offloader
 public:
     static constexpr int32_t MOE_CACHE_SLOT_COUNT = 16;     //temporary hardcoded slot count. In the future we will make this configurable, perhaps with per-model recommended defaults
 
+    struct parameter_offloader_model_i {
+        bool (*weight_supported)(const std::string & name);
+        bool (*node_may_read_dense_weight)(const ggml_tensor * node);
+    };
+
     bool ready = false;
 
     std::vector<ggml_tensor*> collected_order;      // CPU weights in first-use order
@@ -31,6 +36,7 @@ public:
 
     // Arena + twin-context
     llama_model*                model;
+    const parameter_offloader_model_i * model_i = nullptr; // selected once from model->arch
     ggml_backend_buffer_t       arena         = nullptr;  // your CUDA arena buffer
     ggml_context*               ctx_gpu_twins = nullptr;  // no-alloc ctx for duplicated GPU tensors
     ggml_context*               ctx_moe_cache = nullptr;

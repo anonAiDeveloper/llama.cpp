@@ -35,6 +35,8 @@
 //#define LLAMA_LOG_COPIES 2
 
 //#define LLAMA_NAIVE_OFFLOADER 1
+
+//#define LLAMA_PRINT_WEIGHT_READS
 /////////////////////////////////////
 
 #ifndef GGML_USE_CUDA
@@ -207,14 +209,204 @@ inline bool parameter_offloader::no_transform_needed_for_backend_(const ggml_ten
     }
 }
 
+
+static inline bool offloader_name_ends(const std::string & name, const char * suffix)
+{
+    const size_t n = std::strlen(suffix);
+    return name.size() >= n && name.compare(name.size() - n, n, suffix) == 0;
+}
+
+//Deepseek 2 weights
+static bool parameter_offloader_deepseek2_weight_supported(const std::string & name)
+{
+    return
+        offloader_name_ends(name, ".attn_norm.weight")      || // RMSNorm scale before attention block; 1D vector applied to residual stream before Q/K/V work
+        offloader_name_ends(name, ".attn_q_a.weight")       ||   // First low-rank Q projection: hidden -> q_lora_rank before q_a_norm/q_b
+        offloader_name_ends(name, ".attn_q_a_norm.weight")  || // RMSNorm scale on low-rank Q activation between q_a and q_b; 1D vector
+        offloader_name_ends(name, ".attn_q_b.weight")       ||   // Second low-rank Q projection: q_lora_rank -> full per-head Q
+        offloader_name_ends(name, ".attn_k_b.weight")       ||   // MLA absorbed K projection used after KV compression in MLA path
+        offloader_name_ends(name, ".attn_kv_a_mqa.weight")  ||   // Shared KV compression projection: hidden -> kv_lora_rank + rope K part
+        offloader_name_ends(name, ".attn_kv_a_norm.weight") || // RMSNorm scale on compressed KV activation before K/V expansion; 1D vector
+        offloader_name_ends(name, ".attn_v_b.weight")       ||   // MLA absorbed V projection used by attention output path
+        offloader_name_ends(name, ".attn_kv_b.weight")      || // Legacy unsplit KV expansion tensor for older/non-MLA GGUFs; replaces separate k_b/v_b
+        offloader_name_ends(name, ".attn_output.weight")    ||   // Attention output projection back to model hidden size
+        offloader_name_ends(name, ".ffn_norm.weight")       || // RMSNorm scale before FFN/MoE block; 1D vector
+        offloader_name_ends(name, ".ffn_gate.weight")       ||   // Dense-layer FFN gate projection for leading non-MoE layers
+        offloader_name_ends(name, ".ffn_up.weight")         ||   // Dense-layer FFN up projection for leading non-MoE layers
+        offloader_name_ends(name, ".ffn_down.weight")       ||   // Dense-layer FFN down projection for leading non-MoE layers
+        offloader_name_ends(name, ".ffn_gate_inp.weight")   ||   // MoE router/gating projection: hidden -> expert scores
+        offloader_name_ends(name, ".exp_probs_b.bias")      || // Optional MoE expert-score/probability bias; 1D vector over experts
+        //offloader_name_ends(name, ".ffn_down_exps.weight")  || // Routed MoE expert-bank down matrices; packed per expert
+        //offloader_name_ends(name, ".ffn_gate_exps.weight")  || // Routed MoE expert-bank gate matrices; packed per expert
+        //offloader_name_ends(name, ".ffn_up_exps.weight")    || // Routed MoE expert-bank up matrices; packed per expert
+        offloader_name_ends(name, ".ffn_gate_shexp.weight") ||   // Shared expert FFN gate projection; always used, not routed by top-k
+        offloader_name_ends(name, ".ffn_up_shexp.weight")   ||   // Shared expert FFN up projection; always used, not routed by top-k
+        offloader_name_ends(name, ".ffn_down_shexp.weight") ||   // Shared expert FFN down projection; always used, not routed by top-k
+        name == "token_embd.weight"                         ||
+        name == "output_norm.weight"                        ||   // Final RMSNorm scale before logits
+        name == "output.weight";                                 // LM head / output projection from hidden state to vocabulary logits
+}
+
+//GPT-OSS weights. These all fit within 4GB, and yes thats the 120B parameter model. This leads to odd behavior where copies no longer need to wait on reads.
+static bool parameter_offloader_gpt_oss_weight_supported(const std::string & name)
+{
+    return
+        name == "token_embd.weight"                              ||   // Input embedding table
+        name == "output_norm.weight"                             ||   // Final RMSNorm scale
+        offloader_name_ends(name, ".attn_norm.weight")          ||   // RMSNorm scale before attention
+        offloader_name_ends(name, ".post_attention_norm.weight")||   // RMSNorm scale before MoE
+        offloader_name_ends(name, ".attn_qkv.weight")           ||   // Optional fused Q/K/V projection
+        offloader_name_ends(name, ".attn_qkv.bias")             ||   // Optional fused Q/K/V bias
+        offloader_name_ends(name, ".attn_q.weight")             ||   // Separate Q projection when fused QKV is absent
+        offloader_name_ends(name, ".attn_k.weight")             ||   // Separate K projection when fused QKV is absent
+        offloader_name_ends(name, ".attn_v.weight")             ||   // Separate V projection when fused QKV is absent
+        offloader_name_ends(name, ".attn_q.bias")               ||   // Optional Q bias
+        offloader_name_ends(name, ".attn_k.bias")               ||   // Optional K bias
+        offloader_name_ends(name, ".attn_v.bias")               ||   // Optional V bias
+        offloader_name_ends(name, ".attn_output.weight")        ||   // Attention output projection
+        offloader_name_ends(name, ".attn_output.bias")          ||   // Attention output bias
+        offloader_name_ends(name, ".attn_sinks.weight")         ||   // Attention sinks
+        offloader_name_ends(name, ".ffn_gate_inp.weight")       ||   // MoE router/gating projection
+        offloader_name_ends(name, ".ffn_gate_inp.bias")         ||   // MoE router/gating bias
+        //offloader_name_ends(name, ".ffn_gate_exps.weight")     || // SPARSE: routed expert gate matrices
+        //offloader_name_ends(name, ".ffn_down_exps.weight")     || // SPARSE: routed expert down matrices
+        //offloader_name_ends(name, ".ffn_up_exps.weight")       || // SPARSE: routed expert up matrices
+        //offloader_name_ends(name, ".ffn_gate_exps.bias")       || // SPARSE: routed expert gate biases
+        //offloader_name_ends(name, ".ffn_down_exps.bias")       || // SPARSE: routed expert down biases
+        //offloader_name_ends(name, ".ffn_up_exps.bias")         || // SPARSE: routed expert up biases
+        //offloader_name_ends(name, ".ffn_gate_exps.scale")      || // SPARSE: routed expert gate scales
+        //offloader_name_ends(name, ".ffn_down_exps.scale")      || // SPARSE: routed expert down scales
+        //offloader_name_ends(name, ".ffn_up_exps.scale")        || // SPARSE: routed expert up scales
+        //offloader_name_ends(name, ".ffn_gate_exps.input_scale")|| // SPARSE: routed expert gate input scales
+        //offloader_name_ends(name, ".ffn_down_exps.input_scale")|| // SPARSE: routed expert down input scales
+        //offloader_name_ends(name, ".ffn_up_exps.input_scale")  || // SPARSE: routed expert up input scales
+        name == "output.weight";                                      // LM head / output projection
+}
+
+// DeepSeek V4 weights
+static bool parameter_offloader_deepseek4_weight_supported(const std::string & name)
+{
+    return
+        offloader_name_ends(name, ".hc_attn_fn.weight")              ||   // Hyperconnection projection before attention
+        // Reused later in the same graph; current schedule tracks first use only.
+        //offloader_name_ends(name, ".hc_attn_base.weight")           ||
+        //offloader_name_ends(name, ".hc_attn_scale.weight")          ||
+        offloader_name_ends(name, ".attn_q_a.weight")                ||   // First low-rank Q projection
+        offloader_name_ends(name, ".attn_q_b.weight")                ||   // Second low-rank Q projection
+        offloader_name_ends(name, ".attn_kv.weight")                 ||   // Shared attention KV projection
+        offloader_name_ends(name, ".attn_compressor_kv.weight")      ||   // Conditional compressed-attention KV projection
+        offloader_name_ends(name, ".attn_compressor_gate.weight")    ||   // Conditional compressed-attention score projection
+        offloader_name_ends(name, ".indexer_compressor_kv.weight")   ||   // Conditional indexer-state KV projection
+        offloader_name_ends(name, ".indexer_compressor_gate.weight") ||   // Conditional indexer-state score projection
+        offloader_name_ends(name, ".indexer.attn_q_b.weight")        ||   // Conditional LID query projection
+        offloader_name_ends(name, ".indexer.proj.weight")            ||   // Conditional LID weight projection
+        offloader_name_ends(name, ".attn_output_a.weight")           ||   // Grouped attention output projection A
+        offloader_name_ends(name, ".attn_output_b.weight")           ||   // Grouped attention output projection B
+        offloader_name_ends(name, ".hc_ffn_fn.weight")               ||   // Hyperconnection projection before FFN
+        // Reused later in the same graph; current schedule tracks first use only.
+        //offloader_name_ends(name, ".hc_ffn_base.weight")            ||
+        //offloader_name_ends(name, ".hc_ffn_scale.weight")           ||
+        offloader_name_ends(name, ".ffn_gate_inp.weight")            ||   // Dense MoE router projection
+        //offloader_name_ends(name, ".ffn_gate_exps.weight")          || // Routed expert banks are handled by the MoE cache
+        //offloader_name_ends(name, ".ffn_down_exps.weight")          ||
+        //offloader_name_ends(name, ".ffn_up_exps.weight")            ||
+        offloader_name_ends(name, ".ffn_gate_shexp.weight")          ||   // Shared expert gate projection
+        offloader_name_ends(name, ".ffn_up_shexp.weight")            ||   // Shared expert up projection
+        offloader_name_ends(name, ".ffn_down_shexp.weight")          ||   // Shared expert down projection
+        name == "output_hc_fn.weight"                                ||   // Final hyperconnection projection
+        name == "output.weight";                                          // LM head / output projection
+}
+
+//Op filters to speed up graph walking. Each model only checks ops that can directly read one of its enabled dense weights.
+static bool parameter_offloader_deepseek2_node_may_read_dense_weight(const ggml_tensor * node)
+{
+    if (!node)
+        return false;
+
+    switch (node->op) {
+        case GGML_OP_GET_ROWS:       // token_embd.weight;
+        case GGML_OP_MUL:            // attn/output/FFN/Q/KV norm weights; currently disabled
+        case GGML_OP_MUL_MAT:        // Q/KV/attention output, dense/shared FFN, router, and output weights
+        case GGML_OP_ADD:            // exp_probs_b.bias; currently disabled
+        //case GGML_OP_MUL_MAT_ID:   // routed MoE expert banks; sparse and handled separately
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool parameter_offloader_gpt_oss_node_may_read_dense_weight(const ggml_tensor * node)
+{
+    if (!node)
+        return false;
+
+    switch (node->op) {
+        case GGML_OP_GET_ROWS:       // token_embd.weight
+        case GGML_OP_MUL:            // attention/post-attention/output norm weights
+        case GGML_OP_MUL_MAT:        // QKV, attention output, router, and output weights
+        case GGML_OP_ADD:            // QKV, attention-output, and router biases
+        case GGML_OP_SOFT_MAX:       // attn_sinks.weight on the non-flash attention path
+        case GGML_OP_FLASH_ATTN_EXT: // attn_sinks.weight on the flash-attention path
+        //case GGML_OP_MUL_MAT_ID:   // routed expert gate/up/down weights; sparse and handled separately
+        //case GGML_OP_ADD_ID:       // routed expert gate/up/down biases; sparse and handled separately
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool parameter_offloader_deepseek4_node_may_read_dense_weight(const ggml_tensor * node)
+{
+    if (!node)
+        return false;
+
+    switch (node->op) {
+        //case GGML_OP_GET_ROWS:       // token_embd, compressor/indexer APE, and hash-router table weights; currently disabled
+        //case GGML_OP_MUL:            // norm weights plus HC scale weights; currently disabled
+        case GGML_OP_MUL_MAT:          // HC fn, attention/compressor/indexer, router/shared-expert, and output weights
+        //case GGML_OP_ADD:            // HC base weights and expert-probability bias; currently disabled
+        //case GGML_OP_SOFT_MAX:       // attn_sinks on the non-flash attention path; currently disabled
+        //case GGML_OP_FLASH_ATTN_EXT: // attn_sinks on the flash-attention path; currently disabled
+        //case GGML_OP_MUL_MAT_ID:     // routed expert gate/up/down banks; sparse and handled separately
+        //case GGML_OP_DSV4_HC_COMB:   // HC base/scale weights are direct inputs to the optional fused HC-comb path
+            return true;
+        default:
+            return false;
+    }
+}
+
+static const parameter_offloader::parameter_offloader_model_i parameter_offloader_deepseek2_i = {
+    /*weight_supported*/            parameter_offloader_deepseek2_weight_supported,
+    /*node_may_read_dense_weight*/ parameter_offloader_deepseek2_node_may_read_dense_weight,
+};
+
+static const parameter_offloader::parameter_offloader_model_i parameter_offloader_gpt_oss_i = {
+    /*weight_supported*/            parameter_offloader_gpt_oss_weight_supported,
+    /*node_may_read_dense_weight*/ parameter_offloader_gpt_oss_node_may_read_dense_weight,
+};
+
+static const parameter_offloader::parameter_offloader_model_i parameter_offloader_deepseek4_i = {
+    /*weight_supported*/            parameter_offloader_deepseek4_weight_supported,
+    /*node_may_read_dense_weight*/ parameter_offloader_deepseek4_node_may_read_dense_weight,
+};
+
 parameter_offloader::parameter_offloader(llama_model  * model)
     : model(model)
 {
-    // Require DeepSeek-2
-    //if (model->arch != LLM_ARCH_DEEPSEEK2) {
-    //    LLAMA_LOG_WARN("%s: registry constructor: non-DeepSeek2 arch (%d) no ordering applied\n", __func__, (int)model->arch);
-    //    return;
-    //}
+    switch (model->arch)
+    {
+        case LLM_ARCH_DEEPSEEK2:
+            model_i = &parameter_offloader_deepseek2_i;
+            break;
+        case LLM_ARCH_OPENAI_MOE:
+            model_i = &parameter_offloader_gpt_oss_i;
+            break;
+        case LLM_ARCH_DEEPSEEK4:
+            model_i = &parameter_offloader_deepseek4_i;
+            break;
+        default:
+            throw std::runtime_error("parameter_offloader: unsupported model architecture");
+    }
 
     cpu_weight_set.clear();
     cpu_weight_set.reserve(model->tensors_by_name.size());
@@ -253,106 +445,7 @@ void parameter_offloader::seed_all_weights_from_model()
         if (cpu_weight_set.find(t) == cpu_weight_set.end())
             continue;
 
-        auto ends = [](const std::string & s, const char * suffix) {
-            const size_t n = std::strlen(suffix);
-            return s.size() >= n && s.compare(s.size() - n, n, suffix) == 0;
-        };
-
-        //Deepseek 2 weights
-        const bool supported_deepseek2 =
-            //ends(kv.first, ".attn_norm.weight")      || // RMSNorm scale before attention block; 1D vector applied to residual stream before Q/K/V work
-            ends(kv.first, ".attn_q_a.weight")       ||   // First low-rank Q projection: hidden -> q_lora_rank before q_a_norm/q_b
-            //ends(kv.first, ".attn_q_a_norm.weight")  || // RMSNorm scale on low-rank Q activation between q_a and q_b; 1D vector
-            ends(kv.first, ".attn_q_b.weight")       ||   // Second low-rank Q projection: q_lora_rank -> full per-head Q
-            ends(kv.first, ".attn_k_b.weight")       ||   // MLA absorbed K projection used after KV compression in MLA path
-            ends(kv.first, ".attn_kv_a_mqa.weight")  ||   // Shared KV compression projection: hidden -> kv_lora_rank + rope K part
-            //ends(kv.first, ".attn_kv_a_norm.weight") || // RMSNorm scale on compressed KV activation before K/V expansion; 1D vector
-            ends(kv.first, ".attn_v_b.weight")       ||   // MLA absorbed V projection used by attention output path
-            //ends(kv.first, ".attn_kv_b.weight")      || // Legacy unsplit KV expansion tensor for older/non-MLA GGUFs; replaces separate k_b/v_b
-            ends(kv.first, ".attn_output.weight")    ||   // Attention output projection back to model hidden size
-            //ends(kv.first, ".ffn_norm.weight")       || // RMSNorm scale before FFN/MoE block; 1D vector
-            ends(kv.first, ".ffn_gate.weight")       ||   // Dense-layer FFN gate projection for leading non-MoE layers
-            ends(kv.first, ".ffn_up.weight")         ||   // Dense-layer FFN up projection for leading non-MoE layers
-            ends(kv.first, ".ffn_down.weight")       ||   // Dense-layer FFN down projection for leading non-MoE layers
-            ends(kv.first, ".ffn_gate_inp.weight")   ||   // MoE router/gating projection: hidden -> expert scores
-            //ends(kv.first, ".exp_probs_b.bias")      || // Optional MoE expert-score/probability bias; 1D vector over experts
-            //ends(kv.first, ".ffn_down_exps.weight")  || // Routed MoE expert-bank down matrices; packed per expert
-            //ends(kv.first, ".ffn_gate_exps.weight")  || // Routed MoE expert-bank gate matrices; packed per expert
-            //ends(kv.first, ".ffn_up_exps.weight")    || // Routed MoE expert-bank up matrices; packed per expert
-            ends(kv.first, ".ffn_gate_shexp.weight") ||   // Shared expert FFN gate projection; always used, not routed by top-k
-            ends(kv.first, ".ffn_up_shexp.weight")   ||   // Shared expert FFN up projection; always used, not routed by top-k
-            ends(kv.first, ".ffn_down_shexp.weight") ||   // Shared expert FFN down projection; always used, not routed by top-k
-            //kv.first == "token_embd.weight"          ||
-            //kv.first == "output_norm.weight"         || // Final RMSNorm scale before logits
-            kv.first == "output.weight";                  // LM head / output projection from hidden state to vocabulary logits
-
-        //GPT-OSS weights. These all fit within 4GB, and yes thats the 120B parameter model. This leads to odd behavior where copies no longer need to wait on reads.
-        const bool supported_gpt_oss =
-            kv.first == "token_embd.weight"                  ||   // Input embedding table
-            kv.first == "output_norm.weight"                 ||   // Final RMSNorm scale
-            ends(kv.first, ".attn_norm.weight")              ||   // RMSNorm scale before attention
-            ends(kv.first, ".post_attention_norm.weight")    ||   // RMSNorm scale before MoE
-            ends(kv.first, ".attn_qkv.weight")               ||   // Optional fused Q/K/V projection
-            ends(kv.first, ".attn_qkv.bias")                 ||   // Optional fused Q/K/V bias
-            ends(kv.first, ".attn_q.weight")                 ||   // Separate Q projection when fused QKV is absent
-            ends(kv.first, ".attn_k.weight")                 ||   // Separate K projection when fused QKV is absent
-            ends(kv.first, ".attn_v.weight")                 ||   // Separate V projection when fused QKV is absent
-            ends(kv.first, ".attn_q.bias")                   ||   // Optional Q bias
-            ends(kv.first, ".attn_k.bias")                   ||   // Optional K bias
-            ends(kv.first, ".attn_v.bias")                   ||   // Optional V bias
-            ends(kv.first, ".attn_output.weight")            ||   // Attention output projection
-            ends(kv.first, ".attn_output.bias")              ||   // Attention output bias
-            ends(kv.first, ".attn_sinks.weight")             ||   // Attention sinks
-            ends(kv.first, ".ffn_gate_inp.weight")           ||   // MoE router/gating projection
-            ends(kv.first, ".ffn_gate_inp.bias")             ||   // MoE router/gating bias
-            //ends(kv.first, ".ffn_gate_exps.weight")         || // SPARSE: routed expert gate matrices
-            //ends(kv.first, ".ffn_down_exps.weight")         || // SPARSE: routed expert down matrices
-            //ends(kv.first, ".ffn_up_exps.weight")           || // SPARSE: routed expert up matrices
-            //ends(kv.first, ".ffn_gate_exps.bias")           || // SPARSE: routed expert gate biases
-            //ends(kv.first, ".ffn_down_exps.bias")           || // SPARSE: routed expert down biases
-            //ends(kv.first, ".ffn_up_exps.bias")             || // SPARSE: routed expert up biases
-            //ends(kv.first, ".ffn_gate_exps.scale")          || // SPARSE: routed expert gate scales
-            //ends(kv.first, ".ffn_down_exps.scale")          || // SPARSE: routed expert down scales
-            //ends(kv.first, ".ffn_up_exps.scale")            || // SPARSE: routed expert up scales
-            //ends(kv.first, ".ffn_gate_exps.input_scale")    || // SPARSE: routed expert gate input scales
-            //ends(kv.first, ".ffn_down_exps.input_scale")    || // SPARSE: routed expert down input scales
-            //ends(kv.first, ".ffn_up_exps.input_scale")      || // SPARSE: routed expert up input scales
-            kv.first == "output.weight";                          // LM head / output projection
-
-        // DeepSeek V4 weights
-        const bool supported_deepseek4 =
-            ends(kv.first, ".hc_attn_fn.weight")              ||   // Hyperconnection projection before attention
-            // Reused later in the same graph; current schedule tracks first use only.
-            //ends(kv.first, ".hc_attn_base.weight")           ||
-            //ends(kv.first, ".hc_attn_scale.weight")          ||
-            ends(kv.first, ".attn_q_a.weight")                ||   // First low-rank Q projection
-            ends(kv.first, ".attn_q_b.weight")                ||   // Second low-rank Q projection
-            ends(kv.first, ".attn_kv.weight")                 ||   // Shared attention KV projection
-            ends(kv.first, ".attn_compressor_kv.weight")      ||   // Conditional compressed-attention KV projection
-            ends(kv.first, ".attn_compressor_gate.weight")    ||   // Conditional compressed-attention score projection
-            ends(kv.first, ".indexer_compressor_kv.weight")   ||   // Conditional indexer-state KV projection
-            ends(kv.first, ".indexer_compressor_gate.weight") ||   // Conditional indexer-state score projection
-            ends(kv.first, ".indexer.attn_q_b.weight")        ||   // Conditional LID query projection
-            ends(kv.first, ".indexer.proj.weight")            ||   // Conditional LID weight projection
-            ends(kv.first, ".attn_output_a.weight")           ||   // Grouped attention output projection A
-            ends(kv.first, ".attn_output_b.weight")           ||   // Grouped attention output projection B
-            ends(kv.first, ".hc_ffn_fn.weight")               ||   // Hyperconnection projection before FFN
-            // Reused later in the same graph; current schedule tracks first use only.
-            //ends(kv.first, ".hc_ffn_base.weight")            ||
-            //ends(kv.first, ".hc_ffn_scale.weight")           ||
-            ends(kv.first, ".ffn_gate_inp.weight")            ||   // Dense MoE router projection
-            //ends(kv.first, ".ffn_gate_exps.weight")          || // Routed expert banks are handled by the MoE cache
-            //ends(kv.first, ".ffn_down_exps.weight")          ||
-            //ends(kv.first, ".ffn_up_exps.weight")            ||
-            ends(kv.first, ".ffn_gate_shexp.weight")          ||   // Shared expert gate projection
-            ends(kv.first, ".ffn_up_shexp.weight")            ||   // Shared expert up projection
-            ends(kv.first, ".ffn_down_shexp.weight")          ||   // Shared expert down projection
-            kv.first == "output_hc_fn.weight"                 ||   // Final hyperconnection projection
-            kv.first == "output.weight";                           // LM head / output projection
-
-        const bool supported = supported_deepseek2 || supported_gpt_oss || supported_deepseek4;
-
-        if (!supported)
+        if (!model_i->weight_supported(kv.first))
         {
             LLAMA_LOG_INFO("%s: rejecting %s\n", __func__, kv.first.c_str());
             continue;
@@ -1580,38 +1673,12 @@ void parameter_offloader::retarget_schedule_tensors(offloader_schedule & schedul
     }
 }
 
-//Op filter to speed up graph walking. These ops may contain reads.
-static bool offloader_node_may_read_dense_weight(const ggml_tensor * node)
-{
-    if (!node)
-        return false;
-
-    switch (node->op) {
-        case GGML_OP_GET_ROWS:
-        case GGML_OP_MUL:
-        case GGML_OP_MUL_MAT:
-        //case GGML_OP_MUL_MAT_ID:      //we exclude this because MoE layers have their own prefetch mechanism
-        case GGML_OP_ROPE:
-        case GGML_OP_ADD:
-        case GGML_OP_SCALE:
-        case GGML_OP_DIV:
-        case GGML_OP_SOFT_MAX:
-        case GGML_OP_FLASH_ATTN_EXT:
-        case GGML_OP_SSM_CONV:
-        case GGML_OP_SSM_SCAN:
-        case GGML_OP_RWKV_WKV6:
-        case GGML_OP_IM2COL:
-            return true;
-        default:
-            return false;
-    }
-}
 
 // Return true if node 't' reads any tracked GPU twin; optionally output the
 // furthest tracked weight used by the node in the active schedule.
 bool parameter_offloader::node_reads_tracked_weight(ggml_tensor * t, int * out_idx = nullptr)
 {
-    if (!offloader_node_may_read_dense_weight(t))
+    if (!model_i->node_may_read_dense_weight(t))
         return false;
 
     int best_idx = -1;
@@ -2226,6 +2293,62 @@ static inline size_t common_prefix_len(const std::vector<ggml_tensor *> & a, con
     return i;
 }
 
+#ifdef LLAMA_PRINT_WEIGHT_READS
+static bool offloader_weight_is_sparse(const ggml_tensor * weight)
+{
+    const char * name = ggml_get_name(weight);
+    if (!name)
+        return false;
+
+    return strstr(name, ".ffn_gate_exps.")    ||
+           strstr(name, ".ffn_down_exps.")    ||
+           strstr(name, ".ffn_up_exps.")      ||
+           strstr(name, ".ffn_gate_up_exps.") ||
+           strstr(name, ".ffn_gate_chexps.")  ||
+           strstr(name, ".ffn_down_chexps.")  ||
+           strstr(name, ".ffn_up_chexps.");
+}
+
+static void print_all_weight_reads(parameter_offloader * po, ggml_cgraph * graph)
+{
+    std::unordered_set<ggml_tensor *> seen;
+    int event = 0;
+
+    LLAMA_LOG_INFO("%-6s %-70s %-7s %-7s %-7s\n", "EVENT", "WEIGHT", "REPEAT", "MANAGED", "SPARSE");
+
+    for (int i = 0; i < graph->n_nodes; ++i)
+    {
+        ggml_tensor * node = graph->nodes[i];
+
+        for (int k = 0; k < GGML_MAX_SRC; ++k)
+        {
+            ggml_tensor * weight = node->src[k];
+            if (!weight)
+                break;
+
+            while (weight->view_src)
+                weight = weight->view_src;
+
+            auto managed_it = po->gpu2cpu.find(weight);
+            const bool managed = managed_it != po->gpu2cpu.end();
+
+            if (!managed && po->cpu_weight_set.find(weight) == po->cpu_weight_set.end())
+                continue;
+
+            ggml_tensor * cpu_weight = managed ? managed_it->second : weight;
+            const bool repeat = !seen.insert(cpu_weight).second;
+            const bool sparse = offloader_weight_is_sparse(cpu_weight);
+
+            LLAMA_LOG_INFO("%-6d %-70s %-7s %-7s %-7s\n",
+                event++, ggml_get_name(cpu_weight),
+                repeat ? "YES" : "",
+                managed ? "YES" : "",
+                sparse ? "SPARSE" : "");
+        }
+    }
+}
+#endif
+
 // Choose how strict you want the selection to be:
 //
 // 0 -> Walk the whole graph in order; collect weights from *all* nodes (simplest, no internal deps)
@@ -2248,12 +2371,16 @@ bool llama_offloader_graph_cb(ggml_backend_sched_t sched, struct ggml_cgraph * g
     if (!po->ready)
         return true;
 
+#ifdef LLAMA_PRINT_WEIGHT_READS
+    print_all_weight_reads(po, graph);
+#endif
+
     // Reset & (re)build the order from this graph
     po->schedule_next = parameter_offloader::offloader_schedule{};
     po->collect_seen.clear();
 
     auto collect_node_weights = [&](ggml_tensor * node) {
-        if (!offloader_node_may_read_dense_weight(node))
+        if (!po->model_i->node_may_read_dense_weight(node))
             return;
 
         for (int k = 0; k < GGML_MAX_SRC; ++k) {
