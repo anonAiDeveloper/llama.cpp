@@ -287,34 +287,47 @@ static bool parameter_offloader_gpt_oss_weight_supported(const std::string & nam
 static bool parameter_offloader_deepseek4_weight_supported(const std::string & name)
 {
     return
-        offloader_name_ends(name, ".hc_attn_fn.weight")              ||   // Hyperconnection projection before attention
-        // Reused later in the same graph; current schedule tracks first use only.
-        //offloader_name_ends(name, ".hc_attn_base.weight")           ||
-        //offloader_name_ends(name, ".hc_attn_scale.weight")          ||
-        offloader_name_ends(name, ".attn_q_a.weight")                ||   // First low-rank Q projection
-        offloader_name_ends(name, ".attn_q_b.weight")                ||   // Second low-rank Q projection
-        offloader_name_ends(name, ".attn_kv.weight")                 ||   // Shared attention KV projection
-        offloader_name_ends(name, ".attn_compressor_kv.weight")      ||   // Conditional compressed-attention KV projection
-        offloader_name_ends(name, ".attn_compressor_gate.weight")    ||   // Conditional compressed-attention score projection
-        offloader_name_ends(name, ".indexer_compressor_kv.weight")   ||   // Conditional indexer-state KV projection
-        offloader_name_ends(name, ".indexer_compressor_gate.weight") ||   // Conditional indexer-state score projection
-        offloader_name_ends(name, ".indexer.attn_q_b.weight")        ||   // Conditional LID query projection
-        offloader_name_ends(name, ".indexer.proj.weight")            ||   // Conditional LID weight projection
-        offloader_name_ends(name, ".attn_output_a.weight")           ||   // Grouped attention output projection A
-        offloader_name_ends(name, ".attn_output_b.weight")           ||   // Grouped attention output projection B
-        offloader_name_ends(name, ".hc_ffn_fn.weight")               ||   // Hyperconnection projection before FFN
-        // Reused later in the same graph; current schedule tracks first use only.
-        //offloader_name_ends(name, ".hc_ffn_base.weight")            ||
-        //offloader_name_ends(name, ".hc_ffn_scale.weight")           ||
-        offloader_name_ends(name, ".ffn_gate_inp.weight")            ||   // Dense MoE router projection
-        //offloader_name_ends(name, ".ffn_gate_exps.weight")          || // Routed expert banks are handled by the MoE cache
-        //offloader_name_ends(name, ".ffn_down_exps.weight")          ||
-        //offloader_name_ends(name, ".ffn_up_exps.weight")            ||
-        offloader_name_ends(name, ".ffn_gate_shexp.weight")          ||   // Shared expert gate projection
-        offloader_name_ends(name, ".ffn_up_shexp.weight")            ||   // Shared expert up projection
-        offloader_name_ends(name, ".ffn_down_shexp.weight")          ||   // Shared expert down projection
-        name == "output_hc_fn.weight"                                ||   // Final hyperconnection projection
-        name == "output.weight";                                          // LM head / output projection
+        name == "token_embd.weight"                                ||   // Token embedding
+        offloader_name_ends(name, ".hc_attn_fn.weight")            ||   // Hyperconnection projection before attention
+        //offloader_name_ends(name, ".hc_attn_base.weight")        ||   // HC attention base stores pre[hc], post[hc], and comb[hc*hc] affine biases.
+        //offloader_name_ends(name, ".hc_attn_scale.weight")       ||   // HC attention scale stores separate pre, post, and comb affine scales.
+        offloader_name_ends(name, ".attn_norm.weight")             ||   // Attention RMSNorm
+        offloader_name_ends(name, ".attn_sinks.weight")            ||   // Attention sinks
+        offloader_name_ends(name, ".attn_q_a.weight")              ||   // First low-rank Q projection
+        offloader_name_ends(name, ".attn_q_a_norm.weight")         ||   // Low-rank Q RMSNorm
+        offloader_name_ends(name, ".attn_q_b.weight")              ||   // Second low-rank Q projection
+        offloader_name_ends(name, ".attn_kv.weight")               ||   // Shared attention KV projection
+        offloader_name_ends(name, ".attn_kv_a_norm.weight")        ||   // Compressed KV RMSNorm
+        offloader_name_ends(name, ".attn_compressor_kv.weight")    ||   // Compressed-attention KV projection
+        offloader_name_ends(name, ".attn_compressor_gate.weight")  ||   // Compressed-attention score projection
+        offloader_name_ends(name, ".attn_compressor_ape.weight")   ||   // Compressed-attention positional table
+        offloader_name_ends(name, ".attn_compressor_norm.weight")  ||   // Compressed-attention RMSNorm
+        offloader_name_ends(name, ".indexer_compressor_kv.weight") ||   // Indexer-state KV projection
+        offloader_name_ends(name, ".indexer_compressor_gate.weight") || // Indexer-state score projection
+        offloader_name_ends(name, ".indexer_compressor_ape.weight") ||  // Indexer positional table
+        offloader_name_ends(name, ".indexer_compressor_norm.weight") || // Indexer RMSNorm
+        offloader_name_ends(name, ".indexer.attn_q_b.weight")      ||   // LID query projection
+        offloader_name_ends(name, ".indexer.proj.weight")          ||   // LID weight projection
+        offloader_name_ends(name, ".attn_output_a.weight")         ||   // Attention output projection A
+        offloader_name_ends(name, ".attn_output_b.weight")         ||   // Attention output projection B
+        offloader_name_ends(name, ".hc_ffn_fn.weight")             ||   // Hyperconnection projection before FFN
+        //offloader_name_ends(name, ".hc_ffn_base.weight")         ||   // HC FFN base stores pre[hc], post[hc], and comb[hc*hc] affine biases.
+        //offloader_name_ends(name, ".hc_ffn_scale.weight")        ||   // HC FFN scale stores separate pre, post, and comb affine scales.
+        offloader_name_ends(name, ".ffn_norm.weight")              ||   // FFN RMSNorm
+        offloader_name_ends(name, ".ffn_gate_inp.weight")          ||   // Dense MoE router projection
+        offloader_name_ends(name, ".ffn_gate_tid2eid.weight")      ||   // Hash-router token-to-expert table
+        offloader_name_ends(name, ".exp_probs_b.bias")             ||   // MoE expert-probability bias
+        //offloader_name_ends(name, ".ffn_gate_exps.weight")       ||   // SPARSE
+        //offloader_name_ends(name, ".ffn_down_exps.weight")       ||   // SPARSE
+        //offloader_name_ends(name, ".ffn_up_exps.weight")         ||   // SPARSE
+        offloader_name_ends(name, ".ffn_gate_shexp.weight")        ||   // Shared expert gate projection
+        offloader_name_ends(name, ".ffn_up_shexp.weight")          ||   // Shared expert up projection
+        offloader_name_ends(name, ".ffn_down_shexp.weight")        ||   // Shared expert down projection
+        name == "output_hc_fn.weight"                              ||   // Final hyperconnection projection
+        name == "output_hc_scale.weight"                           ||   // Final hyperconnection scale
+        name == "output_hc_base.weight"                            ||   // Final hyperconnection base
+        name == "output_norm.weight"                               ||   // Final RMSNorm
+        name == "output.weight";                                        // LM head
 }
 
 //Op filters to speed up graph walking. Each model only checks ops that can directly read one of its enabled dense weights.
@@ -361,14 +374,14 @@ static bool parameter_offloader_deepseek4_node_may_read_dense_weight(const ggml_
         return false;
 
     switch (node->op) {
-        //case GGML_OP_GET_ROWS:       // token_embd, compressor/indexer APE, and hash-router table weights; currently disabled
-        //case GGML_OP_MUL:            // norm weights plus HC scale weights; currently disabled
-        case GGML_OP_MUL_MAT:          // HC fn, attention/compressor/indexer, router/shared-expert, and output weights
-        //case GGML_OP_ADD:            // HC base weights and expert-probability bias; currently disabled
-        //case GGML_OP_SOFT_MAX:       // attn_sinks on the non-flash attention path; currently disabled
-        //case GGML_OP_FLASH_ATTN_EXT: // attn_sinks on the flash-attention path; currently disabled
-        //case GGML_OP_MUL_MAT_ID:     // routed expert gate/up/down banks; sparse and handled separately
-        //case GGML_OP_DSV4_HC_COMB:   // HC base/scale weights are direct inputs to the optional fused HC-comb path
+        case GGML_OP_GET_ROWS:       // token embedding, compressor/indexer APE, hash-router table
+        case GGML_OP_MUL:            // norm weights and final HC scale
+        case GGML_OP_MUL_MAT:        // HC, attention, compressor/indexer, FFN, router, output
+        case GGML_OP_ADD:            // expert-probability bias and final HC base
+        case GGML_OP_SOFT_MAX:       // attn_sinks on non-flash attention
+        case GGML_OP_FLASH_ATTN_EXT: // attn_sinks on flash attention
+        //case GGML_OP_MUL_MAT_ID:   // routed expert banks; SPARSE
+        //case GGML_OP_DSV4_HC_COMB: // per-layer HC base/scale; repeated and currently unsupported
             return true;
         default:
             return false;
