@@ -1128,6 +1128,8 @@ void patch_model_refs_for(llama_model * model, ggml_tensor * w_cpu, ggml_tensor 
     SET(model->output_s);
     SET(model->output_in_s);
     SET(model->hc_head_fn);
+    SET(model->hc_head_base);
+    SET(model->hc_head_scale);
 
     SET(model->nextn_proj_pre);
     SET(model->nextn_proj_post);
@@ -1164,6 +1166,7 @@ void patch_model_refs_for(llama_model * model, ggml_tensor * w_cpu, ggml_tensor 
         SET(L.attn_k_norm);      SET(L.attn_k_norm_b);
         SET(L.attn_out_norm);    SET(L.attn_out_norm_b);
         SET(L.attn_q_a_norm);    SET(L.attn_kv_a_norm);
+        SET(L.attn_kv_norm);
         SET(L.attn_sub_norm);    SET(L.attn_post_norm);
         SET(L.ffn_sub_norm);     SET(L.attn_norm_cross);
         SET(L.attn_norm_enc);    SET(L.ssm_norm);
@@ -1196,6 +1199,7 @@ void patch_model_refs_for(llama_model * model, ggml_tensor * w_cpu, ggml_tensor 
 
         // ff MoE
         SET(L.ffn_gate_inp);      SET(L.ffn_gate_inp_s);
+        SET(L.ffn_gate_tid2eid);
         //SET(L.ffn_gate_exps);     SET(L.ffn_down_exps);       //sparse layers are handled separately
         //SET(L.ffn_up_exps);       SET(L.ffn_gate_up_exps);
         SET(L.ffn_gate_inp_b);
@@ -1321,8 +1325,12 @@ void patch_model_refs_for(llama_model * model, ggml_tensor * w_cpu, ggml_tensor 
 
         // DeepSeek V4
         SET(L.hc_attn_fn);       SET(L.hc_ffn_fn);
+        SET(L.hc_attn_base);     SET(L.hc_attn_scale);
+        SET(L.hc_ffn_base);      SET(L.hc_ffn_scale);
         SET(L.attn_comp_wkv);    SET(L.attn_comp_wgate);
+        SET(L.attn_comp_ape);    SET(L.attn_comp_norm);
         SET(L.indexer_comp_wkv); SET(L.indexer_comp_wgate);
+        SET(L.indexer_comp_ape); SET(L.indexer_comp_norm);
 
         // gemma4 layer output scale, reused for talkie embedding skip scale
         SET(L.out_scale);
@@ -2324,10 +2332,11 @@ static bool offloader_weight_is_sparse(const ggml_tensor * weight)
 
 static void print_all_weight_reads(parameter_offloader * po, ggml_cgraph * graph)
 {
-    std::unordered_set<ggml_tensor *> seen;
+    std::unordered_set<std::string> seen;
     int event = 0;
 
-    LLAMA_LOG_INFO("%-6s %-70s %-7s %-7s %-7s\n", "EVENT", "WEIGHT", "REPEAT", "MANAGED", "SPARSE");
+    LLAMA_LOG_INFO("%-6s %-70s %-7s %-7s %-7s %-8s\n",
+        "EVENT", "WEIGHT", "REPEAT", "MANAGED", "SPARSE", "RESIDENT");
 
     for (int i = 0; i < graph->n_nodes; ++i)
     {
@@ -2348,15 +2357,18 @@ static void print_all_weight_reads(parameter_offloader * po, ggml_cgraph * graph
             if (!managed && po->cpu_weight_set.find(weight) == po->cpu_weight_set.end())
                 continue;
 
-            ggml_tensor * cpu_weight = managed ? managed_it->second : weight;
-            const bool repeat = !seen.insert(cpu_weight).second;
-            const bool sparse = offloader_weight_is_sparse(cpu_weight);
+            ggml_tensor * model_weight = managed ? managed_it->second : weight;
+            const char * name = ggml_get_name(model_weight);
+            const bool repeat = !seen.insert(name ? name : "").second;
+            const bool sparse = offloader_weight_is_sparse(model_weight);
+            const char * resident = ggml_backend_buffer_is_host(model_weight->buffer) ? "HOST" : "DEVICE";
 
-            LLAMA_LOG_INFO("%-6d %-70s %-7s %-7s %-7s\n",
-                event++, ggml_get_name(cpu_weight),
+            LLAMA_LOG_INFO("%-6d %-70s %-7s %-7s %-7s %-8s\n",
+                event++, name,
                 repeat ? "YES" : "",
                 managed ? "YES" : "",
-                sparse ? "SPARSE" : "");
+                sparse ? "SPARSE" : "",
+                resident);
         }
     }
 }
