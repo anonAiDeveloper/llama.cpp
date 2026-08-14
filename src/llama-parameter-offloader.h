@@ -61,19 +61,14 @@ public:
         std::vector<ggml_tensor*>             gpu_tensors_in_order;  // feed-order list of GPU twins
         std::unordered_map<ggml_tensor*, int> gpu2index;             // GPU twin -> feed-order index
 
-        std::vector<size_t> start; // arena start offset for each scheduled GPU tensor
-        std::vector<size_t> end;   // arena end offset for each scheduled GPU tensor
-
-        uint64_t generation = 0; // monotonic id for debugging schedule swaps
+        std::vector<size_t> start_offset; // arena start offset for each scheduled GPU tensor
+        std::vector<size_t> end_offset;   // arena end offset for each scheduled GPU tensor
     };
     std::atomic<bool> schedule_swap_requested { false };
-    std::mutex schedule_mu; // protects schedule_current / schedule_next swaps and schedule reads
+    std::mutex schedule_mutex;                    // protects schedule_current / schedule_next swaps and schedule reads
     offloader_schedule schedule_current;          // active schedule used by reader and streamer
     offloader_schedule schedule_next;             // candidate schedule built from latest graph callback
     std::atomic<uint64_t> schedule_generation{0}; // latest published schedule generation
-    size_t schedule_next_prefix  = 0;       // common prefix length between active and candidate schedules
-    bool schedule_next_identical = false;   // candidate schedule exactly matches active schedule
-    bool schedule_next_valid     = false;   // candidate comparison stats are valid
 
     void retarget_schedule_tensors(offloader_schedule & schedule);
 

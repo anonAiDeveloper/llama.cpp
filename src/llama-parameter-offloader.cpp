@@ -934,8 +934,8 @@ void parameter_offloader::init(
 
     // Optional log
     size_t peak = 0;
-    if (!schedule_current.end.empty())
-        peak = *std::max_element(schedule_current.end.begin(), schedule_current.end.end());
+    if (!schedule_current.end_offset.empty())
+        peak = *std::max_element(schedule_current.end_offset.begin(), schedule_current.end_offset.end());
     LLAMA_LOG_INFO("%s: vram-offload: scheduled %zu tensors; peak logical occupancy ~%zu bytes\n", __func__, tensor_count, peak);
 }
 parameter_offloader::~parameter_offloader()
@@ -1572,9 +1572,9 @@ void parameter_offloader::stream_worker()
         bool allowed = false;                 // true when selected copy is inside safe window
 
         {
-            std::lock_guard<std::mutex> schedule_lk(schedule_mu); // blocks schedule swap during copy selection/upload
+            std::lock_guard<std::mutex> schedule_lock(schedule_mutex); // blocks schedule swap during copy selection/upload
 
-            // A swap may have been requested after the check above but before this thread acquired schedule_mu.
+            // A swap may have been requested after the check above but before this thread acquired schedule_mutex.
             if (schedule_swap_requested.load(std::memory_order_acquire))
                 continue;
 
@@ -1784,17 +1784,6 @@ bool llama_offloader_graph_cb(ggml_backend_sched_t sched, struct ggml_cgraph * g
             collect_node_weights(graph->nodes[i]);
     }
 
-    // Candidate schedule has been collected; compare it once against the active schedule.
-    po->schedule_next_prefix = common_prefix_len(
-        po->schedule_current.gpu_tensors_in_order,
-        po->schedule_next.gpu_tensors_in_order);
-
-    po->schedule_next_identical =
-        po->schedule_next_prefix == po->schedule_current.gpu_tensors_in_order.size() &&
-        po->schedule_next_prefix == po->schedule_next.gpu_tensors_in_order.size();
-
-    po->schedule_next_valid = true;
-
     LLAMA_LOG_INFO("%s 2\n", __func__);
 
     const bool schedule_changed = po->swap_next_schedule(); // true if retarget moved tensors for this graph
@@ -1808,17 +1797,18 @@ bool llama_offloader_graph_cb(ggml_backend_sched_t sched, struct ggml_cgraph * g
 
 bool parameter_offloader::swap_next_schedule()
 {
+    // Candidate schedule has been collected; compare it once against the active schedule.
+    const size_t common_prefix_len_ = common_prefix_len(schedule_current.gpu_tensors_in_order, schedule_next.gpu_tensors_in_order);
+    bool schedule_next_identical =
+        common_prefix_len_ == schedule_current.gpu_tensors_in_order.size() &&
+        common_prefix_len_ == schedule_next.gpu_tensors_in_order.size();
+
     long long new_copied_ordinal = -1; // copied ordinal required before graph may start reading
     bool changed = false; // true when a new schedule was published
 
-    GGML_ASSERT(schedule_next_valid);
-
     if (schedule_next_identical)
     {
-        schedule_next_valid = false;
         schedule_next = offloader_schedule{};
-        schedule_next_prefix = 0;
-        schedule_next_identical = false;
 
         return false;
     }
@@ -1828,21 +1818,9 @@ bool parameter_offloader::swap_next_schedule()
     node_cv_.notify_all();
 
     {
-        std::lock_guard<std::mutex> schedule_lk(schedule_mu); // blocks streamer while tensor pointers move
+        std::lock_guard<std::mutex> schedule_lock(schedule_mutex); // blocks streamer while tensor pointers move
         
         LLAMA_LOG_INFO("%s 1\n", __func__);
-
-        /*const bool identical = schedule_next_identical; // true if graph order did not change
-        schedule_next_valid = false;
-
-        //LLAMA_LOG_INFO("%s identical == %d\n", __func__, identical);
-        if (identical)
-        {
-            schedule_next = offloader_schedule{};
-            schedule_next_prefix = 0;
-            schedule_next_identical = false;
-            return false;
-        }*/
 
         //wait for in-flight copies to complete
         {
@@ -1868,10 +1846,11 @@ bool parameter_offloader::swap_next_schedule()
 
         const size_t prefix_limit = std::min(schedule_current.gpu_tensors_in_order.size(), schedule_next.gpu_tensors_in_order.size()); // max prefix to compare
         // prefix that kept same tensor identity and same arena offset
-        for (schedule_next_prefix = 0; schedule_next_prefix < prefix_limit; ++schedule_next_prefix)
+        size_t schedule_reusable_count = 0;
+        for (schedule_reusable_count = 0; schedule_reusable_count < prefix_limit; ++schedule_reusable_count)
         {
-            ggml_tensor * old_gpu = schedule_current.gpu_tensors_in_order[schedule_next_prefix]; // tensor in old schedule prefix
-            ggml_tensor * new_gpu = schedule_next.gpu_tensors_in_order[schedule_next_prefix]; // tensor in new schedule prefix
+            ggml_tensor * old_gpu = schedule_current.gpu_tensors_in_order[schedule_reusable_count]; // tensor in old schedule prefix
+            ggml_tensor * new_gpu = schedule_next.gpu_tensors_in_order[schedule_reusable_count]; // tensor in new schedule prefix
 
             if (old_gpu != new_gpu)
                 break;
@@ -1896,16 +1875,14 @@ bool parameter_offloader::swap_next_schedule()
         if (copied_ahead < 0)
             copied_ahead = 0;
 
-        const long long reusable_copied = std::min((long long)schedule_next_prefix, copied_ahead); // preserved copied prefix count
+        const long long reusable_copied = std::min((long long)schedule_reusable_count, copied_ahead); // preserved copied prefix count
         new_copied_ordinal = reusable_copied - 1; // copied ordinal after schedule swap
 
         std::swap(schedule_current, schedule_next);
 
-        schedule_current.generation = schedule_generation.fetch_add(1, std::memory_order_relaxed) + 1;
+        schedule_generation.fetch_add(1, std::memory_order_relaxed) + 1;
 
         schedule_next = offloader_schedule{};
-        schedule_next_prefix = 0;
-        schedule_next_identical = false;
 
         tensor_idx_copied_ordinal.store(new_copied_ordinal, std::memory_order_release);
         tensor_idx_used_ordinal.store(-1, std::memory_order_release);
@@ -1961,7 +1938,7 @@ bool parameter_offloader::swap_next_schedule()
         print_snapshot(schedule_current);
     }
 
-    // The new schedule is now completely published and schedule_mu is free.
+    // The new schedule is now completely published and schedule_mutex is free.
     schedule_swap_requested.store(false, std::memory_order_release);
     node_cv_.notify_all();
 
@@ -2131,8 +2108,8 @@ void parameter_offloader::build_schedule_gates(offloader_schedule & schedule)
     GGML_ASSERT(schedule.gpu2index.size() == tensor_count);
 
     schedule.ready_after.assign(tensor_count, -1); // post-read maximum copy barrier
-    schedule.start.assign(tensor_count, 0);        // arena start offset for each GPU tensor
-    schedule.end.assign(tensor_count, 0);          // arena end offset for each GPU tensor
+    schedule.start_offset.assign(tensor_count, 0);        // arena start offset for each GPU tensor
+    schedule.end_offset.assign(tensor_count, 0);          // arena end offset for each GPU tensor
 
     if (tensor_count == 0)
         return;
@@ -2150,10 +2127,10 @@ void parameter_offloader::build_schedule_gates(offloader_schedule & schedule)
         const size_t off = (size_t)((char *)t_gpu->data - base); // arena-relative start
         const size_t bytes = ggml_backend_buft_get_alloc_size(buft, t_cpu); // backend padded size
 
-        schedule.start[i] = off;
-        schedule.end[i] = off + bytes;
+        schedule.start_offset[i] = off;
+        schedule.end_offset[i] = off + bytes;
 
-        GGML_ASSERT(schedule.end[i] <= cap);
+        GGML_ASSERT(schedule.end_offset[i] <= cap);
     }
 
     auto overlaps_abs = [](size_t a0, size_t a1, size_t b0, size_t b1) -> bool {
@@ -2173,7 +2150,7 @@ void parameter_offloader::build_schedule_gates(offloader_schedule & schedule)
 
             for (const auto & range : ring_byte_ranges)
             {
-                if (overlaps_abs(range.first, range.second, schedule.start[copy_idx], schedule.end[copy_idx]))
+                if (overlaps_abs(range.first, range.second, schedule.start_offset[copy_idx], schedule.end_offset[copy_idx]))
                 {
                     copy_is_safe = false;
                     break;
@@ -2185,13 +2162,13 @@ void parameter_offloader::build_schedule_gates(offloader_schedule & schedule)
 
             barrier = j;
 
-            if (!ring_byte_ranges.empty() && ring_byte_ranges.back().second <= schedule.start[copy_idx])
+            if (!ring_byte_ranges.empty() && ring_byte_ranges.back().second <= schedule.start_offset[copy_idx])
             {
-                ring_byte_ranges.back().second = schedule.end[copy_idx];
+                ring_byte_ranges.back().second = schedule.end_offset[copy_idx];
             }
             else
             {
-                ring_byte_ranges.emplace_back(schedule.start[copy_idx], schedule.end[copy_idx]);
+                ring_byte_ranges.emplace_back(schedule.start_offset[copy_idx], schedule.end_offset[copy_idx]);
             }
         }
 
