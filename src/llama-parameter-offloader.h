@@ -37,21 +37,18 @@ public:
     // Arena + twin-context
     llama_model*                model;
     const parameter_offloader_model_i * model_i = nullptr; // selected once from model->arch
-    ggml_backend_buffer_t       arena         = nullptr;  // your CUDA arena buffer
-    ggml_context*               ctx_gpu_twins = nullptr;  // no-alloc ctx for duplicated GPU tensors
-    ggml_context*               ctx_moe_cache = nullptr;
-    bool                        owns_arena     = false;
+    ggml_backend_buffer_t       arena           = nullptr; // offloader CUDA arena buffer
+    ggml_context*               ctx_gpu_twins   = nullptr; // no-alloc ctx for duplicated GPU tensors
+    ggml_context*               ctx_moe_cache   = nullptr;
+    bool                        owns_arena      = false;
     int32_t                     moe_cache_n_slots = 0;
 
     // Cached placement info
-    ggml_backend_buffer_type_t  buft  = nullptr;          // ggml_backend_buffer_get_type(arena)
-    char*                       base  = nullptr;          // ggml_backend_buffer_get_base(arena)
-    size_t                      arena_size = 0;           // full arena size
-    size_t                      cap   = 0;                // dense streaming region size
-    size_t                      moe_cache_offset = 0;     // cache tail offset inside arena
-    size_t                      moe_cache_size   = 0;     // cache tail size
-    size_t                      align = 0;                // ggml_backend_buffer_get_alignment(arena)
-    size_t                      cur_off = 0;              // next free offset (bytes) inside arena
+    ggml_backend_buffer_type_t  arena_buffer_type  = nullptr;   // backend type for arena allocation sizing/layout
+    char*                       arena_base  = nullptr;          // byte 0 of arena; offsets are relative to this
+    size_t                      arena_size  = 0;                // full arena size
+    size_t                      arena_dense_size   = 0;         // dense streaming region size
+    size_t                      arena_alignment = 0;            // required byte alignment for arena placement
 
     struct offloader_schedule
     {
@@ -119,7 +116,7 @@ public:
 private:
     void seed_all_weights_from_model();
 
-    ggml_tensor * init_cpu_tensor_to_arena(ggml_tensor * w_cpu);
+    ggml_tensor * init_cpu_tensor_to_arena(ggml_tensor * w_cpu, size_t current_offset);
 
     void attach_arena(ggml_backend_buffer_t arena);
     void clear_moe_cache_refs();

@@ -317,17 +317,16 @@ void parameter_offloader::attach_arena(ggml_backend_buffer_t arena)
 
     this->arena = arena;
 
-    buft       = ggml_backend_buffer_get_type(arena);
-    base       = (char *) ggml_backend_buffer_get_base(arena);
-    arena_size = ggml_backend_buffer_get_size(arena);
-    cap        = arena_size;
-    align      = ggml_backend_buffer_get_alignment(arena);
-    cur_off    = 0;
+    arena_buffer_type = ggml_backend_buffer_get_type(arena);
+    arena_base        = (char *) ggml_backend_buffer_get_base(arena);
+    arena_size        = ggml_backend_buffer_get_size(arena);
+    arena_dense_size  = arena_size;
+    arena_alignment   = ggml_backend_buffer_get_alignment(arena);
 
-    GGML_ASSERT(buft);
-    GGML_ASSERT(base);
+    GGML_ASSERT(arena_buffer_type);
+    GGML_ASSERT(arena_base);
     GGML_ASSERT(arena_size > 0);
-    GGML_ASSERT(align > 0);
+    GGML_ASSERT(arena_alignment > 0);
 }
 
 // Call this *before* transform/upload, i.e. at the top of parameter_offloader::init()
@@ -369,9 +368,9 @@ void parameter_offloader::seed_all_weights_from_model()
             collected_order.push_back(t);
     }
 
-    //LLAMA_LOG_INFO("%s: model->tensors_by_name.size() == %d\n", __func__, model->tensors_by_name.size());
-    //LLAMA_LOG_INFO("%s: named.size() == %d\n", __func__, named.size());
-    LLAMA_LOG_INFO("%s: found %d host-backed weights\n", __func__, collected_order.size());
+    //LLAMA_LOG_INFO("%s: model->tensors_by_name.size() == %lu\n", __func__, model->tensors_by_name.size());
+    //LLAMA_LOG_INFO("%s: named.size() == %lu\n", __func__, named.size());
+    LLAMA_LOG_INFO("%s: found %lu host-backed weights\n", __func__, collected_order.size());
 }
 
 size_t parameter_offloader::transform_all_cpu_weights_to_device_layout()
@@ -694,7 +693,7 @@ void patch_model_refs_for(llama_model * model, ggml_tensor * w_cpu, ggml_tensor 
     }
 }
 
-ggml_tensor * parameter_offloader::init_cpu_tensor_to_arena(ggml_tensor * w_cpu)
+ggml_tensor * parameter_offloader::init_cpu_tensor_to_arena(ggml_tensor * w_cpu, size_t current_offset)
 {
     GGML_ASSERT(ctx_gpu_twins);
     GGML_ASSERT(arena);
@@ -711,26 +710,26 @@ ggml_tensor * parameter_offloader::init_cpu_tensor_to_arena(ggml_tensor * w_cpu)
     }
     
     // Compute padded slot as the backend will expect it on device
-    const size_t slot_bytes = ggml_backend_buft_get_alloc_size(buft, w_cpu);
-    size_t off              = align_up(cur_off, align);
+    const size_t slot_bytes = ggml_backend_buft_get_alloc_size(arena_buffer_type, w_cpu);
+    size_t off              = align_up(current_offset, arena_alignment);
     
-    if (off + slot_bytes > cap)
+    if (off + slot_bytes > arena_dense_size)
         off = 0; // wrap
 
     // starting from current 'off' (possibly just wrapped to 0), bump until unused
-    const size_t bump      = align;                     // step by arena alignment
-    const size_t max_tries = cap / align + 2;          // safety bound
+    const size_t bump      = arena_alignment;                         // step by arena alignment
+    const size_t max_tries = arena_dense_size / arena_alignment + 2;  // safety bound
     size_t tries = 0;
     while (std::any_of(gpu2cpu.begin(), gpu2cpu.end(),
-                [&](const auto &kv) { return kv.first && kv.first->data == static_cast<void*>(base + off); }))
+                [&](const auto &kv) { return kv.first && kv.first->data == static_cast<void*>(arena_base + off); }))
     {
-        off = align_up(off + bump, align);
-        if (off + slot_bytes > cap)
+        off = align_up(off + bump, arena_alignment);
+        if (off + slot_bytes > arena_dense_size)
             off = 0; // wrap again if we ran past the end
         if (++tries > max_tries) {
             LLAMA_LOG_WARN("arena: could not find unique pointer for '%s' "
-                        "(cap=%zu, align=%zu, entries=%zu) — proceeding with overlap\n",
-                        ggml_get_name(w_cpu), cap, align, gpu2cpu.size());
+                        "(arena_dense_size=%zu, arena_alignment=%zu, entries=%zu) — proceeding with overlap\n",
+                        ggml_get_name(w_cpu), arena_dense_size, arena_alignment, gpu2cpu.size());
             break; // fall through; last 'off' may collide but we’ve warned
         }
     }
@@ -740,8 +739,8 @@ ggml_tensor * parameter_offloader::init_cpu_tensor_to_arena(ggml_tensor * w_cpu)
     GGML_ASSERT(w_gpu);
     ggml_set_name(w_gpu, ggml_get_name(w_cpu)); // keep names consistent (optional)
 
-    // Bind GPU twin into the arena at [base + off]
-    GGML_ASSERT(ggml_backend_tensor_alloc(arena, w_gpu, base + off) == GGML_STATUS_SUCCESS);
+    // Bind GPU twin into the arena at [arena_base + off]
+    GGML_ASSERT(ggml_backend_tensor_alloc(arena, w_gpu, arena_base + off) == GGML_STATUS_SUCCESS);
 
     // Upload
     ggml_cuda_copy_event * ev = upload_weight_auto(w_cpu, w_gpu);
@@ -763,7 +762,7 @@ ggml_tensor * parameter_offloader::init_cpu_tensor_to_arena(ggml_tensor * w_cpu)
         schedule_current.ready_after.resize(idx + 1, INT_MAX); // fill later
 
     // Bump arena pointer
-    cur_off = off + slot_bytes;
+    current_offset = off + slot_bytes;
 
     patch_model_refs_for(model, w_cpu, w_gpu);
 
@@ -807,8 +806,9 @@ void parameter_offloader::init(
     LLAMA_LOG_INFO("host-packing: %zu/%zu weights packed on host\n",
                 packed, collected_order.size());
 
+    size_t current_offset = 0;
     for (ggml_tensor * w_cpu : collected_order)
-        (void) init_cpu_tensor_to_arena(w_cpu);
+        (void) init_cpu_tensor_to_arena(w_cpu, current_offset);
 
     //print_model_tensor_stats(model);
 
@@ -826,8 +826,8 @@ void parameter_offloader::init(
             {
                 ggml_tensor *tg = schedule_current.gpu_tensors_in_order[i];
                 ggml_tensor *tc = gpu2cpu.at(tg);
-                start[i] = (size_t)((char*)tg->data - base);
-                len  [i] = ggml_backend_buft_get_alloc_size(buft, tc);
+                start[i] = (size_t)((char*)tg->data - arena_base);
+                len  [i] = ggml_backend_buft_get_alloc_size(arena_buffer_type, tc);
                 endv [i] = start[i] + len[i];
             }
 
@@ -853,12 +853,12 @@ void parameter_offloader::init(
                 const size_t sz = len[k];
 
                 // mid arena, aligned, clamped
-                size_t cand = align_up((cap > sz ? (cap/2 - sz/2) : 0), align);
-                if (cand + sz > cap)
-                    cand = cap - sz;
+                size_t cand = align_up((arena_dense_size > sz ? (arena_dense_size/2 - sz/2) : 0), arena_alignment);
+                if (cand + sz > arena_dense_size)
+                    cand = arena_dense_size - sz;
 
-                const size_t step = align ? align : 1;
-                const size_t max_tries = cap / step + 2;
+                const size_t step = arena_alignment ? arena_alignment : 1;
+                const size_t max_tries = arena_dense_size / step + 2;
 
                 for (size_t tries = 0; tries < max_tries; ++tries)
                 {
@@ -883,14 +883,14 @@ void parameter_offloader::init(
                     if (!clash && unique)
                     {
                         ggml_tensor *w_gpu = schedule_current.gpu_tensors_in_order[k];
-                        w_gpu->data = base + a0;
+                        w_gpu->data = arena_base + a0;
                         ggml_backend_buffer_init_tensor(arena, w_gpu);
                         start[k] = a0; endv[k] = a1;
                         break;
                     }
 
                     cand += step;
-                    if (cand + sz > cap)
+                    if (cand + sz > arena_dense_size)
                         cand = 0; // wrap search
                 }
             }
@@ -1071,12 +1071,12 @@ bool parameter_offloader::wants_observe(ggml_tensor * node)
                             ggml_get_name(src_node)?: "(unnamed)", src_node->data);
             }
 
-            // 2) Does this pointer fall inside your arena’s [base, base+cap)?
+            // 2) Does this pointer fall inside your arena’s [arena_base, arena_base+arena_dense_size)?
             char *q = (char*) src_node->data;
-            if (q && q >= base && q < base + cap) {
+            if (q && q >= arena_base && q < arena_base + arena_dense_size) {
                 LLAMA_LOG_WARN("[ACT-IN-WEIGHT-RANGE] node=%s tens=%s ptr=%p (inside [%p, %p))\n",
                             ggml_get_name(node)?: "(unnamed)",
-                            ggml_get_name(src_node)?: "(unnamed)", src_node->data, base, base + cap);
+                            ggml_get_name(src_node)?: "(unnamed)", src_node->data, arena_base, arena_base + arena_dense_size);
             }
         }
 
@@ -1136,8 +1136,8 @@ bool parameter_offloader::on_eval_tensor(ggml_tensor * node)
     ggml_tensor * w_cpu = gpu2cpu[w_gpu];
 
     const char * name   = ggml_get_name(w_gpu);
-    const size_t off    = (size_t)((char *) w_gpu->data - base);
-    const size_t bytes  = ggml_backend_buft_get_alloc_size(buft, w_cpu);
+    const size_t off    = (size_t)((char *) w_gpu->data - arena_base);
+    const size_t bytes  = ggml_backend_buft_get_alloc_size(arena_buffer_type, w_cpu);
     const size_t nbytes = ggml_nbytes(w_cpu);
 
     const long long old_used_ordinal = tensor_idx_used_ordinal.load(std::memory_order_relaxed);
@@ -1218,7 +1218,7 @@ bool parameter_offloader::on_eval_tensor(ggml_tensor * node)
     }
 
 #ifdef LLAMA_CHECK_WEIGHTS
-    //hash_compare_tensor(w_cpu, w_gpu, base, idx);
+    //hash_compare_tensor(w_cpu, w_gpu, arena_base, idx);
     //if (idx == 606)
     {
         const size_t nbytes_g = ggml_nbytes(w_gpu);
@@ -1392,7 +1392,7 @@ bool llama_offloader_eval_cb(ggml_tensor * node, bool ask, void * ud)
 /////////////////////////////////////
 inline bool parameter_offloader::no_transform_needed_for_backend_(const ggml_tensor *t) const {
     const size_t logical   = ggml_nbytes(t);
-    const size_t dev_bytes = ggml_backend_buft_get_alloc_size(buft, t);
+    const size_t dev_bytes = ggml_backend_buft_get_alloc_size(arena_buffer_type, t);
 
     switch (t->type) {
         case GGML_TYPE_F32:
@@ -1455,7 +1455,7 @@ inline ggml_cuda_copy_event * parameter_offloader::upload_weight_auto(ggml_tenso
     auto it = host_packed_.find(w_cpu);
     if (it != host_packed_.end()) {
         if (ggml_backend_buffer_is_cuda_arena_public(arena)) {
-            const size_t dev_bytes = ggml_backend_buft_get_alloc_size(buft, w_cpu);
+            const size_t dev_bytes = ggml_backend_buft_get_alloc_size(arena_buffer_type, w_cpu);
             ggml_cuda_copy_event * ev = ggml_cuda_copy_event_create(arena);
 
             ggml_cuda_arena_tensor_write_raw_async(arena, w_gpu, it->second.base, dev_bytes, ev);
@@ -1837,7 +1837,7 @@ bool parameter_offloader::swap_next_schedule()
         {
             GGML_ASSERT(w_gpu);
             GGML_ASSERT(w_gpu->data);
-            old_offsets[w_gpu] = (size_t)((char *)w_gpu->data - base);
+            old_offsets[w_gpu] = (size_t)((char *)w_gpu->data - arena_base);
         }
 
         retarget_schedule_tensors(schedule_next);
@@ -1860,7 +1860,7 @@ bool parameter_offloader::swap_next_schedule()
             if (it == old_offsets.end())
                 break;
 
-            const size_t new_offset = (size_t)((char *)new_gpu->data - base); // new offset after retarget
+            const size_t new_offset = (size_t)((char *)new_gpu->data - arena_base); // new offset after retarget
 
             if (it->second != new_offset)
                 break;
@@ -1968,7 +1968,7 @@ void parameter_offloader::retarget_schedule_tensors(offloader_schedule & schedul
     if (tensor_count == 0)
         return;
 
-    const size_t a = align ? align : 1; // alignment used for arena start offsets
+    const size_t a = arena_alignment ? arena_alignment : 1; // alignment used for arena start offsets
 
     size_t cur = 0; // next candidate arena offset
 
@@ -1988,28 +1988,28 @@ void parameter_offloader::retarget_schedule_tensors(offloader_schedule & schedul
         GGML_ASSERT(w_cpu);
         GGML_ASSERT(w_gpu->buffer == arena);
 
-        const size_t slot_bytes = ggml_backend_buft_get_alloc_size(buft, w_cpu); // padded device bytes for this tensor
-        GGML_ASSERT(slot_bytes <= cap);
+        const size_t slot_bytes = ggml_backend_buft_get_alloc_size(arena_buffer_type, w_cpu); // padded device bytes for this tensor
+        GGML_ASSERT(slot_bytes <= arena_dense_size);
 
         size_t off = align_up(cur, a); // candidate arena-relative start offset
 
-        if (off + slot_bytes > cap)
+        if (off + slot_bytes > arena_dense_size)
             off = 0;
 
-        const size_t max_tries = cap / a + 2; // bound for unique-start search
+        const size_t max_tries = arena_dense_size / a + 2; // bound for unique-start search
         size_t tries = 0; // number of alternate starts tried
 
         while (std::find(used_starts.begin(), used_starts.end(), off) != used_starts.end())
         {
             off = align_up(off + a, a);
 
-            if (off + slot_bytes > cap)
+            if (off + slot_bytes > arena_dense_size)
                 off = 0;
 
             GGML_ASSERT(++tries <= max_tries);
         }
 
-        w_gpu->data = base + off;
+        w_gpu->data = arena_base + off;
         ggml_backend_buffer_init_tensor(arena, w_gpu); // refresh backend tensor metadata after moving the arena pointer
 
         used_starts.push_back(off);
@@ -2046,13 +2046,13 @@ void parameter_offloader::retarget_schedule_tensors(offloader_schedule & schedul
 
     const size_t sz = len[k]; // padded size of singleton tail tensor
 
-    size_t cand = align_up((cap > sz ? (cap / 2 - sz / 2) : 0), a); // middle-ish candidate arena offset
+    size_t cand = align_up((arena_dense_size > sz ? (arena_dense_size / 2 - sz / 2) : 0), a); // middle-ish candidate arena offset
 
-    if (cand + sz > cap)
-        cand = cap - sz;
+    if (cand + sz > arena_dense_size)
+        cand = arena_dense_size - sz;
 
     const size_t step = a; // relocation search step
-    const size_t max_tries = cap / step + 2; // relocation search bound
+    const size_t max_tries = arena_dense_size / step + 2; // relocation search bound
 
     for (size_t tries = 0; tries < max_tries; ++tries)
     {
@@ -2084,7 +2084,7 @@ void parameter_offloader::retarget_schedule_tensors(offloader_schedule & schedul
         {
             ggml_tensor * w_gpu = schedule.gpu_tensors_in_order[k]; // singleton tail GPU tensor to relocate
 
-            w_gpu->data = base + a0;
+            w_gpu->data = arena_base + a0;
             ggml_backend_buffer_init_tensor(arena, w_gpu); // refresh backend tensor metadata after moving the arena pointer
 
             start[k] = a0;
@@ -2095,7 +2095,7 @@ void parameter_offloader::retarget_schedule_tensors(offloader_schedule & schedul
 
         cand += step;
 
-        if (cand + sz > cap)
+        if (cand + sz > arena_dense_size)
             cand = 0;
     }
 }
@@ -2124,13 +2124,13 @@ void parameter_offloader::build_schedule_gates(offloader_schedule & schedule)
         GGML_ASSERT(t_gpu && t_gpu->data);
         GGML_ASSERT(t_cpu);
 
-        const size_t off = (size_t)((char *)t_gpu->data - base); // arena-relative start
-        const size_t bytes = ggml_backend_buft_get_alloc_size(buft, t_cpu); // backend padded size
+        const size_t off = (size_t)((char *)t_gpu->data - arena_base); // arena-relative start
+        const size_t bytes = ggml_backend_buft_get_alloc_size(arena_buffer_type, t_cpu); // backend padded size
 
         schedule.start_offset[i] = off;
         schedule.end_offset[i] = off + bytes;
 
-        GGML_ASSERT(schedule.end_offset[i] <= cap);
+        GGML_ASSERT(schedule.end_offset[i] <= arena_dense_size);
     }
 
     auto overlaps_abs = [](size_t a0, size_t a1, size_t b0, size_t b1) -> bool {
@@ -2459,7 +2459,7 @@ void parameter_offloader::init_moe_cache(
         }
     }
 
-    const size_t cache_align = ggml_backend_buft_get_alignment(buft);
+    const size_t cache_align = ggml_backend_buft_get_alignment(arena_buffer_type);
 
     size_t total_size = 0;
 
@@ -2467,7 +2467,7 @@ void parameter_offloader::init_moe_cache(
         total_size = align_up(total_size, cache_align);
         bank.offset = total_size;
 
-        total_size += ggml_backend_buft_get_alloc_size(buft, bank.tensor);
+        total_size += ggml_backend_buft_get_alloc_size(arena_buffer_type, bank.tensor);
     }
 
     total_size = align_up(total_size, cache_align);
@@ -2475,14 +2475,14 @@ void parameter_offloader::init_moe_cache(
     GGML_ASSERT(total_size > 0);
     GGML_ASSERT(total_size < arena_size);
 
-    moe_cache_offset = align_down(arena_size - total_size, cache_align);
-    moe_cache_size   = total_size;
-    cap              = moe_cache_offset;
+    const size_t moe_cache_offset = align_down(arena_size - total_size, cache_align);
+    const size_t moe_cache_size   = total_size;
+    arena_dense_size = moe_cache_offset;
 
-    GGML_ASSERT(cap > 0);
+    GGML_ASSERT(arena_dense_size > 0);
     GGML_ASSERT(moe_cache_offset + moe_cache_size <= arena_size);
 
-    char * cache_base = base + moe_cache_offset;
+    char * cache_base = arena_base + moe_cache_offset;
 
     for (moe_cache_bank_build & bank : banks) {
         GGML_ASSERT(ggml_backend_tensor_alloc(arena, bank.tensor, cache_base + bank.offset) == GGML_STATUS_SUCCESS);
@@ -2502,7 +2502,7 @@ void parameter_offloader::init_moe_cache(
     moe_cache_n_slots = n_slots;
 
     LLAMA_LOG_INFO("%s: reserved %zu bytes at arena offset %zu for %zu routed MoE cache banks with %d slots each; %zu bytes remain for dense streaming\n",
-        __func__, moe_cache_size, moe_cache_offset, banks.size(), n_slots, cap);
+        __func__, moe_cache_size, moe_cache_offset, banks.size(), n_slots, arena_dense_size);
 }
 
 // TODO: This is a proof-of-concept test function.
@@ -2653,12 +2653,12 @@ void parameter_offloader::print_snapshot(offloader_schedule & schedule)
         GGML_ASSERT(t_gpu && t_gpu->data);
         ggml_tensor *t_cpu = gpu2cpu.at(t_gpu);
 
-        const size_t off   = (size_t)((char*)t_gpu->data - base);              // arena-relative
-        const size_t bytes = ggml_backend_buft_get_alloc_size(buft, t_cpu);    // padded size
+        const size_t off   = (size_t)((char*)t_gpu->data - arena_base);                  // arena-relative
+        const size_t bytes = ggml_backend_buft_get_alloc_size(arena_buffer_type, t_cpu); // padded size
 
         start[i] = off;
         end[i]   = off + bytes;
-        GGML_ASSERT(end[i] <= cap);
+        GGML_ASSERT(end[i] <= arena_dense_size);
     }
 
     for (int i = 0; i < tensor_count; ++i)
