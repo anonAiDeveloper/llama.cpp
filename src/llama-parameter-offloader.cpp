@@ -87,27 +87,27 @@ static bool parameter_offloader_deepseek2_weight_supported(const std::string & n
 {
     return
         offloader_name_ends(name, ".attn_norm.weight")      || // RMSNorm scale before attention block; 1D vector applied to residual stream before Q/K/V work
-        offloader_name_ends(name, ".attn_q_a.weight")       ||   // First low-rank Q projection: hidden -> q_lora_rank before q_a_norm/q_b
+        offloader_name_ends(name, ".attn_q_a.weight")       || // First low-rank Q projection: hidden -> q_lora_rank before q_a_norm/q_b
         offloader_name_ends(name, ".attn_q_a_norm.weight")  || // RMSNorm scale on low-rank Q activation between q_a and q_b; 1D vector
-        offloader_name_ends(name, ".attn_q_b.weight")       ||   // Second low-rank Q projection: q_lora_rank -> full per-head Q
-        offloader_name_ends(name, ".attn_k_b.weight")       ||   // MLA absorbed K projection used after KV compression in MLA path
-        offloader_name_ends(name, ".attn_kv_a_mqa.weight")  ||   // Shared KV compression projection: hidden -> kv_lora_rank + rope K part
+        offloader_name_ends(name, ".attn_q_b.weight")       || // Second low-rank Q projection: q_lora_rank -> full per-head Q
+        offloader_name_ends(name, ".attn_k_b.weight")       || // MLA absorbed K projection used after KV compression in MLA path
+        offloader_name_ends(name, ".attn_kv_a_mqa.weight")  || // Shared KV compression projection: hidden -> kv_lora_rank + rope K part
         offloader_name_ends(name, ".attn_kv_a_norm.weight") || // RMSNorm scale on compressed KV activation before K/V expansion; 1D vector
-        offloader_name_ends(name, ".attn_v_b.weight")       ||   // MLA absorbed V projection used by attention output path
+        offloader_name_ends(name, ".attn_v_b.weight")       || // MLA absorbed V projection used by attention output path
         offloader_name_ends(name, ".attn_kv_b.weight")      || // Legacy unsplit KV expansion tensor for older/non-MLA GGUFs; replaces separate k_b/v_b
-        offloader_name_ends(name, ".attn_output.weight")    ||   // Attention output projection back to model hidden size
+        offloader_name_ends(name, ".attn_output.weight")    || // Attention output projection back to model hidden size
         offloader_name_ends(name, ".ffn_norm.weight")       || // RMSNorm scale before FFN/MoE block; 1D vector
-        offloader_name_ends(name, ".ffn_gate.weight")       ||   // Dense-layer FFN gate projection for leading non-MoE layers
-        offloader_name_ends(name, ".ffn_up.weight")         ||   // Dense-layer FFN up projection for leading non-MoE layers
-        offloader_name_ends(name, ".ffn_down.weight")       ||   // Dense-layer FFN down projection for leading non-MoE layers
-        offloader_name_ends(name, ".ffn_gate_inp.weight")   ||   // MoE router/gating projection: hidden -> expert scores
+        offloader_name_ends(name, ".ffn_gate.weight")       || // Dense-layer FFN gate projection for leading non-MoE layers
+        offloader_name_ends(name, ".ffn_up.weight")         || // Dense-layer FFN up projection for leading non-MoE layers
+        offloader_name_ends(name, ".ffn_down.weight")       || // Dense-layer FFN down projection for leading non-MoE layers
+        offloader_name_ends(name, ".ffn_gate_inp.weight")   || // MoE router/gating projection: hidden -> expert scores
         offloader_name_ends(name, ".exp_probs_b.bias")      || // Optional MoE expert-score/probability bias; 1D vector over experts
-        //offloader_name_ends(name, ".ffn_down_exps.weight")  || // Routed MoE expert-bank down matrices; packed per expert
-        //offloader_name_ends(name, ".ffn_gate_exps.weight")  || // Routed MoE expert-bank gate matrices; packed per expert
-        //offloader_name_ends(name, ".ffn_up_exps.weight")    || // Routed MoE expert-bank up matrices; packed per expert
-        offloader_name_ends(name, ".ffn_gate_shexp.weight") ||   // Shared expert FFN gate projection; always used, not routed by top-k
-        offloader_name_ends(name, ".ffn_up_shexp.weight")   ||   // Shared expert FFN up projection; always used, not routed by top-k
-        offloader_name_ends(name, ".ffn_down_shexp.weight") ||   // Shared expert FFN down projection; always used, not routed by top-k
+        //offloader_name_ends(name, ".ffn_down_exps.weight")  || // SPARSE: Routed MoE expert-bank down matrices; packed per expert
+        //offloader_name_ends(name, ".ffn_gate_exps.weight")  || // SPARSE: Routed MoE expert-bank gate matrices; packed per expert
+        //offloader_name_ends(name, ".ffn_up_exps.weight")    || // SPARSE: Routed MoE expert-bank up matrices; packed per expert
+        offloader_name_ends(name, ".ffn_gate_shexp.weight") || // Shared expert FFN gate projection; always used, not routed by top-k
+        offloader_name_ends(name, ".ffn_up_shexp.weight")   || // Shared expert FFN up projection; always used, not routed by top-k
+        offloader_name_ends(name, ".ffn_down_shexp.weight") || // Shared expert FFN down projection; always used, not routed by top-k
         name == "token_embd.weight"                         ||
         name == "output_norm.weight"                        ||   // Final RMSNorm scale before logits
         name == "output.weight";                                 // LM head / output projection from hidden state to vocabulary logits
@@ -2004,7 +2004,7 @@ bool parameter_offloader::swap_next_schedule()
             ++copied_ordinal;
             tensor_idx_copied_ordinal.store(copied_ordinal, std::memory_order_release);
         }
-        
+
         const long long startup_copied_ordinal = tensor_idx_copied_ordinal.load(std::memory_order_acquire);
         GGML_ASSERT(startup_copied_ordinal >= startup_copy_idx);
     #endif /* defined(LLAMA_DIAGNOSE_COPY) */
