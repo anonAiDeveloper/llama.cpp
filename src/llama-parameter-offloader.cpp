@@ -155,8 +155,8 @@ static bool parameter_offloader_deepseek4_weight_supported(const std::string & n
     return
         name == "token_embd.weight"                                ||   // Token embedding
         offloader_name_ends(name, ".hc_attn_fn.weight")            ||   // Hyperconnection projection before attention
-        //offloader_name_ends(name, ".hc_attn_base.weight")        ||   // HC attention base stores pre[hc], post[hc], and comb[hc*hc] affine biases.
-        //offloader_name_ends(name, ".hc_attn_scale.weight")       ||   // HC attention scale stores separate pre, post, and comb affine scales.
+        offloader_name_ends(name, ".hc_attn_base.weight")          ||   // HC attention base stores pre[hc], post[hc], and comb[hc*hc] affine biases.
+        offloader_name_ends(name, ".hc_attn_scale.weight")         ||   // HC attention scale stores separate pre, post, and comb affine scales.
         offloader_name_ends(name, ".attn_norm.weight")             ||   // Attention RMSNorm
         offloader_name_ends(name, ".attn_sinks.weight")            ||   // Attention sinks
         offloader_name_ends(name, ".attn_q_a.weight")              ||   // First low-rank Q projection
@@ -170,15 +170,15 @@ static bool parameter_offloader_deepseek4_weight_supported(const std::string & n
         offloader_name_ends(name, ".attn_compressor_norm.weight")  ||   // Compressed-attention RMSNorm
         offloader_name_ends(name, ".indexer_compressor_kv.weight") ||   // Indexer-state KV projection
         offloader_name_ends(name, ".indexer_compressor_gate.weight") || // Indexer-state score projection
-        offloader_name_ends(name, ".indexer_compressor_ape.weight") ||  // Indexer positional table
+        offloader_name_ends(name, ".indexer_compressor_ape.weight")  || // Indexer positional table
         offloader_name_ends(name, ".indexer_compressor_norm.weight") || // Indexer RMSNorm
         offloader_name_ends(name, ".indexer.attn_q_b.weight")      ||   // LID query projection
         offloader_name_ends(name, ".indexer.proj.weight")          ||   // LID weight projection
         offloader_name_ends(name, ".attn_output_a.weight")         ||   // Attention output projection A
         offloader_name_ends(name, ".attn_output_b.weight")         ||   // Attention output projection B
         offloader_name_ends(name, ".hc_ffn_fn.weight")             ||   // Hyperconnection projection before FFN
-        //offloader_name_ends(name, ".hc_ffn_base.weight")         ||   // HC FFN base stores pre[hc], post[hc], and comb[hc*hc] affine biases.
-        //offloader_name_ends(name, ".hc_ffn_scale.weight")        ||   // HC FFN scale stores separate pre, post, and comb affine scales.
+        offloader_name_ends(name, ".hc_ffn_base.weight")           ||   // HC FFN base stores pre[hc], post[hc], and comb[hc*hc] affine biases.
+        offloader_name_ends(name, ".hc_ffn_scale.weight")          ||   // HC FFN scale stores separate pre, post, and comb affine scales.
         offloader_name_ends(name, ".ffn_norm.weight")              ||   // FFN RMSNorm
         offloader_name_ends(name, ".ffn_gate_inp.weight")          ||   // Dense MoE router projection
         offloader_name_ends(name, ".ffn_gate_tid2eid.weight")      ||   // Hash-router token-to-expert table
@@ -1140,18 +1140,34 @@ bool parameter_offloader::on_eval_tensor(ggml_tensor * node)
     const size_t bytes  = ggml_backend_buft_get_alloc_size(arena_buffer_type, w_cpu);
     const size_t nbytes = ggml_nbytes(w_cpu);
 
-    const long long old_used_ordinal = tensor_idx_used_ordinal.load(std::memory_order_relaxed);
-    const long long used_ordinal = advance_ordinal_to_idx(old_used_ordinal, idx, tensor_count);
+    long long used_ordinal = tensor_idx_used_ordinal.load(std::memory_order_relaxed);
+    bool gate_advanced = false;
 
-    tensor_idx_used_ordinal.store(used_ordinal, std::memory_order_release);
+    for (int i = 0; i < tensor_count; ++i)
+    {
+        const int release_idx = ordinal_mod(used_ordinal + 1, tensor_count);
+        if (schedule_current.read_last_node[release_idx] != node)
+            break;
 
-    // wake streamer
-    node_cv_.notify_all();
+        ++used_ordinal;
+        gate_advanced = true;
+    }
+
+    if (gate_advanced)
+    {
+        tensor_idx_used_ordinal.store(used_ordinal, std::memory_order_release);
+
+        // wake streamer
+        node_cv_.notify_all();
+    }
 
     // Verbose, but super handy while tuning:
 #ifdef LLAMA_LOG_READS
     LLAMA_LOG_INFO("[R.%d]", idx);
 #endif
+
+    auto read_next_it = schedule_current.read_next.find(node);
+    const long long needed_copy_ordinal = read_next_it != schedule_current.read_next.end() ? advance_ordinal_to_idx(used_ordinal, read_next_it->second, tensor_count) : -1;
 
 #if defined(LLAMA_DIAGNOSE_COPY)
     auto ring_dist = [&](int from, int to) -> int {
@@ -1167,12 +1183,12 @@ bool parameter_offloader::on_eval_tensor(ggml_tensor * node)
         const int i = ordinal_mod(copied_ordinal + 1, tensor_count);
 
         {
-            const int r_idx = ordinal_mod(cur_used_ordinal, tensor_count); // current reader index
+            const int r_idx = cur_used_ordinal < 0 ? tensor_count - 1 : ordinal_mod(cur_used_ordinal, tensor_count); // current reader index
             const int bar   = schedule_current.ready_after[r_idx];         // last copyable index while r is read
             const int di    = ring_dist(r_idx, i);                         // distance from reader to copy slot
             const int dbar  = ring_dist(r_idx, bar);                       // distance from reader to barrier
 
-            bool allowed = (di <= dbar) && (di <= LLAMA_DIAGNOSE_COPY);
+            bool allowed = (di <= dbar) && (di <= LLAMA_DIAGNOSE_COPY || copied_ordinal < needed_copy_ordinal);
 
             if (!allowed)
                 break;
@@ -1197,23 +1213,25 @@ bool parameter_offloader::on_eval_tensor(ggml_tensor * node)
     }
 #endif /* defined(LLAMA_DIAGNOSE_COPY) */
     
-    long long cur_copied_ordinal = tensor_idx_copied_ordinal.load(std::memory_order_acquire);
-    const long long needed_copy_ordinal = used_ordinal + 1; // +1 because we're in post-compute and need the next one
-
-    if (cur_copied_ordinal < needed_copy_ordinal)
+    if (read_next_it != schedule_current.read_next.end())
     {
-    #if LLAMA_LOG_READS > 1
-        LLAMA_LOG_INFO("[RB.%d.%lld.%lld.%lld]",
-                       idx, cur_copied_ordinal, needed_copy_ordinal, used_ordinal);
-    #endif
-        std::unique_lock<std::mutex> lk(node_mu_);
-        node_cv_.wait(lk, [&]{
-            return stop_stream.load(std::memory_order_acquire) ||
-                   tensor_idx_copied_ordinal.load(std::memory_order_acquire) >= needed_copy_ordinal;
-        });
-        if (stop_stream.load(std::memory_order_acquire)) {
-            // shutting down; don't block compute
-            return false;
+        long long cur_copied_ordinal = tensor_idx_copied_ordinal.load(std::memory_order_acquire);
+
+        if (cur_copied_ordinal < needed_copy_ordinal)
+        {
+        #if LLAMA_LOG_READS > 1
+            LLAMA_LOG_INFO("[RB.%d.%lld.%lld.%lld]",
+                           idx, cur_copied_ordinal, needed_copy_ordinal, used_ordinal);
+        #endif
+            std::unique_lock<std::mutex> lk(node_mu_);
+            node_cv_.wait(lk, [&]{
+                return stop_stream.load(std::memory_order_acquire) ||
+                       tensor_idx_copied_ordinal.load(std::memory_order_acquire) >= needed_copy_ordinal;
+            });
+            if (stop_stream.load(std::memory_order_acquire)) {
+                // shutting down; don't block compute
+                return false;
+            }
         }
     }
 
@@ -1722,9 +1740,16 @@ bool llama_offloader_graph_cb(ggml_backend_sched_t sched, struct ggml_cgraph * g
     po->schedule_next = parameter_offloader::offloader_schedule{};
     po->collect_seen.clear();
 
-    auto collect_node_weights = [&](ggml_tensor * node) {
+    std::vector<int> read_last_position;
+    ggml_tensor * previous_read_node = nullptr;
+    int first_read_idx = -1;
+
+    auto collect_node_weights = [&](ggml_tensor * node, int graph_idx) {
         if (!po->model_i->node_may_read_dense_weight(node))
             return;
+
+        bool node_reads_managed_weight = false;
+        int node_first_read_idx = -1;
 
         for (int k = 0; k < GGML_MAX_SRC; ++k) {
             ggml_tensor * w_gpu = node->src[k];
@@ -1738,18 +1763,37 @@ bool llama_offloader_graph_cb(ggml_backend_sched_t sched, struct ggml_cgraph * g
             if (po->gpu_weight_set.find(w_gpu) == po->gpu_weight_set.end())
                 continue;
 
-            if (!po->collect_seen.insert(w_gpu).second) {
-                const char * duplicate_name = ggml_get_name(w_gpu);
-                throw std::runtime_error(std::string("duplicate weight in graph schedule: ") + (duplicate_name ? duplicate_name : "(unnamed)"));
+            node_reads_managed_weight = true;
+
+            int idx = -1;
+
+            if (po->collect_seen.insert(w_gpu).second) {
+                idx = (int) po->schedule_next.gpu_tensors_in_order.size();
+                ggml_tensor * w_cpu = po->gpu2cpu.at(w_gpu);
+
+                po->schedule_next.gpu_tensors_in_order.push_back(w_gpu);
+                po->schedule_next.cpu_tensors_in_order.push_back(w_cpu);
+                po->schedule_next.gpu2index.emplace(w_gpu, idx);
+                po->schedule_next.read_last_node.push_back(node);
+                read_last_position.push_back(graph_idx);
+                node_first_read_idx = idx;
+            } else {
+                idx = po->schedule_next.gpu2index.at(w_gpu);
+                po->schedule_next.read_last_node[idx] = node;
+                read_last_position[idx] = graph_idx;
             }
-
-            const int idx = (int) po->schedule_next.gpu_tensors_in_order.size();
-            ggml_tensor * w_cpu = po->gpu2cpu.at(w_gpu);
-
-            po->schedule_next.gpu_tensors_in_order.push_back(w_gpu);
-            po->schedule_next.cpu_tensors_in_order.push_back(w_cpu);
-            po->schedule_next.gpu2index.emplace(w_gpu, idx);
         }
+
+        if (!node_reads_managed_weight)
+            return;
+
+        if (first_read_idx < 0)
+            first_read_idx = node_first_read_idx;
+
+        if (previous_read_node && node_first_read_idx >= 0)
+            po->schedule_next.read_next[previous_read_node] = node_first_read_idx;
+
+        previous_read_node = node;
     };
 
 #if PO_GRAPH_FILTER_BY_BACKEND > 0
@@ -1772,7 +1816,7 @@ bool llama_offloader_graph_cb(ggml_backend_sched_t sched, struct ggml_cgraph * g
 
         // Walk the original graph nodes covered by this split
         for (int j = sp.i_start; j < sp.i_end; ++j)
-            collect_node_weights(graph->nodes[j]);
+            collect_node_weights(graph->nodes[j], j);
     }
 
     // If nothing matched (e.g., you compiled out impl access), fall back to walking the full graph:
@@ -1781,7 +1825,24 @@ bool llama_offloader_graph_cb(ggml_backend_sched_t sched, struct ggml_cgraph * g
     {
         // Simple, robust fallback: walk the whole graph in topo order
         for (int i = 0; i < graph->n_nodes; ++i)
-            collect_node_weights(graph->nodes[i]);
+            collect_node_weights(graph->nodes[i], i);
+    }
+
+    if (previous_read_node && first_read_idx >= 0)
+        po->schedule_next.read_next[previous_read_node] = first_read_idx;
+
+    int release_position = -1;
+    ggml_tensor * release_node = nullptr;
+
+    for (size_t i = 0; i < po->schedule_next.read_last_node.size(); ++i)
+    {
+        if (read_last_position[i] > release_position)
+        {
+            release_position = read_last_position[i];
+            release_node = po->schedule_next.read_last_node[i];
+        }
+
+        po->schedule_next.read_last_node[i] = release_node;
     }
 
     LLAMA_LOG_INFO("%s 2\n", __func__);
@@ -1804,10 +1865,15 @@ bool parameter_offloader::swap_next_schedule()
         common_prefix_len_ == schedule_next.gpu_tensors_in_order.size();
 
     long long new_copied_ordinal = -1; // copied ordinal required before graph may start reading
+    int startup_copy_idx = 0; // furthest first-read weight required by the first managed node
     bool changed = false; // true when a new schedule was published
 
     if (schedule_next_identical)
     {
+        // TODO: If a future model's first node requires the second scheduled weight, there is an unresolved startup-read bug here.
+        // Fix by ensuring the new schedule's first-node copy requirement is satisfied before returning from the schedule_next_identical path.
+        std::swap(schedule_current.read_last_node, schedule_next.read_last_node);
+        std::swap(schedule_current.read_next,      schedule_next.read_next);
         schedule_next = offloader_schedule{};
 
         return false;
@@ -1880,6 +1946,13 @@ bool parameter_offloader::swap_next_schedule()
 
         std::swap(schedule_current, schedule_next);
 
+        if (!schedule_current.read_last_node.empty())
+        {
+            auto it = schedule_current.read_next.find(schedule_current.read_last_node.back());
+            if (it != schedule_current.read_next.end())
+                startup_copy_idx = it->second;
+        }
+
         schedule_generation.fetch_add(1, std::memory_order_relaxed) + 1;
 
         schedule_next = offloader_schedule{};
@@ -1903,12 +1976,12 @@ bool parameter_offloader::swap_next_schedule()
             const int i = ordinal_mod(copied_ordinal + 1, tensor_count);
 
             {
-                const int r_idx = ordinal_mod(cur_used_ordinal, tensor_count); // current reader index
+                const int r_idx = cur_used_ordinal < 0 ? tensor_count - 1 : ordinal_mod(cur_used_ordinal, tensor_count); // current reader index
                 const int bar   = schedule_current.ready_after[r_idx];         // last copyable index while r is read
                 const int di    = ring_dist(r_idx, i);                         // distance from reader to copy slot
                 const int dbar  = ring_dist(r_idx, bar);                       // distance from reader to barrier
 
-                bool allowed = (di <= dbar) && (di <= LLAMA_DIAGNOSE_COPY);
+                bool allowed = (di <= dbar) && (di <= LLAMA_DIAGNOSE_COPY || copied_ordinal < startup_copy_idx);
 
                 if (!allowed)
                     break;
@@ -1931,6 +2004,9 @@ bool parameter_offloader::swap_next_schedule()
             ++copied_ordinal;
             tensor_idx_copied_ordinal.store(copied_ordinal, std::memory_order_release);
         }
+        
+        const long long startup_copied_ordinal = tensor_idx_copied_ordinal.load(std::memory_order_acquire);
+        GGML_ASSERT(startup_copied_ordinal >= startup_copy_idx);
     #endif /* defined(LLAMA_DIAGNOSE_COPY) */
 
         changed = true;
@@ -1944,16 +2020,16 @@ bool parameter_offloader::swap_next_schedule()
 
     //TODO: This must block if we don't have the first tensor copied into the new schedule. If the first schedule changed between schedules, this should always fire
 #if !defined(LLAMA_DIAGNOSE_COPY)
-    if (new_copied_ordinal < 0)
+    if (new_copied_ordinal < startup_copy_idx)
     {
     #if LLAMA_LOG_READS > 1
         const long long cur_copied_ordinal = tensor_idx_copied_ordinal.load(std::memory_order_acquire); // copied ordinal after publishing schedule
-        LLAMA_LOG_INFO("[RB.%d.%lld.%lld.%lld]", 0, cur_copied_ordinal, new_copied_ordinal, (long long)-1);
+        LLAMA_LOG_INFO("[RB.%d.%lld.%lld.%lld]", startup_copy_idx, cur_copied_ordinal, (long long)startup_copy_idx, (long long)-1);
     #endif
 
         std::unique_lock<std::mutex> lk(node_mu_);
         node_cv_.wait(lk, [&]{
-            return stop_stream.load(std::memory_order_acquire) || tensor_idx_copied_ordinal.load(std::memory_order_acquire) >= 0;
+            return stop_stream.load(std::memory_order_acquire) || tensor_idx_copied_ordinal.load(std::memory_order_acquire) >= startup_copy_idx;
         });
     }
 #endif

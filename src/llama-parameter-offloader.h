@@ -60,6 +60,8 @@ public:
 
         std::vector<size_t> start_offset; // arena start offset for each scheduled GPU tensor
         std::vector<size_t> end_offset;   // arena end offset for each scheduled GPU tensor
+        std::vector<ggml_tensor*> read_last_node;             // per schedule index: node at which this schedule position may be released. Usually, not always, the last instance of it being read
+        std::unordered_map<ggml_tensor*, int> read_next;      // node -> next schedule index when the immediately following read is a first read
     };
     std::atomic<bool> schedule_swap_requested { false };
     std::mutex schedule_mutex;                    // protects schedule_current / schedule_next swaps and schedule reads
