@@ -47,7 +47,8 @@ public:
     ggml_backend_buffer_type_t  arena_buffer_type  = nullptr;   // backend type for arena allocation sizing/layout
     char*                       arena_base  = nullptr;          // byte 0 of arena; offsets are relative to this
     size_t                      arena_size  = 0;                // full arena size
-    size_t                      arena_dense_size   = 0;         // dense streaming region size
+    size_t                      arena_dense_size   = 0;         // dense region size; static storage ends here
+    size_t                      arena_stream_size  = 0;         // dense streaming region size
     size_t                      arena_alignment = 0;            // required byte alignment for arena placement
 
     struct offloader_schedule
@@ -69,9 +70,22 @@ public:
     offloader_schedule schedule_next;             // candidate schedule built from latest graph callback
     std::atomic<uint64_t> schedule_generation{0}; // latest published schedule generation
 
+    // Cached no-halt fit and exact offsets for a streamed tensor set + managed read pattern.
+    struct streaming_fit_cache_entry
+    {
+        std::vector<ggml_tensor*> gpu_tensors_in_order;
+        std::vector<int> read_signature;
+        size_t streaming_size = 0;
+        std::vector<size_t> offsets;
+    };
+    std::unordered_map<uint64_t, std::vector<streaming_fit_cache_entry>> streaming_fit_cache;
+    uint64_t streaming_fit_cache_current_hash = 0;
+    int streaming_fit_cache_current = -1;
+
+    size_t generate_streaming_fit(const offloader_schedule & schedule, const ggml_cgraph * graph);
     void retarget_schedule_tensors(offloader_schedule & schedule);
 
-    bool swap_next_schedule(); // swaps after retargeting and gate build
+    bool swap_next_schedule(size_t streaming_fit); // swaps after retargeting and gate build
 
     void build_schedule_gates(offloader_schedule & schedule); // compute copy barriers
 
