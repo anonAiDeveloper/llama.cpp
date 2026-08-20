@@ -247,7 +247,7 @@ static bool parameter_offloader_deepseek4_node_may_read_dense_weight(const ggml_
         case GGML_OP_SOFT_MAX:       // attn_sinks on non-flash attention
         case GGML_OP_FLASH_ATTN_EXT: // attn_sinks on flash attention
         //case GGML_OP_MUL_MAT_ID:   // routed expert banks; SPARSE
-        //case GGML_OP_DSV4_HC_COMB: // per-layer HC base/scale; repeated and currently unsupported
+        case GGML_OP_DSV4_HC_COMB:   // per-layer HC base/scale; repeated and currently unsupported
             return true;
         default:
             return false;
