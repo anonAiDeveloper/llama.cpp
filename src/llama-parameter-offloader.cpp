@@ -22,6 +22,7 @@
 /////////////////////////////////////
 //   DEBUGGING SWITCHES
 /////////////////////////////////////
+//Uncomment LLAMA_DIAGNOSE_COPY to run copy/read synchronously
 //Set this number to the max number of copies ahead you want to allow
 //#define LLAMA_DIAGNOSE_COPY 9999
 //#define LLAMA_DIAGNOSE_COPY 1
@@ -55,6 +56,19 @@ static inline size_t align_up(size_t x, size_t a)
 static inline size_t align_down(size_t x, size_t a)
 {
     return x & ~(a - 1);
+}
+
+static inline bool ranges_overlap(size_t a0, size_t a1, size_t b0, size_t b1)
+{
+    return !(a1 <= b0 || b1 <= a0);
+}
+
+static inline void update_next_size_event(size_t arena_size, size_t required_size, size_t alignment, size_t & next_size_event)
+{
+    required_size = align_up(required_size, alignment);
+
+    if (required_size > arena_size)
+        next_size_event = std::min(next_size_event, required_size);
 }
 
 static inline int ordinal_mod(long long ordinal, int n)
@@ -847,10 +861,6 @@ void parameter_offloader::init(
                 const int prev = (k - 1 + (int)tensor_count) % (int)tensor_count;
                 const int next = (k + 1) % (int)tensor_count;
 
-                auto overlaps = [](size_t a0, size_t a1, size_t b0, size_t b1) -> bool {
-                    return !(a1 <= b0 || b1 <= a0);
-                };
-
                 const size_t sz = len[k];
 
                 // mid arena, aligned, clamped
@@ -866,8 +876,8 @@ void parameter_offloader::init(
                     const size_t a0 = cand;
                     const size_t a1 = cand + sz;
                     const bool clash =
-                        overlaps(a0, a1, start[prev], endv[prev]) ||
-                        overlaps(a0, a1, start[next], endv[next]);
+                        ranges_overlap(a0, a1, start[prev], endv[prev]) ||
+                        ranges_overlap(a0, a1, start[next], endv[next]);
 
                     bool unique = true;
                     if (!clash)
@@ -1858,31 +1868,55 @@ bool llama_offloader_graph_cb(ggml_backend_sched_t sched, struct ggml_cgraph * g
     return true;
 }
 
-// Generate and cache the minimum no-halt streaming arena size and a valid fixed offset for every streamed tensor.
-// The minimum is the smallest layout that keeps each tensor resident from its prefetch point through its reusable point.
+// Generate and cache a compact no-halt streaming arena size and a valid fixed offset for every streamed tensor.
+// Graph nodes are used only to derive tensor read lifetimes; placement itself is entirely tensor based.
+
+/*
+ *   generate_streaming_fit generates and caches the smallest required size for the streaming area that allows
+ * tensor prefetching without halting.
+ * 
+ * unique pointer addresses -   Each tensor will be given a unique address, to avoid
+ *                            any unforseen conflicts that may depend on pointer uninqueness.
+ *
+ * lower-bound -   The lower bound of the streaming area size is equal to the largest requirement
+ *               across TWO consecutive streamed read positions, plus any unavoidable start-offset displacement.
+ *
+ * upper-bound -   The upper bound of the required area is equal to the largest requirement across
+ *               THREE consecutive streamed read positions, plus any unavoidable start-offset displacement.
+ *
+ * fragmentation problem -   Consider the following tensors in a size 10 arena:
+ *                         A [0,6)             B [6,10)
+ *                         C [0,2)   D [2,4)   Z [4,8)
+ *
+ *                           A would be prefetched Z is being read, but this configuration would cause a COPY HALT
+ *                         as Z and A overlap the same area in memory. Z must be released before A can be copied,
+ *                         and because copy is usually the bottleneck this exacerbates said bottleneck. Moving
+ *                         Z to [6, 10) solves this issue, but such an easy solution may not always be easy to find.
+ */
+
 size_t parameter_offloader::generate_streaming_fit(const offloader_schedule & schedule, const ggml_cgraph * graph)
 {
+    static constexpr size_t MAX_REPAIR_TENSORS_BACK = 30;
+    static constexpr size_t MAX_REPAIR_STATES = 4096;
+    static constexpr size_t MAX_REPAIR_CANDIDATES = 8;
+
     const size_t tensor_count = schedule.cpu_tensors_in_order.size();
     const size_t alignment = arena_alignment ? arena_alignment : 1;
 
-    // TODO: remove these asserts after initial testing.
-    GGML_ASSERT(graph);
-    GGML_ASSERT(schedule.gpu_tensors_in_order.size() == tensor_count);
-    GGML_ASSERT(schedule.gpu2index.size() == tensor_count);
-
     if (tensor_count == 0)
     {
-        streaming_fit_cache_current_hash = 0;
-        streaming_fit_cache_current = -1;
+        streaming_fit_selected_hash = 0;
+        streaming_fit_selected = -1;
         return 0;
     }
+
+///////////////////////       BUILD STREAMED READ TIMELINE       ///////////////////////
 
     std::vector<std::vector<int>> managed_node_reads;
     std::vector<int> read_signature;
 
-    // Walk the graph once to record only nodes that read at least one currently
-    // streamed tensor. Static-only nodes are deliberately omitted so consecutive
-    // streamed reads remain adjacent in the streaming timeline.
+    // Walk the graph once to record only nodes that read at least one currently streamed tensor.
+    // Static-only nodes are deliberately omitted so consecutive streamed reads remain adjacent in the streaming timeline.
     for (int i = 0; i < graph->n_nodes; ++i)
     {
         ggml_tensor * node = graph->nodes[i];
@@ -1905,8 +1939,7 @@ size_t parameter_offloader::generate_streaming_fit(const offloader_schedule & sc
             while (source->view_src)
                 source = source->view_src;
 
-            std::unordered_map<ggml_tensor *, int>::const_iterator index_it =
-                schedule.gpu2index.find(source);
+            std::unordered_map<ggml_tensor *, int>::const_iterator index_it = schedule.gpu2index.find(source);
 
             if (index_it != schedule.gpu2index.end())
                 streamed_tensor_indices.push_back(index_it->second);
@@ -1918,51 +1951,46 @@ size_t parameter_offloader::generate_streaming_fit(const offloader_schedule & sc
             continue;
 
         std::sort(streamed_tensor_indices.begin(), streamed_tensor_indices.end());
-        streamed_tensor_indices.erase(
-            std::unique(streamed_tensor_indices.begin(), streamed_tensor_indices.end()),
-            streamed_tensor_indices.end());
+        streamed_tensor_indices.erase(std::unique(streamed_tensor_indices.begin(), streamed_tensor_indices.end()), streamed_tensor_indices.end());
 
         managed_node_reads.push_back(streamed_tensor_indices);
         read_signature.insert(read_signature.end(), streamed_tensor_indices.begin(), streamed_tensor_indices.end());
         read_signature.push_back(-1);
     }
 
+    const int managed_node_count = (int)managed_node_reads.size();
+
+////////////////////       BUILD FIT SIGNATURE + CHECK CACHE       /////////////////////
+
     // Hash the exact streamed tensor order and managed-node read pattern for cache lookup.
     const uint64_t fnv_offset_basis = 14695981039346656037ULL; // Standard 64-bit FNV-1a offset basis.
-    const uint64_t fnv_prime        = 1099511628211ULL;        // Standard 64-bit FNV-1a prime.
+    const uint64_t fnv_prime = 1099511628211ULL; // Standard 64-bit FNV-1a prime.
     uint64_t signature_hash = fnv_offset_basis;
 
-    struct fnv1a_64
-    {
-        static void add(uint64_t & hash, uint64_t value, uint64_t prime)
+    // Add one 64-bit value to the streaming-fit FNV-1a signature.
+    auto hash_value = [&](uint64_t value) {
+        for (int i = 0; i < 8; ++i)
         {
-            for (int i = 0; i < 8; ++i)
-            {
-                hash ^= value & 0xffULL;
-                hash *= prime;
-                value >>= 8;
-            }
+            signature_hash ^= value & 0xffULL;
+            signature_hash *= fnv_prime;
+            value >>= 8;
         }
     };
 
     // Hash the streamed tensor sequence.
-    fnv1a_64::add(signature_hash, tensor_count, fnv_prime);
+    hash_value(tensor_count);
 
     for (ggml_tensor * tensor : schedule.gpu_tensors_in_order)
-        fnv1a_64::add(signature_hash, (uint64_t)(uintptr_t)tensor, fnv_prime);
+        hash_value((uint64_t)(uintptr_t)tensor);
 
     // Hash the managed-node read signature.
-    fnv1a_64::add(signature_hash, read_signature.size(), fnv_prime);
+    hash_value(read_signature.size());
 
     for (int value : read_signature)
-    {
-        const uint64_t hash_value = value < 0 ? UINT64_MAX : (uint64_t)value;
-        fnv1a_64::add(signature_hash, hash_value, fnv_prime);
-    }
+        hash_value(value < 0 ? UINT64_MAX : (uint64_t)value);
 
     // Search only the matching hash bucket and verify the full signature before reusing a cached fit.
-    std::unordered_map<uint64_t, std::vector<streaming_fit_cache_entry>>::iterator cache_it =
-        streaming_fit_cache.find(signature_hash);
+    std::unordered_map<uint64_t, std::vector<streaming_fit_cache_entry>>::iterator cache_it = streaming_fit_cache.find(signature_hash);
 
     if (cache_it != streaming_fit_cache.end())
     {
@@ -1972,27 +2000,27 @@ size_t parameter_offloader::generate_streaming_fit(const offloader_schedule & sc
         {
             const streaming_fit_cache_entry & cached_fit = cache_bucket[i];
 
-            if (cached_fit.gpu_tensors_in_order != schedule.gpu_tensors_in_order ||
-                cached_fit.read_signature != read_signature)
+            if (cached_fit.gpu_tensors_in_order != schedule.gpu_tensors_in_order || cached_fit.read_signature != read_signature)
                 continue;
 
-            streaming_fit_cache_current_hash = signature_hash;
-            streaming_fit_cache_current = (int)i;
+            // Never reuse a cached fit that would shrink the already claimed streaming area.
+            if (streaming_fit_applied >= 0 && cached_fit.streaming_size < arena_stream_size)
+                continue;
+
+            streaming_fit_selected_hash = signature_hash;
+            streaming_fit_selected = (int)i;
 
             return cached_fit.streaming_size;
         }
     }
 
-    // TODO: remove this assert after initial testing.
-    GGML_ASSERT(!managed_node_reads.empty());
-
-    const int managed_node_count = (int)managed_node_reads.size();
+/////////////////       DERIVE TENSOR SIZES + READ LIFETIMES       ///////////////////
 
     std::vector<size_t> tensor_bytes(tensor_count);
     std::vector<int> first_read_node_idx(tensor_count, -1);
     std::vector<int> last_read_node_idx(tensor_count, -1);
 
-    // Walk the managed nodes to record each streamed tensor's first and last actual read.
+    // Nodes are timestamps only. Repeated reads extend the lifetime of the same tensor; they never create another allocation.
     for (int i = 0; i < managed_node_count; ++i)
     {
         for (int tensor_idx : managed_node_reads[i])
@@ -2006,19 +2034,12 @@ size_t parameter_offloader::generate_streaming_fit(const offloader_schedule & sc
 
     // Record the padded device allocation size of every streamed tensor.
     for (size_t i = 0; i < tensor_count; ++i)
-    {
-        // TODO: remove these asserts after initial testing.
-        GGML_ASSERT(first_read_node_idx[i] >= 0);
-        GGML_ASSERT(last_read_node_idx[i] >= first_read_node_idx[i]);
-
-        tensor_bytes[i] =
-            ggml_backend_buft_get_alloc_size(arena_buffer_type, schedule.cpu_tensors_in_order[i]);
-    }
+        tensor_bytes[i] = ggml_backend_buft_get_alloc_size(arena_buffer_type, schedule.cpu_tensors_in_order[i]);
 
     std::vector<int> reuse_after_node_idx(tensor_count);
     int latest_reuse_node_idx = -1;
 
-    // Walk schedule order to delay reuse until every earlier streamed tensor is also reusable.
+    // Release remains monotonic in streaming order, exactly like tensor_idx_used_ordinal at runtime.
     for (size_t i = 0; i < tensor_count; ++i)
     {
         latest_reuse_node_idx = std::max(latest_reuse_node_idx, last_read_node_idx[i]);
@@ -2027,382 +2048,760 @@ size_t parameter_offloader::generate_streaming_fit(const offloader_schedule & sc
 
     std::vector<int> prefetch_node_idx(tensor_count);
 
-    // Move each tensor's residency start back one managed node so COPY can prepare it during preceding compute.
+    // COPY must be able to prepare a tensor during the immediately preceding streamed read position.
     for (size_t i = 0; i < tensor_count; ++i)
         prefetch_node_idx[i] = first_read_node_idx[i] == 0 ? managed_node_count - 1 : first_read_node_idx[i] - 1;
 
+/////////////////       BUILD TENSOR COEXISTENCE CONSTRAINTS       ///////////////////
+
     std::vector<uint8_t> tensor_conflicts(tensor_count * tensor_count, 0);
-    std::vector<int> largest_requirement_tensors;
-    size_t minimum_streaming_size = 0;
-    int largest_requirement_node_idx = 0;
+    std::vector<std::vector<int>> resident_tensor_indices(managed_node_count);
 
-    // Walk every managed node to build tensor coexistence constraints and find the largest mandatory resident set.
-    for (int i = 0; i < managed_node_count; ++i)
+    // Build the exact set of streamed tensors that must coexist at every streamed read position.
+    for (int node_idx = 0; node_idx < managed_node_count; ++node_idx)
     {
-        std::vector<int> resident_tensor_indices;
-        size_t aligned_resident_bytes = 0;
-        size_t largest_unused_tail = 0;
+        std::vector<int> & resident = resident_tensor_indices[node_idx];
 
-        // Collect every streamed tensor that must be resident while this managed node executes.
         for (size_t tensor_idx = 0; tensor_idx < tensor_count; ++tensor_idx)
         {
             const int prefetch_idx = prefetch_node_idx[tensor_idx];
             const int first_read_idx = first_read_node_idx[tensor_idx];
             const int reuse_idx = reuse_after_node_idx[tensor_idx];
+            const bool is_resident = prefetch_idx < first_read_idx ? prefetch_idx <= node_idx && node_idx <= reuse_idx : node_idx >= prefetch_idx || node_idx <= reuse_idx;
 
-            const bool resident =
-                prefetch_idx < first_read_idx ?
-                    prefetch_idx <= i && i <= reuse_idx :
-                    i >= prefetch_idx || i <= reuse_idx;
-
-            if (!resident)
-                continue;
-
-            resident_tensor_indices.push_back((int)tensor_idx);
-
-            const size_t aligned_size = align_up(tensor_bytes[tensor_idx], alignment);
-            aligned_resident_bytes += aligned_size;
-            largest_unused_tail = std::max(largest_unused_tail, aligned_size - tensor_bytes[tensor_idx]);
+            if (is_resident)
+                resident.push_back((int)tensor_idx);
         }
 
-        // Record that every pair simultaneously resident at this node must occupy non-overlapping addresses.
-        for (size_t j = 0; j < resident_tensor_indices.size(); ++j)
+        for (size_t i = 0; i < resident.size(); ++i)
         {
-            for (size_t k = j + 1; k < resident_tensor_indices.size(); ++k)
+            for (size_t j = i + 1; j < resident.size(); ++j)
             {
-                const size_t lhs = (size_t)resident_tensor_indices[j];
-                const size_t rhs = (size_t)resident_tensor_indices[k];
+                const size_t lhs = (size_t)resident[i];
+                const size_t rhs = (size_t)resident[j];
 
                 tensor_conflicts[lhs * tensor_count + rhs] = 1;
                 tensor_conflicts[rhs * tensor_count + lhs] = 1;
             }
         }
+    }
 
-        const size_t required_streaming_size =
-            resident_tensor_indices.empty() ? 0 : aligned_resident_bytes - largest_unused_tail;
+    std::vector<std::vector<int>> tensor_conflict_indices(tensor_count);
 
-        if (required_streaming_size > minimum_streaming_size)
+    for (size_t lhs = 0; lhs < tensor_count; ++lhs)
+    {
+        for (size_t rhs = lhs + 1; rhs < tensor_count; ++rhs)
         {
-            minimum_streaming_size = required_streaming_size;
-            largest_requirement_node_idx = i;
-            largest_requirement_tensors = resident_tensor_indices;
+            if (!tensor_conflicts[lhs * tensor_count + rhs])
+                continue;
+
+            tensor_conflict_indices[lhs].push_back((int)rhs);
+            tensor_conflict_indices[rhs].push_back((int)lhs);
         }
     }
 
-    // Anchor the first streamed tensor read by the first node of the largest requirement at address zero.
-    const int anchor_tensor_idx =
-        managed_node_reads[largest_requirement_node_idx].empty() ?
-            largest_requirement_tensors.front() :
-            managed_node_reads[largest_requirement_node_idx].front();
+//////////////////////       COMPUTE STREAMING SIZE BOUNDS       ///////////////////////
 
-    std::vector<size_t> unique_start_tensor_sizes;
-    unique_start_tensor_sizes.reserve(tensor_count - 1);
+    std::vector<size_t> unique_start_sizes = tensor_bytes;
+    std::sort(unique_start_sizes.rbegin(), unique_start_sizes.rend());
 
-    // Collect every non-anchor tensor size for the independent unique-start lower bound.
-    for (size_t i = 0; i < tensor_count; ++i)
-        if ((int)i != anchor_tensor_idx)
-            unique_start_tensor_sizes.push_back(tensor_bytes[i]);
+    size_t unique_start_requirement = 0;
 
-    std::sort(
-        unique_start_tensor_sizes.begin(),
-        unique_start_tensor_sizes.end(),
-        [](size_t lhs, size_t rhs) { return lhs > rhs; });
+    for (size_t i = 0; i < unique_start_sizes.size(); ++i)
+        unique_start_requirement = std::max(unique_start_requirement, i * alignment + unique_start_sizes[i]);
 
-    size_t unique_start_minimum = tensor_bytes[anchor_tensor_idx];
+    unique_start_requirement = align_up(unique_start_requirement, alignment);
 
-    // Find the smallest arena span capable of giving every tensor a unique aligned start address.
-    for (size_t i = 0; i < unique_start_tensor_sizes.size(); ++i)
-        unique_start_minimum =
-            std::max(unique_start_minimum, (i + 1) * alignment + unique_start_tensor_sizes[i]);
+    std::vector<uint8_t> in_requirement(tensor_count, 0);
+    std::vector<int> requirement_tensors;
+    requirement_tensors.reserve(tensor_count);
 
-    minimum_streaming_size =
-        align_up(std::max(minimum_streaming_size, unique_start_minimum), alignment);
+    // Compute the arena size required by either two or three consecutive streamed positions.
+    auto requirement_size = [&](int node_idx, int position_count) -> size_t {
+        requirement_tensors.clear();
+        std::fill(in_requirement.begin(), in_requirement.end(), 0);
 
-    struct start_order_evaluator
+        // Collect the unique tensors contained in the requested consecutive resident sets.
+        for (int position = 0; position < position_count - 1; ++position)
+        {
+            const std::vector<int> & resident = resident_tensor_indices[(node_idx + position) % managed_node_count];
+
+            for (int tensor_idx : resident)
+            {
+                if (in_requirement[tensor_idx])
+                    continue;
+
+                in_requirement[tensor_idx] = 1;
+                requirement_tensors.push_back(tensor_idx);
+            }
+        }
+
+        // Compute the packed byte requirement for those tensors while respecting backend alignment.
+        size_t aligned_bytes = 0;
+        size_t largest_unused_tail = 0;
+
+        for (int tensor_idx : requirement_tensors)
+        {
+            const size_t aligned_size = align_up(tensor_bytes[tensor_idx], alignment);
+            aligned_bytes += aligned_size;
+            largest_unused_tail = std::max(largest_unused_tail, aligned_size - tensor_bytes[tensor_idx]);
+        }
+
+        // Remove the unused alignment tail from whichever tensor is placed last.
+        const size_t packed_requirement = requirement_tensors.empty() ? 0 : align_up(aligned_bytes - largest_unused_tail, alignment);
+
+        // The requirement must also satisfy the global unique-start-address constraint.
+        return std::max(packed_requirement, unique_start_requirement);
+    };
+
+    size_t streaming_size_lower_bound = 0;
+    size_t streaming_size_upper_bound = 0;
+
+    for (int node_idx = 0; node_idx < managed_node_count; ++node_idx)
     {
-        static size_t evaluate(
-            const std::vector<int> & tensor_start_order,
-            std::vector<size_t> & tensor_offsets,
+        const size_t two_position_size = requirement_size(node_idx, 2);
+        const size_t three_position_size = requirement_size(node_idx, 3);
+
+        streaming_size_lower_bound = std::max(streaming_size_lower_bound, two_position_size);
+        streaming_size_upper_bound = std::max(streaming_size_upper_bound, three_position_size);
+    }
+
+    // Once a streaming fit has been installed, never relinquish streaming arena memory already claimed.
+    if (streaming_fit_applied >= 0)
+        streaming_size_lower_bound = std::max(streaming_size_lower_bound, arena_stream_size);
+
+    // The search ceiling must never be below the effective lower bound.
+    streaming_size_upper_bound = std::max(streaming_size_upper_bound, streaming_size_lower_bound);
+
+    const size_t search_ceiling = std::min(streaming_size_upper_bound, arena_dense_size);
+
+    if (streaming_size_lower_bound > search_ceiling)
+        throw std::runtime_error("parameter_offloader: no no-halt streaming fit can fit inside the dense arena");
+
+    struct local_repair_search
+    {
+        size_t tensor_count;
+        size_t alignment;
+        size_t arena_size;
+        size_t max_states;
+        size_t max_candidates;
+
+        const std::vector<size_t> & tensor_bytes;
+        const std::vector<std::vector<int>> & tensor_conflict_indices;
+        const std::vector<size_t> & baseline_offsets;
+        const std::vector<uint8_t> & movable;
+        const std::vector<uint8_t> & violation_tensor;
+
+        size_t & next_size_event;
+
+        std::vector<size_t> offsets;
+        std::vector<uint8_t> placed;
+        std::unordered_set<size_t> used_starts;
+        std::vector<int> movable_order;
+
+        size_t states = 0;
+
+        local_repair_search(
             size_t tensor_count,
             size_t alignment,
+            size_t arena_size,
+            size_t max_states,
+            size_t max_candidates,
             const std::vector<size_t> & tensor_bytes,
-            const std::vector<uint8_t> & tensor_conflicts)
+            const std::vector<std::vector<int>> & tensor_conflict_indices,
+            const std::vector<size_t> & baseline_offsets,
+            const std::vector<uint8_t> & movable,
+            const std::vector<uint8_t> & violation_tensor,
+            size_t & next_size_event)
+            : tensor_count(tensor_count),
+              alignment(alignment),
+              arena_size(arena_size),
+              max_states(max_states),
+              max_candidates(max_candidates),
+              tensor_bytes(tensor_bytes),
+              tensor_conflict_indices(tensor_conflict_indices),
+              baseline_offsets(baseline_offsets),
+              movable(movable),
+              violation_tensor(violation_tensor),
+              next_size_event(next_size_event),
+              offsets(baseline_offsets),
+              placed(tensor_count, 0)
         {
-            tensor_offsets.assign(tensor_count, 0);
+            used_starts.reserve(tensor_count * 2);
+            movable_order.reserve(tensor_count);
+        }
 
-            size_t previous_start_offset = 0;
-            size_t layout_end = 0;
+        bool legal(size_t tensor_idx, size_t start) const
+        {
+            const size_t bytes = tensor_bytes[tensor_idx];
 
-            // Place tensors in the requested start-address order as low as all prior constraints permit.
-            for (size_t i = 0; i < tensor_count; ++i)
+            if ((start % alignment) != 0)
+                return false;
+
+            if (bytes > arena_size)
+                return false;
+
+            if (start > arena_size - bytes)
+                return false;
+
+            if (used_starts.find(start) != used_starts.end())
+                return false;
+
+            const size_t end = start + bytes;
+
+            for (int other_idx : tensor_conflict_indices[tensor_idx])
             {
-                const int tensor_idx = tensor_start_order[i];
-                size_t tensor_offset = i == 0 ? 0 : previous_start_offset + alignment;
+                const size_t other = (size_t)other_idx;
 
-                // Raise this tensor above every earlier tensor whose residency conflicts with it.
-                for (size_t j = 0; j < i; ++j)
-                {
-                    const int previous_tensor_idx = tensor_start_order[j];
+                if (!placed[other])
+                    continue;
 
-                    if (tensor_conflicts[(size_t)previous_tensor_idx * tensor_count + tensor_idx])
-                    {
-                        tensor_offset = std::max(
-                            tensor_offset,
-                            align_up(
-                                tensor_offsets[previous_tensor_idx] + tensor_bytes[previous_tensor_idx],
-                                alignment));
-                    }
-                }
-
-                tensor_offsets[tensor_idx] = tensor_offset;
-                previous_start_offset = tensor_offset;
-                layout_end = std::max(layout_end, tensor_offset + tensor_bytes[tensor_idx]);
+                if (ranges_overlap(start, end, offsets[other], offsets[other] + tensor_bytes[other]))
+                    return false;
             }
 
-            return align_up(layout_end, alignment);
+            return true;
+        }
+
+        bool prepare()
+        {
+            // Freeze every tensor outside the repair set. If frozen tensors already contain a violation, moving the
+            // selected repair tensors cannot possibly fix this candidate size, so reject this repair set immediately.
+            for (size_t i = 0; i < tensor_count; ++i)
+            {
+                if (movable[i])
+                {
+                    offsets[i] = SIZE_MAX;
+                    continue;
+                }
+
+                if (used_starts.find(offsets[i]) != used_starts.end())
+                    return false;
+
+                for (int other_idx : tensor_conflict_indices[i])
+                {
+                    const size_t other = (size_t)other_idx;
+
+                    if (other >= i || movable[other])
+                        continue;
+
+                    if (ranges_overlap(offsets[i], offsets[i] + tensor_bytes[i], offsets[other], offsets[other] + tensor_bytes[other]))
+                        return false;
+                }
+
+                placed[i] = 1;
+                used_starts.insert(offsets[i]);
+            }
+
+            // Search the actual offending tensors nearest the cyclic seam first, then the remaining movable tensors.
+            for (size_t i = tensor_count; i-- > 0; )
+                if (movable[i] && violation_tensor[i])
+                    movable_order.push_back((int)i);
+
+            for (size_t i = tensor_count; i-- > 0; )
+                if (movable[i] && !violation_tensor[i])
+                    movable_order.push_back((int)i);
+
+            return true;
+        }
+
+        void add_candidate(std::vector<size_t> & candidates, size_t tensor_idx, size_t start)
+        {
+            if (!legal(tensor_idx, start))
+                return;
+
+            if (std::find(candidates.begin(), candidates.end(), start) == candidates.end())
+                candidates.push_back(start);
+        }
+
+        void collect_candidates(size_t tensor_idx, std::vector<size_t> & candidates)
+        {
+            candidates.clear();
+
+            const size_t bytes = tensor_bytes[tensor_idx];
+            const size_t preferred = baseline_offsets[tensor_idx];
+
+            // Keeping the tensor at its baseline address is cheapest and usually preserves the useful structure of the
+            // sequential layout. The remaining candidates are interval boundaries or a midpoint inside a legal hole.
+            add_candidate(candidates, tensor_idx, preferred);
+
+            struct range
+            {
+                size_t start;
+                size_t end;
+            };
+
+            std::vector<range> blocked;
+            blocked.reserve(tensor_conflict_indices[tensor_idx].size());
+
+            // Build every range currently occupied by an already-placed tensor
+            // that this tensor is not allowed to overlap.
+            for (int other_idx : tensor_conflict_indices[tensor_idx])
+            {
+                const size_t other = (size_t)other_idx;
+
+                if (!placed[other])
+                    continue;
+
+                blocked.push_back({ offsets[other], offsets[other] + tensor_bytes[other] });
+
+                const size_t after = align_up(offsets[other] + tensor_bytes[other], alignment);
+
+                if (after <= SIZE_MAX - bytes)
+                    update_next_size_event(arena_size, after + bytes, alignment, next_size_event);
+            }
+
+            std::sort(blocked.begin(), blocked.end(), [](const range & lhs, const range & rhs) { return lhs.start < rhs.start; });
+
+            // Merge overlapping blocked ranges so the gaps between them can be examined directly.
+            std::vector<range> merged;
+            merged.reserve(blocked.size());
+
+            for (const range & current : blocked)
+            {
+                if (merged.empty() || merged.back().end < current.start)
+                    merged.push_back(current);
+                else
+                    merged.back().end = std::max(merged.back().end, current.end);
+            }
+
+            // Try a small number of representative starts from each legal gap.
+            size_t gap_start = 0;
+
+            for (size_t gap_idx = 0; gap_idx <= merged.size(); ++gap_idx)
+            {
+                const size_t gap_end = gap_idx < merged.size() ? merged[gap_idx].start : arena_size;
+
+                if (gap_end >= gap_start + bytes)
+                {
+                    // Left-most legal start.
+                    size_t left = align_up(gap_start, alignment);
+
+                    while (left <= gap_end - bytes && used_starts.find(left) != used_starts.end())
+                        left += alignment;
+
+                    if (left <= gap_end - bytes)
+                        add_candidate(candidates, tensor_idx, left);
+
+                    // Right-most legal start.
+                    size_t right = align_down(gap_end - bytes, alignment);
+
+                    while (right >= gap_start && used_starts.find(right) != used_starts.end())
+                    {
+                        if (right < alignment)
+                            break;
+
+                        right -= alignment;
+                    }
+
+                    if (right >= gap_start && right <= gap_end - bytes)
+                        add_candidate(candidates, tensor_idx, right);
+
+                    // Midpoint gives the bounded search one non-boundary choice
+                    // without enumerating every aligned address in the gap.
+                    const size_t midpoint_limit = gap_end - bytes;
+                    const size_t midpoint = align_down(gap_start + (midpoint_limit - gap_start) / 2, alignment);
+
+                    add_candidate(candidates, tensor_idx, midpoint);
+                }
+
+                if (gap_idx < merged.size())
+                    gap_start = merged[gap_idx].end;
+            }
+
+            // Unplaced conflicting tensors still have useful baseline boundaries. Trying those boundaries gives the
+            // bounded search a chance to exchange positions without recursively exploring arbitrary byte addresses.
+            for (int other_idx : tensor_conflict_indices[tensor_idx])
+            {
+                const size_t other = (size_t)other_idx;
+
+                if (placed[other])
+                    continue;
+
+                const size_t other_start = baseline_offsets[other];
+                const size_t other_end = other_start + tensor_bytes[other];
+
+                if (other_start >= bytes)
+                    add_candidate(candidates, tensor_idx, align_down(other_start - bytes, alignment));
+
+                add_candidate(candidates, tensor_idx, align_up(other_end, alignment));
+            }
+
+            // Prefer addresses nearest the original sequential placement.
+            std::sort(candidates.begin(), candidates.end(), [&](size_t lhs, size_t rhs) {
+                const size_t lhs_distance = lhs > preferred ? lhs - preferred : preferred - lhs;
+                const size_t rhs_distance = rhs > preferred ? rhs - preferred : preferred - rhs;
+
+                if (lhs_distance != rhs_distance)
+                    return lhs_distance < rhs_distance;
+
+                return lhs < rhs;
+            });
+
+            if (candidates.size() > max_candidates)
+                candidates.resize(max_candidates);
+        }
+
+        bool run(size_t movable_pos)
+        {
+            if (++states > max_states)
+                return false;
+
+            if (movable_pos == movable_order.size())
+                return true;
+
+            const size_t tensor_idx = (size_t)movable_order[movable_pos];
+
+            std::vector<size_t> candidates;
+            collect_candidates(tensor_idx, candidates);
+
+            for (size_t start : candidates)
+            {
+                offsets[tensor_idx] = start;
+                placed[tensor_idx] = 1;
+                used_starts.insert(start);
+
+                if (run(movable_pos + 1))
+                    return true;
+
+                used_starts.erase(start);
+                placed[tensor_idx] = 0;
+                offsets[tensor_idx] = SIZE_MAX;
+
+                if (states >= max_states)
+                    break;
+            }
+
+            return false;
         }
     };
 
-    std::vector<int> tensor_start_order;
-    tensor_start_order.reserve(tensor_count);
-    tensor_start_order.push_back(anchor_tensor_idx);
+////////////////////       BUILD SEQUENTIAL WRAPPED BASELINE       ///////////////////
 
-    // Build the first cheap start-address order using schedule order after the fixed anchor.
-    for (size_t i = 0; i < tensor_count; ++i)
-        if ((int)i != anchor_tensor_idx)
-            tensor_start_order.push_back((int)i);
-
-    std::vector<size_t> best_tensor_offsets;
-
-    size_t best_streaming_size =
-        start_order_evaluator::evaluate(
-            tensor_start_order,
-            best_tensor_offsets,
-            tensor_count,
-            alignment,
-            tensor_bytes,
-            tensor_conflicts);
-
-    // Try large tensors earlier as a second cheap ordering before invoking the exact search.
-    std::sort(
-        tensor_start_order.begin() + 1,
-        tensor_start_order.end(),
-        [&](int lhs, int rhs) { return tensor_bytes[lhs] > tensor_bytes[rhs]; });
-
-    std::vector<size_t> trial_tensor_offsets;
-
-    const size_t trial_streaming_size =
-        start_order_evaluator::evaluate(
-            tensor_start_order,
-            trial_tensor_offsets,
-            tensor_count,
-            alignment,
-            tensor_bytes,
-            tensor_conflicts);
-
-    if (trial_streaming_size < best_streaming_size)
+    // Build the cheap streaming-order layout for this candidate size. A cycle is only a run of tensors between wraps;
+    // tensors remain the allocation objects. Unique starts are enforced while building the baseline because duplicate
+    // starts are otherwise common at wrap points and would create repair work unrelated to fragmentation.
+    auto build_sequential_layout = [&](
+        size_t arena_size,
+        std::vector<size_t> & offsets,
+        std::vector<int> & cycle_idx,
+        size_t & next_size_event) -> bool
     {
-        best_streaming_size = trial_streaming_size;
-        best_tensor_offsets = trial_tensor_offsets;
-    }
+        offsets.assign(tensor_count, SIZE_MAX);
+        cycle_idx.assign(tensor_count, 0);
 
-    // Search the remaining start-address orders only when the cheap layouts have not reached the hard minimum.
-    if (best_streaming_size > minimum_streaming_size)
-    {
-        struct fit_search
-        {
-            struct candidate
-            {
-                int tensor_idx;
-                size_t start_offset;
-                size_t layout_end;
-            };
+        std::unordered_set<size_t> used_starts;
+        used_starts.reserve(tensor_count * 2);
 
-            size_t tensor_count;
-            size_t alignment;
-            const std::vector<size_t> & tensor_bytes;
-            const std::vector<uint8_t> & tensor_conflicts;
-            size_t minimum_streaming_size;
-            size_t & best_streaming_size;
-            std::vector<size_t> & best_tensor_offsets;
+        size_t cursor = 0;
+        int cycle = 0;
 
-            std::vector<bool> placed;
-            std::vector<size_t> tensor_offsets;
-            std::vector<size_t> minimum_start_offset;
-
-            fit_search(
-                size_t tensor_count,
-                size_t alignment,
-                const std::vector<size_t> & tensor_bytes,
-                const std::vector<uint8_t> & tensor_conflicts,
-                size_t minimum_streaming_size,
-                size_t & best_streaming_size,
-                std::vector<size_t> & best_tensor_offsets)
-                :
-                tensor_count(tensor_count),
-                alignment(alignment),
-                tensor_bytes(tensor_bytes),
-                tensor_conflicts(tensor_conflicts),
-                minimum_streaming_size(minimum_streaming_size),
-                best_streaming_size(best_streaming_size),
-                best_tensor_offsets(best_tensor_offsets),
-                placed(tensor_count, false),
-                tensor_offsets(tensor_count, 0),
-                minimum_start_offset(tensor_count, 0)
-            {
-            }
-
-            void run(size_t placed_count, size_t previous_start_offset, size_t layout_end)
-            {
-                if (best_streaming_size == minimum_streaming_size)
-                    return;
-
-                if (placed_count == tensor_count)
-                {
-                    const size_t completed_streaming_size = align_up(layout_end, alignment);
-
-                    if (completed_streaming_size < best_streaming_size)
-                    {
-                        best_streaming_size = completed_streaming_size;
-                        best_tensor_offsets = tensor_offsets;
-                    }
-
-                    return;
-                }
-
-                std::vector<candidate> candidates;
-                candidates.reserve(tensor_count - placed_count);
-
-                // Build every tensor that can still improve the current best layout.
-                for (size_t i = 0; i < tensor_count; ++i)
-                {
-                    if (placed[i])
-                        continue;
-
-                    const size_t start_offset =
-                        std::max(previous_start_offset + alignment, minimum_start_offset[i]);
-
-                    const size_t candidate_layout_end =
-                        std::max(layout_end, start_offset + tensor_bytes[i]);
-
-                    if (align_up(candidate_layout_end, alignment) < best_streaming_size)
-                        candidates.push_back({ (int)i, start_offset, candidate_layout_end });
-                }
-
-                // Try candidates that increase the current arena requirement least first.
-                std::sort(
-                    candidates.begin(),
-                    candidates.end(),
-                    [](const candidate & lhs, const candidate & rhs) {
-                        return lhs.layout_end < rhs.layout_end;
-                    });
-
-                // Explore each remaining tensor as the next unique start address.
-                for (const candidate & next : candidates)
-                {
-                    const int tensor_idx = next.tensor_idx;
-
-                    placed[tensor_idx] = true;
-                    tensor_offsets[tensor_idx] = next.start_offset;
-
-                    std::vector<std::pair<int, size_t>> changed_minimum_starts;
-                    const size_t tensor_end =
-                        align_up(next.start_offset + tensor_bytes[tensor_idx], alignment);
-
-                    // Raise every unplaced conflicting tensor above the tensor just placed.
-                    for (size_t i = 0; i < tensor_count; ++i)
-                    {
-                        if (placed[i] ||
-                            !tensor_conflicts[(size_t)tensor_idx * tensor_count + i] ||
-                            minimum_start_offset[i] >= tensor_end)
-                            continue;
-
-                        changed_minimum_starts.push_back(
-                            std::make_pair((int)i, minimum_start_offset[i]));
-
-                        minimum_start_offset[i] = tensor_end;
-                    }
-
-                    size_t branch_minimum =
-                        std::max(minimum_streaming_size, align_up(next.layout_end, alignment));
-
-                    // Bound the branch using the earliest legal position of every tensor still unplaced.
-                    for (size_t i = 0; i < tensor_count && branch_minimum < best_streaming_size; ++i)
-                    {
-                        if (placed[i])
-                            continue;
-
-                        const size_t earliest_start =
-                            std::max(next.start_offset + alignment, minimum_start_offset[i]);
-
-                        branch_minimum =
-                            std::max(
-                                branch_minimum,
-                                align_up(earliest_start + tensor_bytes[i], alignment));
-                    }
-
-                    if (branch_minimum < best_streaming_size)
-                        run(placed_count + 1, next.start_offset, next.layout_end);
-
-                    // Restore the branch-local constraints before trying the next candidate.
-                    for (
-                        std::vector<std::pair<int, size_t>>::reverse_iterator it =
-                            changed_minimum_starts.rbegin();
-                        it != changed_minimum_starts.rend();
-                        ++it)
-                    {
-                        minimum_start_offset[it->first] = it->second;
-                    }
-
-                    placed[tensor_idx] = false;
-                }
-            }
-        };
-
-        fit_search search(
-            tensor_count,
-            alignment,
-            tensor_bytes,
-            tensor_conflicts,
-            minimum_streaming_size,
-            best_streaming_size,
-            best_tensor_offsets);
-
-        search.placed[anchor_tensor_idx] = true;
-        search.tensor_offsets[anchor_tensor_idx] = 0;
-
-        // Apply the anchor tensor's conflict constraint to every remaining tensor before starting the search.
         for (size_t i = 0; i < tensor_count; ++i)
         {
-            if ((int)i != anchor_tensor_idx &&
-                tensor_conflicts[(size_t)anchor_tensor_idx * tensor_count + i])
+            const size_t bytes = tensor_bytes[i];
+
+            if (bytes > arena_size)
+                return false;
+
+            size_t natural_start = align_up(cursor, alignment);
+            bool wrapped = false;
+
+            if (natural_start > arena_size - bytes)
             {
-                search.minimum_start_offset[i] =
-                    align_up(tensor_bytes[anchor_tensor_idx], alignment);
+                update_next_size_event(arena_size, natural_start + bytes, alignment, next_size_event);
+
+                natural_start = 0;
+                ++cycle;
+                wrapped = true;
+            }
+
+            size_t start = natural_start;
+
+            while (start <= arena_size - bytes && used_starts.find(start) != used_starts.end())
+                start += alignment;
+
+            // A unique start was not available before the current end of cycle. Wrap and reuse the physical holes
+            // from earlier cycles; only the start address itself must be globally unique.
+            if (start > arena_size - bytes)
+            {
+                update_next_size_event(arena_size, start + bytes, alignment, next_size_event);
+
+                start = 0;
+
+                while (start <= arena_size - bytes && used_starts.find(start) != used_starts.end())
+                    start += alignment;
+
+                if (start > arena_size - bytes)
+                    return false;
+
+                if (!wrapped)
+                    ++cycle;
+            }
+
+            offsets[i] = start;
+            cycle_idx[i] = cycle;
+            used_starts.insert(start);
+
+            cursor = start + bytes;
+        }
+
+        return true;
+    };
+
+////////////////////       GLOBAL LAYOUT VIOLATION DETECTION       ///////////////////
+
+    auto collect_layout_violations = [&](const std::vector<size_t> & offsets, std::vector<std::pair<int, int>> & violations) {
+        violations.clear();
+
+        // First detect globally duplicated tensor starts.
+        std::unordered_map<size_t, int> start_owner;
+        start_owner.reserve(tensor_count * 2);
+
+        for (size_t i = 0; i < tensor_count; ++i)
+        {
+            const auto inserted = start_owner.emplace(offsets[i], (int)i);
+
+            if (!inserted.second)
+                violations.emplace_back(inserted.first->second, (int)i);
+        }
+
+        // Then detect every physical overlap between tensors that must coexist.
+        for (size_t lhs = 0; lhs < tensor_count; ++lhs)
+        {
+            for (int rhs_idx : tensor_conflict_indices[lhs])
+            {
+                const size_t rhs = (size_t)rhs_idx;
+
+                if (rhs <= lhs)
+                    continue;
+
+                if (ranges_overlap(offsets[lhs], offsets[lhs] + tensor_bytes[lhs], offsets[rhs], offsets[rhs] + tensor_bytes[rhs]))
+                    violations.emplace_back((int)lhs, (int)rhs);
+            }
+        }
+    };
+
+///////////////////////       SEARCH CANDIDATE ARENA SIZES       ///////////////////////
+
+    size_t candidate_size = streaming_size_lower_bound;
+    std::vector<size_t> best_tensor_offsets;
+    size_t attempt_count = 0;
+    size_t total_repair_states = 0;
+
+    while (candidate_size <= search_ceiling)
+    {
+        ++attempt_count;
+
+        size_t next_size_event = SIZE_MAX;
+        std::vector<size_t> baseline_offsets;
+        std::vector<int> cycle_idx;
+
+//////////////////       BUILD BASELINE FOR THIS CANDIDATE SIZE       //////////////////
+
+        if (!build_sequential_layout(candidate_size, baseline_offsets, cycle_idx, next_size_event))
+        {
+            if (candidate_size == search_ceiling)
+                throw std::runtime_error("parameter_offloader: failed to construct a unique-start streaming baseline inside the search ceiling");
+
+            const size_t next_candidate_size = next_size_event == SIZE_MAX ? search_ceiling : std::min(next_size_event, search_ceiling);
+            candidate_size = next_candidate_size > candidate_size ? next_candidate_size : std::min(candidate_size + alignment, search_ceiling);
+
+            continue;
+        }
+
+///////////////////       CHECK BASELINE FOR FRAGMENTATION       /////////////////////
+
+        std::vector<std::pair<int, int>> violations;
+        collect_layout_violations(baseline_offsets, violations);
+
+        if (violations.empty())
+        {
+            best_tensor_offsets = baseline_offsets;
+        }
+        else
+        {
+///////////////////////       BUILD LOCAL REPAIR SETS       //////////////////////////
+
+            std::vector<uint8_t> violation_tensor(tensor_count, 0);
+
+            for (const auto & violation : violations)
+            {
+                violation_tensor[(size_t)violation.first] = 1;
+                violation_tensor[(size_t)violation.second] = 1;
+            }
+
+            const size_t tail_begin = tensor_count > MAX_REPAIR_TENSORS_BACK ? tensor_count - MAX_REPAIR_TENSORS_BACK : 0;
+            const int first_cycle = cycle_idx.front();
+            const int last_cycle = cycle_idx.back();
+
+            std::vector<std::vector<uint8_t>> repair_sets;
+
+///////////////////       REPAIR SET 1 - FINAL CYCLE OFFENDERS       ///////////////////
+
+            // First try only actual offenders in the last cycle. Most cyclic fragmentation problems should die here.
+            std::vector<uint8_t> movable_last_cycle(tensor_count, 0);
+
+            for (size_t i = tail_begin; i < tensor_count; ++i)
+                if (cycle_idx[i] == last_cycle && violation_tensor[i])
+                    movable_last_cycle[i] = 1;
+
+            repair_sets.push_back(std::move(movable_last_cycle));
+
+//////////////////////       REPAIR SET 2 - TAIL OFFENDERS       ///////////////////////
+
+            // If the problem reaches farther back within the final block or so, allow every offending tail tensor to move.
+            std::vector<uint8_t> movable_tail_offenders(tensor_count, 0);
+
+            for (size_t i = tail_begin; i < tensor_count; ++i)
+                if (violation_tensor[i])
+                    movable_tail_offenders[i] = 1;
+
+            repair_sets.push_back(std::move(movable_tail_offenders));
+
+////////////////       REPAIR SET 3 - FULL TAIL + HEAD OFFENDERS       /////////////////
+
+            // Final bounded attempt: the last <=30 tensors may move, along with first-cycle tensors that are directly
+            // involved in the current seam failure. We intentionally do not search farther back than this.
+            std::vector<uint8_t> movable_tail_and_head(tensor_count, 0);
+
+            for (size_t i = tail_begin; i < tensor_count; ++i)
+                movable_tail_and_head[i] = 1;
+
+            for (size_t i = 0; i < tensor_count; ++i)
+                if (cycle_idx[i] == first_cycle && violation_tensor[i])
+                    movable_tail_and_head[i] = 1;
+
+            repair_sets.push_back(std::move(movable_tail_and_head));
+
+//////////////////////////       TRY LOCAL REPAIR SETS       ///////////////////////////
+
+            std::vector<uint8_t> previous_repair_set;
+
+            for (const std::vector<uint8_t> & movable : repair_sets)
+            {
+                if (!previous_repair_set.empty() && movable == previous_repair_set)
+                    continue;
+
+                previous_repair_set = movable;
+
+                bool any_movable = false;
+
+                for (uint8_t value : movable)
+                    any_movable = any_movable || value != 0;
+
+                if (!any_movable)
+                    continue;
+
+                local_repair_search repair(
+                    tensor_count,
+                    alignment,
+                    candidate_size,
+                    MAX_REPAIR_STATES,
+                    MAX_REPAIR_CANDIDATES,
+                    tensor_bytes,
+                    tensor_conflict_indices,
+                    baseline_offsets,
+                    movable,
+                    violation_tensor,
+                    next_size_event);
+
+                if (!repair.prepare())
+                    continue;
+
+                const bool repaired = repair.run(0);
+                total_repair_states += repair.states;
+
+                if (!repaired)
+                    continue;
+
+///////////////////       GLOBALLY VERIFY REPAIRED LAYOUT       //////////////////////
+
+                std::vector<std::pair<int, int>> repaired_violations;
+                collect_layout_violations(repair.offsets, repaired_violations);
+
+                if (!repaired_violations.empty())
+                    continue;
+
+                best_tensor_offsets = std::move(repair.offsets);
+                break;
             }
         }
 
-        search.run(1, 0, tensor_bytes[anchor_tensor_idx]);
+/////////////////////       ACCEPT SUCCESSFUL CANDIDATE       ////////////////////////
+
+        if (!best_tensor_offsets.empty())
+        {
+            size_t layout_end = 0;
+
+            for (size_t i = 0; i < tensor_count; ++i)
+                layout_end = std::max(layout_end, best_tensor_offsets[i] + tensor_bytes[i]);
+
+            // Preserve any streaming arena memory already claimed even when this layout itself would fit in less space.
+            candidate_size = std::max(align_up(layout_end, alignment), streaming_size_lower_bound);
+
+            break;
+        }
+
+////////////////       ADVANCE TO NEXT MEANINGFUL ARENA SIZE       ///////////////////
+
+        if (candidate_size == search_ceiling)
+            throw std::runtime_error("parameter_offloader: bounded local repair failed to construct a no-halt streaming layout inside the search ceiling");
+
+        // Search is intentionally lossy. Once local repair has exceeded its useful scope, pay the small amount of VRAM
+        // needed to reach the next placement event rather than searching deeper into repetitive model blocks.
+        size_t next_candidate_size = next_size_event;
+
+        if (next_candidate_size == SIZE_MAX || next_candidate_size <= candidate_size)
+            next_candidate_size = search_ceiling;
+
+        candidate_size = std::min(align_up(next_candidate_size, alignment), search_ceiling);
     }
 
+//////////////////////       FINAL GLOBAL LAYOUT VALIDATION       //////////////////////
+
+    // Validate the generated tensor layout independently before caching it.
+    std::vector<size_t> used_starts;
+    used_starts.reserve(tensor_count);
+
+    for (size_t i = 0; i < tensor_count; ++i)
+    {
+        GGML_ASSERT((best_tensor_offsets[i] % alignment) == 0);
+        GGML_ASSERT(best_tensor_offsets[i] + tensor_bytes[i] <= candidate_size);
+        GGML_ASSERT(std::find(used_starts.begin(), used_starts.end(), best_tensor_offsets[i]) == used_starts.end());
+
+        used_starts.push_back(best_tensor_offsets[i]);
+
+        for (size_t j = 0; j < i; ++j)
+        {
+            if (!tensor_conflicts[i * tensor_count + j])
+                continue;
+
+            const bool overlap = !(best_tensor_offsets[i] + tensor_bytes[i] <= best_tensor_offsets[j] || best_tensor_offsets[j] + tensor_bytes[j] <= best_tensor_offsets[i]);
+            GGML_ASSERT(!overlap);
+        }
+    }
+
+///////////////////////////       CACHE SOLVED FIT       /////////////////////////////
+
     streaming_fit_cache_entry cached_fit;
+
     cached_fit.gpu_tensors_in_order = schedule.gpu_tensors_in_order;
     cached_fit.read_signature = read_signature;
-    cached_fit.streaming_size = best_streaming_size;
+    cached_fit.streaming_size = candidate_size;
     cached_fit.offsets = best_tensor_offsets;
 
-    // Add the solved fit to this hash's collision bucket and mark it as the current layout.
-    std::vector<streaming_fit_cache_entry> & cache_bucket =
-        streaming_fit_cache[signature_hash];
+    std::vector<streaming_fit_cache_entry> & cache_bucket = streaming_fit_cache[signature_hash];
 
     cache_bucket.push_back(std::move(cached_fit));
 
-    streaming_fit_cache_current_hash = signature_hash;
-    streaming_fit_cache_current = (int)cache_bucket.size() - 1;
+    streaming_fit_selected_hash = signature_hash;
+    streaming_fit_selected = (int)cache_bucket.size() - 1;
 
-    LLAMA_LOG_INFO("%s %zu\n", __func__, best_streaming_size);
+///////////////////////////       DEBUG STATISTICS       /////////////////////////////
 
-    return best_streaming_size;
+    LLAMA_LOG_INFO("%s: fit=%zu lower=%zu upper=%zu tensors=%zu read_positions=%d attempts=%zu repair_states=%zu\n", __func__, candidate_size, streaming_size_lower_bound, streaming_size_upper_bound, tensor_count, managed_node_count, attempt_count, total_repair_states);
+
+    return candidate_size;
 }
 
 bool parameter_offloader::swap_next_schedule(size_t streaming_fit)
@@ -2413,11 +2812,13 @@ bool parameter_offloader::swap_next_schedule(size_t streaming_fit)
         common_prefix_len_ == schedule_current.gpu_tensors_in_order.size() &&
         common_prefix_len_ == schedule_next.gpu_tensors_in_order.size();
 
+    const bool streaming_fit_identical = streaming_fit_applied_hash == streaming_fit_selected_hash && streaming_fit_applied == streaming_fit_selected;
+
     long long new_copied_ordinal = -1; // copied ordinal required before graph may start reading
     int startup_copy_idx = 0; // furthest first-read weight required by the first managed node
     bool changed = false; // true when a new schedule was published
 
-    if (schedule_next_identical && streaming_fit == arena_stream_size)
+    if (schedule_next_identical && streaming_fit_identical)
     {
         // TODO: If a future model's first node requires the second scheduled weight, there is an unresolved startup-read bug here.
         // Fix by ensuring the new schedule's first-node copy requirement is satisfied before returning from the schedule_next_identical path.
@@ -2435,9 +2836,7 @@ bool parameter_offloader::swap_next_schedule(size_t streaming_fit)
     {
         std::lock_guard<std::mutex> schedule_lock(schedule_mutex); // blocks streamer while tensor pointers move
         
-        LLAMA_LOG_INFO("%s 1\n", __func__);
-
-        //wait for in-flight copies to complete
+            //wait for in-flight copies to complete
         {
             std::unique_lock<std::mutex> lk(node_mu_);
             node_cv_.wait(lk, [&] {
@@ -2460,6 +2859,9 @@ bool parameter_offloader::swap_next_schedule(size_t streaming_fit)
 
         arena_stream_size = streaming_fit;
         retarget_schedule_tensors(schedule_next);
+
+        streaming_fit_applied_hash = streaming_fit_selected_hash;
+        streaming_fit_applied      = streaming_fit_selected;
 
         build_schedule_gates(schedule_next);
 
@@ -2599,14 +3001,14 @@ void parameter_offloader::retarget_schedule_tensors(offloader_schedule & schedul
 
     const size_t a = arena_alignment ? arena_alignment : 1; // alignment used for arena start offsets
 
-    size_t cur = 0; // next candidate arena offset
+    auto cache_it = streaming_fit_cache.find(streaming_fit_selected_hash);
+
+    const streaming_fit_cache_entry & cached_fit = cache_it->second[(size_t)streaming_fit_selected];
 
     std::vector<size_t> used_starts; // start offsets already assigned in this retarget pass
     used_starts.reserve(tensor_count);
 
-    std::vector<size_t> start(tensor_count); // arena-relative start offset for each scheduled tensor
-    std::vector<size_t> len(tensor_count); // backend padded allocation size for each scheduled tensor
-    std::vector<size_t> endv(tensor_count); // arena-relative end offset for each scheduled tensor
+    size_t layout_end = 0;
 
     for (size_t i = 0; i < tensor_count; ++i)
     {
@@ -2620,112 +3022,13 @@ void parameter_offloader::retarget_schedule_tensors(offloader_schedule & schedul
         const size_t slot_bytes = ggml_backend_buft_get_alloc_size(arena_buffer_type, w_cpu); // padded device bytes for this tensor
         GGML_ASSERT(slot_bytes <= arena_stream_size);
 
-        size_t off = align_up(cur, a); // candidate arena-relative start offset
-
-        if (off + slot_bytes > arena_stream_size)
-            off = 0;
-
-        const size_t max_tries = arena_stream_size / a + 2; // bound for unique-start search
-        size_t tries = 0; // number of alternate starts tried
-
-        while (std::find(used_starts.begin(), used_starts.end(), off) != used_starts.end())
-        {
-            off = align_up(off + a, a);
-
-            if (off + slot_bytes > arena_stream_size)
-                off = 0;
-
-            GGML_ASSERT(++tries <= max_tries);
-        }
+        const size_t off = cached_fit.offsets[i]; // exact arena-relative start offset generated by generate_streaming_fit()
 
         w_gpu->data = arena_base + off;
         ggml_backend_buffer_init_tensor(arena, w_gpu); // refresh backend tensor metadata after moving the arena pointer
 
         used_starts.push_back(off);
-
-        start[i] = off;
-        len[i] = slot_bytes;
-        endv[i] = off + slot_bytes;
-
-        cur = off + slot_bytes;
-    }
-
-    if (tensor_count <= 2)
-        return;
-
-    int last_cut = -1; // first index of the last wrapped placement generation
-
-    for (size_t i = 1; i < tensor_count; ++i)
-        if (start[i] < start[i - 1])
-            last_cut = (int)i;
-
-    const int k_begin = (last_cut == -1) ? 0 : last_cut; // first tensor in the final placement generation
-    const int tail_cnt = (int)tensor_count - k_begin; // number of tensors in the final placement generation
-
-    if (tail_cnt != 1)
-        return;
-
-    const int k = k_begin; // singleton tail tensor index to relocate
-    const int prev = (k - 1 + (int)tensor_count) % (int)tensor_count; // previous schedule index around the ring
-    const int next = (k + 1) % (int)tensor_count; // next schedule index around the ring
-
-    auto overlaps = [](size_t a0, size_t a1, size_t b0, size_t b1) -> bool {
-        return !(a1 <= b0 || b1 <= a0);
-    };
-
-    const size_t sz = len[k]; // padded size of singleton tail tensor
-
-    size_t cand = align_up((arena_stream_size > sz ? (arena_stream_size / 2 - sz / 2) : 0), a); // middle-ish candidate arena offset
-
-    if (cand + sz > arena_stream_size)
-        cand = arena_stream_size - sz;
-
-    const size_t step = a; // relocation search step
-    const size_t max_tries = arena_stream_size / step + 2; // relocation search bound
-
-    for (size_t tries = 0; tries < max_tries; ++tries)
-    {
-        const size_t a0 = cand; // candidate relocated start offset
-        const size_t a1 = cand + sz; // candidate relocated end offset
-
-        const bool clash =
-            overlaps(a0, a1, start[prev], endv[prev]) ||
-            overlaps(a0, a1, start[next], endv[next]);
-
-        bool unique = true; // true if no other tensor has this exact start offset
-
-        if (!clash)
-        {
-            for (size_t j = 0; j < tensor_count; ++j)
-            {
-                if ((int)j == k)
-                    continue;
-
-                if (start[j] == a0)
-                {
-                    unique = false;
-                    break;
-                }
-            }
-        }
-
-        if (!clash && unique)
-        {
-            ggml_tensor * w_gpu = schedule.gpu_tensors_in_order[k]; // singleton tail GPU tensor to relocate
-
-            w_gpu->data = arena_base + a0;
-            ggml_backend_buffer_init_tensor(arena, w_gpu); // refresh backend tensor metadata after moving the arena pointer
-
-            start[k] = a0;
-            endv[k] = a1;
-
-            break;
-        }
-
-        cand += step;
-
-        if (cand + sz > arena_stream_size)
-            cand = 0;
+        layout_end = std::max(layout_end, off + slot_bytes);
     }
 }
 
@@ -2762,10 +3065,6 @@ void parameter_offloader::build_schedule_gates(offloader_schedule & schedule)
         GGML_ASSERT(schedule.end_offset[i] <= arena_stream_size);
     }
 
-    auto overlaps_abs = [](size_t a0, size_t a1, size_t b0, size_t b1) -> bool {
-        return !(a1 <= b0 || b1 <= a0);
-    };
-
     for (int r = 0; r < N; ++r)
     {
         int barrier = r; // unwrapped last safe copy position after reading r
@@ -2779,7 +3078,7 @@ void parameter_offloader::build_schedule_gates(offloader_schedule & schedule)
 
             for (const auto & range : ring_byte_ranges)
             {
-                if (overlaps_abs(range.first, range.second, schedule.start_offset[copy_idx], schedule.end_offset[copy_idx]))
+                if (ranges_overlap(range.first, range.second, schedule.start_offset[copy_idx], schedule.end_offset[copy_idx]))
                 {
                     copy_is_safe = false;
                     break;

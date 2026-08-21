@@ -79,13 +79,15 @@ public:
         std::vector<size_t> offsets;
     };
     std::unordered_map<uint64_t, std::vector<streaming_fit_cache_entry>> streaming_fit_cache;
-    uint64_t streaming_fit_cache_current_hash = 0;
-    int streaming_fit_cache_current = -1;
+    uint64_t streaming_fit_selected_hash = 0;
+    int streaming_fit_selected = -1;
+    uint64_t streaming_fit_applied_hash = 0;
+    int streaming_fit_applied = -1;
 
     size_t generate_streaming_fit(const offloader_schedule & schedule, const ggml_cgraph * graph);
     void retarget_schedule_tensors(offloader_schedule & schedule);
 
-    bool swap_next_schedule(size_t streaming_fit); // swaps after retargeting and gate build
+    bool swap_next_schedule(size_t streaming_fit); // swaps after applying the generated fit and rebuilding gates
 
     void build_schedule_gates(offloader_schedule & schedule); // compute copy barriers
 
