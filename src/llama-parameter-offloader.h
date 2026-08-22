@@ -33,7 +33,6 @@ public:
     bool ready = false;
 
     std::vector<ggml_tensor*> collected_order;      // CPU weights in first-use order
-    std::unordered_set<ggml_tensor*> collect_seen;  // dedupe during collection
 
     // Arena + twin-context
     llama_model*                model;

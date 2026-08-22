@@ -7,10 +7,7 @@
 #include "llama-graph.h"
 #include "../ggml/src/ggml-impl.h"
 
-#include <algorithm>
-#include <climits>
 #include <thread>
-#include <chrono>
 #include <condition_variable>
 #include <mutex>
 #include <math.h>       /* isfinite */
@@ -34,8 +31,6 @@
 //#define LLAMA_PRINT_ALL_NODES 1
 //#define LLAMA_LOG_READS 2
 //#define LLAMA_LOG_COPIES 2
-
-//#define LLAMA_NAIVE_OFFLOADER 1
 
 //#define LLAMA_PRINT_WEIGHT_READS
 /////////////////////////////////////
@@ -349,7 +344,6 @@ void parameter_offloader::attach_arena(ggml_backend_buffer_t arena)
 void parameter_offloader::seed_all_weights_from_model()
 {
     collected_order.clear();
-    collect_seen.clear();
 
     // Gather (name,tensor) to get a deterministic ordering (lexicographic by name)
     std::vector<std::pair<std::string, ggml_tensor *>> named;
@@ -376,6 +370,7 @@ void parameter_offloader::seed_all_weights_from_model()
 
     std::sort(named.begin(), named.end(), [](auto &a, auto &b){ return a.first < b.first; });
 
+    std::unordered_set<ggml_tensor*> collect_seen;  // dedupe during collection
     for (auto & kv : named)
     {
         ggml_tensor * t = kv.second;
@@ -815,8 +810,6 @@ ggml_tensor * parameter_offloader::init_cpu_tensor_to_arena(ggml_tensor * w_cpu,
     schedule_current.cpu_tensors_in_order.push_back(w_cpu);
     schedule_current.gpu_tensors_in_order.push_back(w_gpu);
     schedule_current.gpu2index.emplace(w_gpu, idx);
-    if ((int)schedule_current.ready_after.size() <= idx)
-        schedule_current.ready_after.resize(idx + 1, INT_MAX); // fill later
 
     // Bump arena pointer
     current_offset = off + slot_bytes;
@@ -855,9 +848,7 @@ void parameter_offloader::init(
     gpu2cpu.reserve(4096);
     cpu2gpu.reserve(4096);
 
-#ifndef LLAMA_NAIVE_OFFLOADER
     seed_all_weights_from_model();
-#endif
 
     const size_t packed = transform_all_cpu_weights_to_device_layout();
     LLAMA_LOG_INFO("host-packing: %zu/%zu weights packed on host\n",
@@ -871,89 +862,6 @@ void parameter_offloader::init(
         (void) init_cpu_tensor_to_arena(w_cpu, current_offset);
 
     model_ref_slots.clear();
-
-    //print_model_tensor_stats(model);
-
-    //re-target the pointers so that the tensors are right-justified in the arena
-    //if (false)
-    {
-        const size_t tensor_count = schedule_current.gpu_tensors_in_order.size();
-        if (tensor_count > 2)
-        {
-            // collect starts/lengths once
-            std::vector<size_t> start(tensor_count);
-            std::vector<size_t> len(tensor_count);
-            std::vector<size_t> endv(tensor_count);
-            for (size_t i = 0; i < tensor_count; ++i)
-            {
-                ggml_tensor *tg = schedule_current.gpu_tensors_in_order[i];
-                ggml_tensor *tc = gpu2cpu.at(tg);
-                start[i] = (size_t)((char*)tg->data - arena_base);
-                len  [i] = ggml_backend_buft_get_alloc_size(arena_buffer_type, tc);
-                endv [i] = start[i] + len[i];
-            }
-
-            // locate final wrap -> last generation = [last_cut .. N-1]
-            int last_cut = -1;
-            for (size_t i = 1; i < tensor_count; ++i)
-                if (start[i] < start[i - 1])
-                    last_cut = (int)i;
-
-            int k_begin = (last_cut == -1) ? 0 : last_cut;
-            int tail_cnt = (int)tensor_count - k_begin;
-
-            if (tail_cnt == 1)
-            {
-                const int k    = k_begin;
-                const int prev = (k - 1 + (int)tensor_count) % (int)tensor_count;
-                const int next = (k + 1) % (int)tensor_count;
-
-                const size_t sz = len[k];
-
-                // mid arena, aligned, clamped
-                size_t cand = align_up((arena_dense_size > sz ? (arena_dense_size/2 - sz/2) : 0), arena_alignment);
-                if (cand + sz > arena_dense_size)
-                    cand = arena_dense_size - sz;
-
-                const size_t step = arena_alignment ? arena_alignment : 1;
-                const size_t max_tries = arena_dense_size / step + 2;
-
-                for (size_t tries = 0; tries < max_tries; ++tries)
-                {
-                    const size_t a0 = cand;
-                    const size_t a1 = cand + sz;
-                    const bool clash =
-                        ranges_overlap(a0, a1, start[prev], endv[prev]) ||
-                        ranges_overlap(a0, a1, start[next], endv[next]);
-
-                    bool unique = true;
-                    if (!clash)
-                        for (size_t j = 0; j < tensor_count; ++j) {
-                            if ((int)j == k)
-                                continue;
-                            if (start[j] == a0)
-                            { 
-                                unique = false;
-                                break;
-                            }
-                        }
-
-                    if (!clash && unique)
-                    {
-                        ggml_tensor *w_gpu = schedule_current.gpu_tensors_in_order[k];
-                        w_gpu->data = arena_base + a0;
-                        ggml_backend_buffer_init_tensor(arena, w_gpu);
-                        start[k] = a0; endv[k] = a1;
-                        break;
-                    }
-
-                    cand += step;
-                    if (cand + sz > arena_dense_size)
-                        cand = 0; // wrap search
-                }
-            }
-        }
-    }
 
     //////////////////////////////////////////////////////////////////
     //       CREATE COPY SCHEDULE
@@ -1197,8 +1105,8 @@ bool parameter_offloader::on_eval_tensor(ggml_tensor * node)
 
     const char * name   = ggml_get_name(w_gpu);
     const size_t off    = (size_t)((char *) w_gpu->data - arena_base);
-    const size_t bytes  = ggml_backend_buft_get_alloc_size(arena_buffer_type, w_cpu);
-    const size_t nbytes = ggml_nbytes(w_cpu);
+    //const size_t bytes  = ggml_backend_buft_get_alloc_size(arena_buffer_type, w_cpu);
+    //const size_t nbytes = ggml_nbytes(w_cpu);
 
     long long used_ordinal = tensor_idx_used_ordinal.load(std::memory_order_relaxed);
     bool gate_advanced = false;
@@ -1296,8 +1204,6 @@ bool parameter_offloader::on_eval_tensor(ggml_tensor * node)
     }
 
 #ifdef LLAMA_CHECK_WEIGHTS
-    //hash_compare_tensor(w_cpu, w_gpu, arena_base, idx);
-    //if (idx == 606)
     {
         const size_t nbytes_g = ggml_nbytes(w_gpu);
         std::vector<uint8_t> tmp_(nbytes_g);
@@ -1333,15 +1239,6 @@ bool parameter_offloader::on_eval_tensor(ggml_tensor * node)
             ggml_tensor * w = node->src[0]; // V weight
             ggml_tensor * x = node->src[1]; // FA output (permuted)
 
-            // Peel views for clarity (optional)
-            ggml_tensor * pw = w;
-            while (pw && pw->view_src)
-                pw = pw->view_src;
-
-            ggml_tensor * px = x;
-            while (px && px->view_src)
-                px = px->view_src;
-
             // Check the FA output that feeds the GEMM:
             if (x)
                 finite_check_node(x);    // now meaningful (x exists & is computed)
@@ -1367,42 +1264,8 @@ bool llama_offloader_eval_cb(ggml_tensor * node, bool ask, void * ud)
     // ---- PHASE A: order collection (ready == false) ----
     if (!po->ready)
     {
-#ifdef LLAMA_NAIVE_OFFLOADER
-        //Naive weight collection. If LLAMA_NAIVE_OFFLOADER is true then initial weight collection is done here
-
-        // Only observe matmuls during warm-up to keep batching intact
-        if (ask)
-            return node->op == GGML_OP_MUL_MAT;
-
-        // find the real model weight among sources
-        ggml_tensor * w = nullptr;
-        for (int k = 0; k < GGML_MAX_SRC; ++k)
-        {
-            ggml_tensor * s = node->src[k];
-            if (!s)
-                break;
-            ggml_tensor * p = s;
-            while (p->view_src)
-                p = p->view_src; // peel views
-
-            if (po->cpu_weight_set.find(p) == po->cpu_weight_set.end())
-                continue; // must be a model weight
-            if (!(p->buffer && ggml_backend_buffer_is_host(p->buffer)))
-                continue; // on host
-            w = p;
-            break;
-        }
-        if (!w)
-            return true; // nothing to record
-
-        if (po->collect_seen.insert(w).second) {
-            po->collected_order.push_back(w);
-        }
-        return true;
-#else
         if (!po)
             return !ask;
-#endif
     }
 
     //LLAMA_LOG_INFO("%s before ask == %d\n", __func__, ask);
@@ -2305,7 +2168,6 @@ bool llama_offloader_graph_cb(ggml_backend_sched_t sched, struct ggml_cgraph * g
 {
     LLAMA_LOG_INFO("%s 1\n", __func__);
 
-#ifndef LLAMA_NAIVE_OFFLOADER
     struct parameter_offloader *po = static_cast<parameter_offloader *>(ud);
     if (!po || !sched || !graph)
         return true;
@@ -2381,10 +2243,7 @@ bool llama_offloader_graph_cb(ggml_backend_sched_t sched, struct ggml_cgraph * g
 
     LLAMA_LOG_INFO("%s 2\n", __func__);
 
-    const bool schedule_changed = po->swap_next_schedule(streaming_fit);
-    (void)schedule_changed;
-
-#endif /* ifndef LLAMA_NAIVE_OFFLOADER */
+    po->swap_next_schedule(streaming_fit);
 
     LLAMA_LOG_INFO("%s 3\n", __func__);
 
