@@ -71,6 +71,11 @@ static inline int ordinal_mod(long long ordinal, int n)
     return (int)(ordinal % (long long)n);
 }
 
+static inline int ring_distance(int from, int to, int n)
+{
+    return (to - from + n) % n;
+}
+
 static inline long long advance_ordinal_to_idx(long long ordinal, int idx, int tensor_count)
 {
     if (ordinal < 0)
@@ -256,7 +261,7 @@ static bool parameter_offloader_deepseek4_node_may_read_dense_weight(const ggml_
         case GGML_OP_SOFT_MAX:       // attn_sinks on non-flash attention
         case GGML_OP_FLASH_ATTN_EXT: // attn_sinks on flash attention
         //case GGML_OP_MUL_MAT_ID:   // routed expert banks; SPARSE
-        case GGML_OP_DSV4_HC_COMB:   // per-layer HC base/scale; repeated and currently unsupported
+        case GGML_OP_DSV4_HC_COMB:   // per-layer HC base/scale
             return true;
         default:
             return false;
@@ -1085,9 +1090,7 @@ bool parameter_offloader::wants_observe(ggml_tensor * node)
     return node_reads_tracked_weight(node, /*out_idx*/ nullptr);
 }
 
-// Called when a node we opted into observing is actually executed.
-// Pick the “latest” managed weight used by this node and advance your
-// tensor_idx_used_mod/tensor_idx_used_epoch/tensor_idx_used_seq just like you do now.
+// Called after an observed node executes; advance all schedule positions released by this node and wait for the next required streamed tensor if COPY has not reached it yet.
 bool parameter_offloader::on_eval_tensor(ggml_tensor * node)
 {
     int idx = -1;
@@ -1098,15 +1101,6 @@ bool parameter_offloader::on_eval_tensor(ggml_tensor * node)
     const int tensor_count = (int)schedule_current.gpu_tensors_in_order.size();
     //if (idx == tensor_count - 1)
     //    LLAMA_LOG_INFO("%s got to idx %d\n", __func__, idx);
-
-    // Resolve the GPU twin + its CPU source so we can print name/size/offset
-    ggml_tensor * w_gpu = schedule_current.gpu_tensors_in_order[idx];
-    ggml_tensor * w_cpu = gpu2cpu[w_gpu];
-
-    const char * name   = ggml_get_name(w_gpu);
-    const size_t off    = (size_t)((char *) w_gpu->data - arena_base);
-    //const size_t bytes  = ggml_backend_buft_get_alloc_size(arena_buffer_type, w_cpu);
-    //const size_t nbytes = ggml_nbytes(w_cpu);
 
     long long used_ordinal = tensor_idx_used_ordinal.load(std::memory_order_relaxed);
     bool gate_advanced = false;
@@ -1138,10 +1132,6 @@ bool parameter_offloader::on_eval_tensor(ggml_tensor * node)
     const long long needed_copy_ordinal = read_next_it != graph_analysis_current.read_next.end() ? advance_ordinal_to_idx(used_ordinal, read_next_it->second, tensor_count) : -1;
 
 #if defined(LLAMA_DIAGNOSE_COPY)
-    auto ring_dist = [&](int from, int to) -> int {
-        return (to - from + tensor_count) % tensor_count; // forward distance in ring
-    };
-
     long long copied_ordinal = tensor_idx_copied_ordinal.load(std::memory_order_relaxed);
 
     for (;;)
@@ -1153,8 +1143,8 @@ bool parameter_offloader::on_eval_tensor(ggml_tensor * node)
         {
             const int r_idx = cur_used_ordinal < 0 ? tensor_count - 1 : ordinal_mod(cur_used_ordinal, tensor_count); // current reader index
             const int bar   = schedule_current.ready_after[r_idx];         // last copyable index while r is read
-            const int di    = ring_dist(r_idx, i);                         // distance from reader to copy slot
-            const int dbar  = ring_dist(r_idx, bar);                       // distance from reader to barrier
+            const int di    = ring_distance(r_idx, i, tensor_count);       // distance from reader to copy slot
+            const int dbar  = ring_distance(r_idx, bar, tensor_count);     // distance from reader to barrier
 
             bool allowed = (di <= dbar) && (di <= LLAMA_DIAGNOSE_COPY || copied_ordinal < needed_copy_ordinal);
 
@@ -1205,6 +1195,12 @@ bool parameter_offloader::on_eval_tensor(ggml_tensor * node)
 
 #ifdef LLAMA_CHECK_WEIGHTS
     {
+        // Resolve the GPU twin + its CPU source so we can print name/size/offset
+        ggml_tensor * w_gpu = schedule_current.gpu_tensors_in_order[idx];
+        ggml_tensor * w_cpu = gpu2cpu.at(w_gpu);
+        const char * name   = ggml_get_name(w_gpu);
+        const size_t off    = (size_t)((char *) w_gpu->data - arena_base);
+
         const size_t nbytes_g = ggml_nbytes(w_gpu);
         std::vector<uint8_t> tmp_(nbytes_g);
         // copy device -> host for the logical bytes
@@ -1259,16 +1255,11 @@ bool llama_offloader_eval_cb(ggml_tensor * node, bool ask, void * ud)
 {
     struct parameter_offloader * po = static_cast<parameter_offloader *>(ud);
     if (!po)
-        return true;
-
-    // ---- PHASE A: order collection (ready == false) ----
-    if (!po->ready)
     {
-        if (!po)
-            return !ask;
+        LLAMA_LOG_INFO("%s ask == %d\n", __func__, ask);
+        return !ask;
+        //return true;
     }
-
-    //LLAMA_LOG_INFO("%s before ask == %d\n", __func__, ask);
 
     // Only return true for weights you actually track; keeps batching intact
     if (ask) {
@@ -1529,9 +1520,6 @@ void parameter_offloader::stream_worker()
                 submitted_ordinal = tensor_idx_copied_ordinal.load(std::memory_order_acquire);
             }
 
-            auto ring_dist = [&](int from, int to) -> int {
-                return (to - from + tensor_count) % tensor_count; // forward distance in active ring
-            };
             //We load from the atomic variable because swap_next_schedule can change this
             const long long last_submitted_ordinal = submitted_ordinal;                                   // last submitted ordinal
             const long long cur_used_ordinal = tensor_idx_used_ordinal.load(std::memory_order_acquire);   // last reader ordinal
@@ -1541,8 +1529,8 @@ void parameter_offloader::stream_worker()
             const int i = ordinal_mod(last_submitted_ordinal + 1, tensor_count); // next copy index
             const int r_idx = startup ? tensor_count - 1 : ordinal_mod(cur_used_ordinal, tensor_count); // reader or virtual startup index
             const int bar   = schedule_current.ready_after[r_idx];
-            const int di    = ring_dist(r_idx, i);   // distance from reader/startup to copy slot
-            const int dbar  = ring_dist(r_idx, bar); // distance from reader/startup to barrier
+            const int di    = ring_distance(r_idx, i, tensor_count);   // distance from reader/startup to copy slot
+            const int dbar  = ring_distance(r_idx, bar, tensor_count); // distance from reader/startup to barrier
 
             GGML_ASSERT(bar >= 0);
 
@@ -2160,8 +2148,6 @@ void parameter_offloader::build_next_schedule(offloader_schedule & schedule, den
         schedule.cpu_tensors_in_order.push_back(gpu2cpu.at(w_gpu));
         schedule.gpu2index.emplace(w_gpu, idx);
     }
-
-    build_graph_runtime_metadata(analysis, schedule);
 }
 
 bool llama_offloader_graph_cb(ggml_backend_sched_t sched, struct ggml_cgraph * graph, void * ud)
@@ -2200,7 +2186,8 @@ bool llama_offloader_graph_cb(ggml_backend_sched_t sched, struct ggml_cgraph * g
         while (po->static_tensor_bytes > (po->streaming_fit_upper_bound >= po->arena_dense_size ? 0 : po->arena_dense_size - po->streaming_fit_upper_bound));
 
         po->build_next_schedule(po->schedule_next, po->graph_analysis_next);
-        po->generate_streaming_fit(po->schedule_next, po->graph_analysis_next);
+        po->build_graph_runtime_metadata(po->graph_analysis_next, po->schedule_next);
+        streaming_fit = po->generate_streaming_fit(po->schedule_next, po->graph_analysis_next);
         po->build_schedule_gates(po->schedule_next);
 
         parameter_offloader::dense_graph_cache_entry cache_entry;
@@ -2235,11 +2222,12 @@ bool llama_offloader_graph_cb(ggml_backend_sched_t sched, struct ggml_cgraph * g
 
         po->schedule_next = cache_it->second.schedule;
         po->build_graph_runtime_metadata(po->graph_analysis_next, po->schedule_next);
-    }
 
-    // The solved schedule itself is the authoritative streaming placement; no separate fit size is cached.
-    for (size_t end_offset : po->schedule_next.end_offset)
-        streaming_fit = std::max(streaming_fit, end_offset);
+        // A cached schedule already contains the solved physical placement, so recover its streaming extent directly.
+        // TODO: should the streaming_fit be cached?
+        for (size_t end_offset : po->schedule_next.end_offset)
+            streaming_fit = std::max(streaming_fit, end_offset);
+    }
 
     LLAMA_LOG_INFO("%s 2\n", __func__);
 
@@ -3080,10 +3068,6 @@ bool parameter_offloader::swap_next_schedule(size_t streaming_fit)
     #if defined(LLAMA_DIAGNOSE_COPY)
         const size_t tensor_count = schedule_current.gpu_tensors_in_order.size();
 
-        auto ring_dist = [&](int from, int to) -> int {
-            return (to - from + tensor_count) % tensor_count; // forward distance in ring
-        };
-
         long long copied_ordinal = tensor_idx_copied_ordinal.load(std::memory_order_relaxed);
 
         for (;;)
@@ -3095,8 +3079,8 @@ bool parameter_offloader::swap_next_schedule(size_t streaming_fit)
             {
                 const int r_idx = cur_used_ordinal < 0 ? tensor_count - 1 : ordinal_mod(cur_used_ordinal, tensor_count); // current reader index
                 const int bar   = schedule_current.ready_after[r_idx];         // last copyable index while r is read
-                const int di    = ring_dist(r_idx, i);                         // distance from reader to copy slot
-                const int dbar  = ring_dist(r_idx, bar);                       // distance from reader to barrier
+                const int di    = ring_distance(r_idx, i, tensor_count);       // distance from reader to copy slot
+                const int dbar  = ring_distance(r_idx, bar, tensor_count);     // distance from reader to barrier
 
                 bool allowed = (di <= dbar) && (di <= LLAMA_DIAGNOSE_COPY || copied_ordinal < startup_copy_idx);
 
@@ -3128,7 +3112,7 @@ bool parameter_offloader::swap_next_schedule(size_t streaming_fit)
 
         changed = true;
 
-        print_snapshot(schedule_current);
+        //print_snapshot(schedule_current);
     }
 
     // The new schedule is now completely published and schedule_mutex is free.

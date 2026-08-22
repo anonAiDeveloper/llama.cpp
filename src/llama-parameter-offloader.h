@@ -225,6 +225,6 @@ private:
     std::atomic<int> copy_publishers_in_flight{0};
     void publish_copy_when_ready(long long ordinal, uint64_t generation, ggml_cuda_copy_event * ev);
     void publish_copy_now(long long ordinal, uint64_t generation);
-public:
-    inline ggml_cuda_copy_event * upload_weight_auto(ggml_tensor *w_cpu, ggml_tensor *w_gpu);       //TODO: Why is this public?
+    
+    inline ggml_cuda_copy_event * upload_weight_auto(ggml_tensor *w_cpu, ggml_tensor *w_gpu);
 };
