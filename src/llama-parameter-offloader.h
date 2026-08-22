@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <atomic>
 #include <climits>
+#include <cstdint>
 #include <thread>
 #include <chrono>
 #include <condition_variable>
@@ -61,33 +62,79 @@ public:
 
         std::vector<size_t> start_offset; // arena start offset for each scheduled GPU tensor
         std::vector<size_t> end_offset;   // arena end offset for each scheduled GPU tensor
-        std::vector<ggml_tensor*> read_last_node;             // per schedule index: node at which this schedule position may be released. Usually, not always, the last instance of it being read
-        std::unordered_map<ggml_tensor*, int> read_next;      // node -> next schedule index when the immediately following read is a first read
     };
+
+    struct dense_graph_analysis
+    {
+        uint64_t hash = 0;
+        std::vector<ggml_tensor *> gpu_tensors_in_order;
+        std::unordered_map<ggml_tensor *, int> gpu2index;
+        std::vector<ggml_tensor *> read_nodes;
+        std::vector<std::vector<ggml_tensor *>> node_reads;
+        std::vector<ggml_tensor *> read_last_node;
+        std::unordered_map<ggml_tensor *, int> read_next;
+    };
+
+    struct dense_graph_cache_entry
+    {
+        std::vector<ggml_tensor *> static_dense_order;
+        offloader_schedule schedule;
+    };
+
+    struct streaming_fit_lifetime_analysis
+    {
+        std::vector<std::vector<int>> managed_node_reads;
+        std::vector<size_t> tensor_bytes;
+        std::vector<std::vector<int>> resident_tensor_indices;
+    };
+
     std::atomic<bool> schedule_swap_requested { false };
     std::mutex schedule_mutex;                    // protects schedule_current / schedule_next swaps and schedule reads
     offloader_schedule schedule_current;          // active schedule used by reader and streamer
     offloader_schedule schedule_next;             // candidate schedule built from latest graph callback
+    dense_graph_analysis graph_analysis_current;  // active graph read/release metadata used by runtime
+    dense_graph_analysis graph_analysis_next;     // analysis for the graph currently being prepared
     std::atomic<uint64_t> schedule_generation{0}; // latest published schedule generation
 
-    // Cached no-halt fit and exact offsets for a streamed tensor set + managed read pattern.
-    struct streaming_fit_cache_entry
-    {
-        std::vector<ggml_tensor*> gpu_tensors_in_order;
-        std::vector<int> read_signature;
-        size_t streaming_size = 0;
-        std::vector<size_t> offsets;
-    };
-    std::unordered_map<uint64_t, std::vector<streaming_fit_cache_entry>> streaming_fit_cache;
-    uint64_t streaming_fit_selected_hash = 0;
-    int streaming_fit_selected = -1;
-    uint64_t streaming_fit_applied_hash = 0;
-    int streaming_fit_applied = -1;
+    std::unordered_map<uint64_t, dense_graph_cache_entry> dense_graph_cache;
 
-    size_t generate_streaming_fit(const offloader_schedule & schedule, const ggml_cgraph * graph);
-    void retarget_schedule_tensors(offloader_schedule & schedule);
+    size_t streaming_fit_lower_bound = 0;
+    size_t streaming_fit_upper_bound = 0;
+    size_t static_tensor_bytes = 0;
 
-    bool swap_next_schedule(size_t streaming_fit); // swaps after applying the generated fit and rebuilding gates
+    std::vector<ggml_tensor *> static_dense_order;
+    std::unordered_set<ggml_tensor *> static_dense_set;
+
+    // Analyze managed dense-weight reads for this graph and build the graph-specific read structure/hash.
+    uint64_t analyze_dense_graph(ggml_backend_sched_t sched, const ggml_cgraph * graph, dense_graph_analysis & analysis);
+
+    // Calculate the current streamed lower/upper arena-size bounds from graph reads and static membership.
+    void streaming_fit_calculate_bounds(const dense_graph_analysis & analysis);
+
+    // Add or eject static dense tensors to fit the current upper-bound split while preserving the spacing heuristic.
+    //TODO: Eventually we want to get this to fit as close to LOWER bound as we can, but that can get complicated.
+    bool select_static_dense_tensors(const dense_graph_analysis & analysis);
+
+    // Build the finalized streamed tensor schedule from the current graph analysis and static selection.
+    void build_next_schedule(offloader_schedule & schedule, dense_graph_analysis & analysis);
+
+    // Build current-graph runtime release and next-copy metadata for the finalized streamed schedule.
+    void build_graph_runtime_metadata(dense_graph_analysis & analysis, const offloader_schedule & schedule);
+
+    // Build fitter-only streamed lifetimes and resident sets used to derive physical coexistence constraints.
+    void build_streaming_fit_lifetimes(
+        const std::vector<ggml_tensor *> & gpu_tensors_in_order,
+        const std::unordered_map<ggml_tensor *, int> & gpu2index,
+        const dense_graph_analysis & analysis,
+        streaming_fit_lifetime_analysis & fit_analysis) const;
+
+    // Find and store a valid no-halt physical placement for every tensor in the finalized streamed schedule.
+    size_t generate_streaming_fit(offloader_schedule & schedule, const dense_graph_analysis & analysis);
+
+    // Apply the solved streamed offsets and pack/upload the current static dense tensors into the arena.
+    void seat_dense_tensors(offloader_schedule & schedule);
+
+    bool swap_next_schedule(size_t streaming_fit); // swaps after applying the solved schedule
 
     void build_schedule_gates(offloader_schedule & schedule); // compute copy barriers
 
@@ -134,7 +181,7 @@ public:
 private:
     void seed_all_weights_from_model();
 
-    ggml_tensor * init_cpu_tensor_to_arena(ggml_tensor * w_cpu, size_t current_offset);
+    ggml_tensor * init_cpu_tensor_to_arena(ggml_tensor * w_cpu, size_t & current_offset);
 
     void attach_arena(ggml_backend_buffer_t arena);
     void clear_moe_cache_refs();
@@ -155,9 +202,6 @@ private:
 
     // Track which host weights have been permanently device-packed
     std::unordered_map<ggml_tensor*, PackedHostBytes> host_packed_;
-
-    // We own these new host buffers; free them in ~parameter_offloader()
-    std::vector<ggml_backend_buffer_t> owned_host_buffers_;
 
     // Permanently transform a host tensor to the device-native layout (stored on host).
     // Returns false if already transformed or if preconditions are not met.
