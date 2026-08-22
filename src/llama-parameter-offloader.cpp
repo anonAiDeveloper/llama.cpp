@@ -453,259 +453,301 @@ bool parameter_offloader::transform_cpu_tensor_to_device_layout(ggml_tensor * w_
     return true;
 }
 
-// For the given model, replace the cpu weight w_cpu pointer with a pointer to w_gpu
-// This should be called on each cpu weight that needs to be pointer to a gpu weight ONCE on init
-// We do this by brute force checking each weight member in the model, until we find a match to update
-void patch_model_refs_for(llama_model * model, ggml_tensor * w_cpu, ggml_tensor * w_gpu) {
-    // same matching rule you used: pointer match, else name match
-    const char * cname = ggml_get_name(w_cpu);
+// Enumerate model tensor pointer slots once so later CPU->GPU patching is a direct lookup instead of a full model scan.
+void parameter_offloader::build_model_ref_lookup()
+{
+    model_ref_slots.clear();
+    model_ref_slots.reserve(cpu_weight_set.size());
 
-    auto equal = [&](ggml_tensor * t) -> bool {
-        if (t == w_cpu) return true;
-        if (!cname || !t) return false;
-        const char * tname = ggml_get_name(t);
-        return tname && std::strcmp(tname, cname) == 0;
+    // Build the original CPU-tensor name lookup once so the old pointer-OR-name matching behavior is preserved exactly.
+    std::unordered_map<std::string, std::vector<ggml_tensor *>> cpu_weights_by_name;
+    cpu_weights_by_name.reserve(cpu_weight_set.size());
+
+    for (ggml_tensor * w_cpu : cpu_weight_set)
+    {
+        const char * name = ggml_get_name(w_cpu);
+        if (name)
+            cpu_weights_by_name[name].push_back(w_cpu);
+    }
+
+    // Register one mutable tensor-pointer slot under one CPU tensor, without adding the same slot twice.
+    auto register_slot = [&](ggml_tensor * w_cpu, ggml_tensor * & slot) {
+        std::vector<ggml_tensor **> & slots = model_ref_slots[w_cpu];
+        if (std::find(slots.begin(), slots.end(), &slot) == slots.end())
+            slots.push_back(&slot);
     };
 
-    auto SET = [&](ggml_tensor *& slot) {
-        if (equal(slot)) slot = w_gpu;
+    // Index one model member using both pointer identity and tensor-name matching, exactly like the old patch loop.
+    auto INDEX = [&](ggml_tensor * & slot) {
+        if (!slot)
+            return;
+
+        if (cpu_weight_set.find(slot) != cpu_weight_set.end())
+            register_slot(slot, slot);
+
+        const char * name = ggml_get_name(slot);
+        if (!name)
+            return;
+
+        auto it = cpu_weights_by_name.find(name);
+        if (it == cpu_weights_by_name.end())
+            return;
+
+        for (ggml_tensor * w_cpu : it->second)
+            register_slot(w_cpu, slot);
     };
 
     // -------------------
     // top-level (model)
     // -------------------
-    SET(model->tok_embd);
-    SET(model->type_embd);
-    SET(model->pos_embd);
-    SET(model->tok_norm);
-    SET(model->tok_norm_b);
+    INDEX(model->tok_embd);
+    INDEX(model->type_embd);
+    INDEX(model->pos_embd);
+    INDEX(model->tok_norm);
+    INDEX(model->tok_norm_b);
 
-    SET(model->output_norm);
-    SET(model->output_norm_b);
-    SET(model->output);
-    SET(model->output_b);
-    SET(model->output_norm_enc);
+    INDEX(model->output_norm);
+    INDEX(model->output_norm_b);
+    INDEX(model->output);
+    INDEX(model->output_b);
+    INDEX(model->output_norm_enc);
 
-    SET(model->output_s);
-    SET(model->output_in_s);
-    SET(model->hc_head_fn);
-    SET(model->hc_head_base);
-    SET(model->hc_head_scale);
+    INDEX(model->output_s);
+    INDEX(model->output_in_s);
+    INDEX(model->hc_head_fn);
+    INDEX(model->hc_head_base);
+    INDEX(model->hc_head_scale);
 
-    SET(model->nextn_proj_pre);
-    SET(model->nextn_proj_post);
+    INDEX(model->nextn_proj_pre);
+    INDEX(model->nextn_proj_post);
 
-    SET(model->cls);
-    SET(model->cls_b);
-    SET(model->cls_out);
-    SET(model->cls_out_b);
-    SET(model->cls_norm);
+    INDEX(model->cls);
+    INDEX(model->cls_b);
+    INDEX(model->cls_out);
+    INDEX(model->cls_out_b);
+    INDEX(model->cls_norm);
 
-    SET(model->conv1d);
-    SET(model->conv1d_b);
+    INDEX(model->conv1d);
+    INDEX(model->conv1d_b);
 
-    SET(model->altup_proj);
-    SET(model->altup_unembd_proj);
-    SET(model->per_layer_tok_embd);
-    SET(model->per_layer_model_proj);
-    SET(model->per_layer_proj_norm);
+    INDEX(model->altup_proj);
+    INDEX(model->altup_unembd_proj);
+    INDEX(model->per_layer_tok_embd);
+    INDEX(model->per_layer_model_proj);
+    INDEX(model->per_layer_proj_norm);
 
-    SET(model->fc);
-    SET(model->d2t);
+    INDEX(model->fc);
+    INDEX(model->d2t);
 
     // -------------------
     // per-layer
     // -------------------
-    const int nl = (int) model->hparams.n_layer();
-    for (int il = 0; il < nl; ++il) {
+    const int nl = (int)model->hparams.n_layer();
+    for (int il = 0; il < nl; ++il)
+    {
         llama_layer & L = model->layers[il];
 
         // normalization
-        SET(L.attn_norm);        SET(L.attn_norm_b);
-        SET(L.attn_norm_2);      SET(L.attn_norm_2_b);
-        SET(L.attn_q_norm);      SET(L.attn_q_norm_b);
-        SET(L.attn_k_norm);      SET(L.attn_k_norm_b);
-        SET(L.attn_out_norm);    SET(L.attn_out_norm_b);
-        SET(L.attn_q_a_norm);    SET(L.attn_kv_a_norm);
-        SET(L.attn_kv_norm);
-        SET(L.attn_sub_norm);    SET(L.attn_post_norm);
-        SET(L.ffn_sub_norm);     SET(L.attn_norm_cross);
-        SET(L.attn_norm_enc);    SET(L.ssm_norm);
-        SET(L.ssm_dt_norm);      SET(L.ssm_b_norm);
-        SET(L.ssm_c_norm);
+        INDEX(L.attn_norm);        INDEX(L.attn_norm_b);
+        INDEX(L.attn_norm_2);      INDEX(L.attn_norm_2_b);
+        INDEX(L.attn_q_norm);      INDEX(L.attn_q_norm_b);
+        INDEX(L.attn_k_norm);      INDEX(L.attn_k_norm_b);
+        INDEX(L.attn_out_norm);    INDEX(L.attn_out_norm_b);
+        INDEX(L.attn_q_a_norm);    INDEX(L.attn_kv_a_norm);
+        INDEX(L.attn_kv_norm);
+        INDEX(L.attn_sub_norm);    INDEX(L.attn_post_norm);
+        INDEX(L.ffn_sub_norm);     INDEX(L.attn_norm_cross);
+        INDEX(L.attn_norm_enc);    INDEX(L.ssm_norm);
+        INDEX(L.ssm_dt_norm);      INDEX(L.ssm_b_norm);
+        INDEX(L.ssm_c_norm);
 
         // attention
-        SET(L.wq);        SET(L.wk);        SET(L.wv);        SET(L.wo);
-        SET(L.wqkv);      SET(L.wq_a);      SET(L.wq_b);      SET(L.wkv_a_mqa);
-        SET(L.wkv);       SET(L.wkv_b);     SET(L.wk_b);      SET(L.wv_b);
-        SET(L.wqkv_b);    SET(L.wo_a);      SET(L.wo_b);
-        SET(L.wq_cross);  SET(L.wk_cross);  SET(L.wv_cross);  SET(L.wo_cross);
-        SET(L.wq_enc);    SET(L.wk_enc);    SET(L.wv_enc);    SET(L.wo_enc);
-        SET(L.wqkv_gate);
+        INDEX(L.wq);        INDEX(L.wk);        INDEX(L.wv);        INDEX(L.wo);
+        INDEX(L.wqkv);      INDEX(L.wq_a);      INDEX(L.wq_b);      INDEX(L.wkv_a_mqa);
+        INDEX(L.wkv);       INDEX(L.wkv_b);     INDEX(L.wk_b);      INDEX(L.wv_b);
+        INDEX(L.wqkv_b);    INDEX(L.wo_a);      INDEX(L.wo_b);
+        INDEX(L.wq_cross);  INDEX(L.wk_cross);  INDEX(L.wv_cross);  INDEX(L.wo_cross);
+        INDEX(L.wq_enc);    INDEX(L.wk_enc);    INDEX(L.wv_enc);    INDEX(L.wo_enc);
+        INDEX(L.wqkv_gate);
 
         // relative position bias
-        SET(L.attn_rel_b);       SET(L.attn_rel_b_enc);
-        SET(L.attn_rel_b_cross);
+        INDEX(L.attn_rel_b);       INDEX(L.attn_rel_b_enc);
+        INDEX(L.attn_rel_b_cross);
 
         // normalization
-        SET(L.ffn_norm);       SET(L.ffn_norm_b);
-        SET(L.ffn_post_norm);  SET(L.ffn_post_norm_1); SET(L.ffn_post_norm_2);
-        SET(L.ffn_pre_norm_2); SET(L.layer_out_norm);  SET(L.layer_out_norm_b);
-        SET(L.ffn_norm_exps);  SET(L.ffn_norm_enc);
+        INDEX(L.ffn_norm);       INDEX(L.ffn_norm_b);
+        INDEX(L.ffn_post_norm);  INDEX(L.ffn_post_norm_1); INDEX(L.ffn_post_norm_2);
+        INDEX(L.ffn_pre_norm_2); INDEX(L.layer_out_norm);  INDEX(L.layer_out_norm_b);
+        INDEX(L.ffn_norm_exps);  INDEX(L.ffn_norm_enc);
 
         // ff
-        SET(L.ffn_gate);       SET(L.ffn_down);
-        SET(L.ffn_up);         SET(L.ffn_gate_enc);
-        SET(L.ffn_down_enc);   SET(L.ffn_up_enc);
+        INDEX(L.ffn_gate);       INDEX(L.ffn_down);
+        INDEX(L.ffn_up);         INDEX(L.ffn_gate_enc);
+        INDEX(L.ffn_down_enc);   INDEX(L.ffn_up_enc);
 
         // ff MoE
-        SET(L.ffn_gate_inp);      SET(L.ffn_gate_inp_s);
-        SET(L.ffn_gate_tid2eid);
-        //SET(L.ffn_gate_exps);     SET(L.ffn_down_exps);       //sparse layers are handled separately
-        //SET(L.ffn_up_exps);       SET(L.ffn_gate_up_exps);
-        SET(L.ffn_gate_inp_b);
-        //SET(L.ffn_gate_exps_b);    SET(L.ffn_down_exps_b);
-        //SET(L.ffn_up_exps_b);      SET(L.ffn_gate_up_exps_b);
+        INDEX(L.ffn_gate_inp);      INDEX(L.ffn_gate_inp_s);
+        INDEX(L.ffn_gate_tid2eid);
+        //INDEX(L.ffn_gate_exps);     INDEX(L.ffn_down_exps);       //sparse layers are handled separately
+        //INDEX(L.ffn_up_exps);       INDEX(L.ffn_gate_up_exps);
+        INDEX(L.ffn_gate_inp_b);
+        //INDEX(L.ffn_gate_exps_b);    INDEX(L.ffn_down_exps_b);
+        //INDEX(L.ffn_up_exps_b);      INDEX(L.ffn_gate_up_exps_b);
 
         // ff MoE per-expert scales (NVFP4 per-tensor scale2)
         // Routed expert tensors are handled by the sparse cache.
-        //SET(L.ffn_gate_exps_s);     SET(L.ffn_down_exps_s);
-        //SET(L.ffn_up_exps_s);
+        //INDEX(L.ffn_gate_exps_s);     INDEX(L.ffn_down_exps_s);
+        //INDEX(L.ffn_up_exps_s);
 
         // ff MoE latent proj
-        SET(L.ffn_latent_down);     SET(L.ffn_latent_up);
+        INDEX(L.ffn_latent_down);     INDEX(L.ffn_latent_up);
 
         // ffn shared expert (shexp)
-        SET(L.ffn_gate_inp_shexp);  SET(L.ffn_gate_shexp);
-        SET(L.ffn_down_shexp);      SET(L.ffn_up_shexp);
+        INDEX(L.ffn_gate_inp_shexp);  INDEX(L.ffn_gate_shexp);
+        INDEX(L.ffn_down_shexp);      INDEX(L.ffn_up_shexp);
 
         // ff adjugate experts (chexps)
-        //SET(L.ffn_gate_chexps);     SET(L.ffn_down_chexps);       //sparse layers are handled separately
-        //SET(L.ffn_up_chexps);
+        //INDEX(L.ffn_gate_chexps);     INDEX(L.ffn_down_chexps);       //sparse layers are handled separately
+        //INDEX(L.ffn_up_chexps);
 
         // ffn bias
-        SET(L.ffn_gate_b);   SET(L.ffn_down_b);
-        SET(L.ffn_up_b);     SET(L.ffn_act);
-        SET(L.ffn_exp_probs_b);
+        INDEX(L.ffn_gate_b);   INDEX(L.ffn_down_b);
+        INDEX(L.ffn_up_b);     INDEX(L.ffn_act);
+        INDEX(L.ffn_exp_probs_b);
 
         // mamba proj
-        SET(L.ssm_in);   SET(L.ssm_x);
-        SET(L.ssm_dt);   SET(L.ssm_out);
+        INDEX(L.ssm_in);   INDEX(L.ssm_x);
+        INDEX(L.ssm_dt);   INDEX(L.ssm_out);
 
         // mamba
-        SET(L.ssm_conv1d);   SET(L.ssm_a);
-        SET(L.ssm_d);
+        INDEX(L.ssm_conv1d);   INDEX(L.ssm_a);
+        INDEX(L.ssm_d);
 
         // mamba bias
-        SET(L.ssm_conv1d_b); SET(L.ssm_dt_b);
+        INDEX(L.ssm_conv1d_b); INDEX(L.ssm_dt_b);
 
         // qwen3next
-        SET(L.ssm_beta_alpha);
+        INDEX(L.ssm_beta_alpha);
 
         // qwen3.5
-        SET(L.ssm_alpha);
+        INDEX(L.ssm_alpha);
 
         // rwkv
-        SET(L.time_mix_w1);     SET(L.time_mix_w2);
-        SET(L.time_mix_lerp_x); SET(L.time_mix_lerp_w);
-        SET(L.time_mix_lerp_k); SET(L.time_mix_lerp_v);
-        SET(L.time_mix_lerp_r); SET(L.time_mix_lerp_g);
-        SET(L.time_mix_lerp_fused);
+        INDEX(L.time_mix_w1);     INDEX(L.time_mix_w2);
+        INDEX(L.time_mix_lerp_x); INDEX(L.time_mix_lerp_w);
+        INDEX(L.time_mix_lerp_k); INDEX(L.time_mix_lerp_v);
+        INDEX(L.time_mix_lerp_r); INDEX(L.time_mix_lerp_g);
+        INDEX(L.time_mix_lerp_fused);
 
-        SET(L.time_mix_first);      SET(L.time_mix_decay);
-        SET(L.time_mix_decay_w1);   SET(L.time_mix_decay_w2);
-        SET(L.time_mix_key);        SET(L.time_mix_key_b);
-        SET(L.time_mix_value);      SET(L.time_mix_value_b);
-        SET(L.time_mix_receptance); SET(L.time_mix_receptance_b);
-        SET(L.time_mix_gate);
+        INDEX(L.time_mix_first);      INDEX(L.time_mix_decay);
+        INDEX(L.time_mix_decay_w1);   INDEX(L.time_mix_decay_w2);
+        INDEX(L.time_mix_key);        INDEX(L.time_mix_key_b);
+        INDEX(L.time_mix_value);      INDEX(L.time_mix_value_b);
+        INDEX(L.time_mix_receptance); INDEX(L.time_mix_receptance_b);
+        INDEX(L.time_mix_gate);
 
         // rwkv7
-        SET(L.time_mix_w0);
-        SET(L.time_mix_a0);  SET(L.time_mix_a1);  SET(L.time_mix_a2);
-        SET(L.time_mix_v0);  SET(L.time_mix_v1);  SET(L.time_mix_v2);
-        SET(L.time_mix_g1);  SET(L.time_mix_g2);
-        SET(L.time_mix_k_k); SET(L.time_mix_k_a); SET(L.time_mix_r_k);
+        INDEX(L.time_mix_w0);
+        INDEX(L.time_mix_a0);  INDEX(L.time_mix_a1);  INDEX(L.time_mix_a2);
+        INDEX(L.time_mix_v0);  INDEX(L.time_mix_v1);  INDEX(L.time_mix_v2);
+        INDEX(L.time_mix_g1);  INDEX(L.time_mix_g2);
+        INDEX(L.time_mix_k_k); INDEX(L.time_mix_k_a); INDEX(L.time_mix_r_k);
 
-        SET(L.time_mix_ln);  SET(L.time_mix_ln_b);
-        SET(L.time_mix_output);
+        INDEX(L.time_mix_ln);  INDEX(L.time_mix_ln_b);
+        INDEX(L.time_mix_output);
 
-        SET(L.channel_mix_lerp_k);   SET(L.channel_mix_lerp_r);
+        INDEX(L.channel_mix_lerp_k);   INDEX(L.channel_mix_lerp_r);
 
-        SET(L.channel_mix_key);      SET(L.channel_mix_receptance);
-        SET(L.channel_mix_value);
+        INDEX(L.channel_mix_key);      INDEX(L.channel_mix_receptance);
+        INDEX(L.channel_mix_value);
 
         // long rope factors
-        SET(L.rope_long); SET(L.rope_short); SET(L.rope_freqs);
+        INDEX(L.rope_long); INDEX(L.rope_short); INDEX(L.rope_freqs);
 
         // bitnet scale
-        SET(L.wq_s);   SET(L.wk_s);   SET(L.wv_s);   SET(L.wo_s);
-        SET(L.wqkv_s); SET(L.wqkv_gate_s);
-        SET(L.ffn_gate_s);       SET(L.ffn_up_s);       SET(L.ffn_down_s);
-        SET(L.ffn_gate_shexp_s); SET(L.ffn_up_shexp_s); SET(L.ffn_down_shexp_s);
-        SET(L.ssm_in_s);    SET(L.ssm_out_s);
-        SET(L.ssm_alpha_s); SET(L.ssm_beta_s);
+        INDEX(L.wq_s);   INDEX(L.wk_s);   INDEX(L.wv_s);   INDEX(L.wo_s);
+        INDEX(L.wqkv_s); INDEX(L.wqkv_gate_s);
+        INDEX(L.ffn_gate_s);       INDEX(L.ffn_up_s);       INDEX(L.ffn_down_s);
+        INDEX(L.ffn_gate_shexp_s); INDEX(L.ffn_up_shexp_s); INDEX(L.ffn_down_shexp_s);
+        INDEX(L.ssm_in_s);    INDEX(L.ssm_out_s);
+        INDEX(L.ssm_alpha_s); INDEX(L.ssm_beta_s);
 
         // input scales
-        SET(L.wq_in_s);   SET(L.wk_in_s);   SET(L.wv_in_s);   SET(L.wo_in_s);
-        SET(L.wqkv_in_s); SET(L.wqkv_gate_in_s);
-        SET(L.ffn_gate_in_s);       SET(L.ffn_up_in_s);        SET(L.ffn_down_in_s);
+        INDEX(L.wq_in_s);   INDEX(L.wk_in_s);   INDEX(L.wv_in_s);   INDEX(L.wo_in_s);
+        INDEX(L.wqkv_in_s); INDEX(L.wqkv_gate_in_s);
+        INDEX(L.ffn_gate_in_s);       INDEX(L.ffn_up_in_s);        INDEX(L.ffn_down_in_s);
         // Routed expert tensors are handled by the sparse cache.
-        //SET(L.ffn_gate_exps_in_s);  SET(L.ffn_down_exps_in_s); SET(L.ffn_up_exps_in_s);
-        SET(L.ffn_gate_shexp_in_s); SET(L.ffn_up_shexp_in_s);  SET(L.ffn_down_shexp_in_s);
-        SET(L.ssm_in_in_s);    SET(L.ssm_out_in_s);
-        SET(L.ssm_alpha_in_s); SET(L.ssm_beta_in_s);
+        //INDEX(L.ffn_gate_exps_in_s);  INDEX(L.ffn_down_exps_in_s); INDEX(L.ffn_up_exps_in_s);
+        INDEX(L.ffn_gate_shexp_in_s); INDEX(L.ffn_up_shexp_in_s);  INDEX(L.ffn_down_shexp_in_s);
+        INDEX(L.ssm_in_in_s);    INDEX(L.ssm_out_in_s);
+        INDEX(L.ssm_alpha_in_s); INDEX(L.ssm_beta_in_s);
 
         // altup & laurel
-        SET(L.per_layer_inp_gate); SET(L.per_layer_proj); SET(L.per_layer_post_norm);
-        SET(L.altup_correct_coef);  SET(L.altup_correct_scale);
-        SET(L.altup_predict_coef);  SET(L.altup_router);
-        SET(L.altup_router_norm);
-        SET(L.laurel_l);  SET(L.laurel_r);
-        SET(L.laurel_post_norm);
+        INDEX(L.per_layer_inp_gate); INDEX(L.per_layer_proj); INDEX(L.per_layer_post_norm);
+        INDEX(L.altup_correct_coef);  INDEX(L.altup_correct_scale);
+        INDEX(L.altup_predict_coef);  INDEX(L.altup_router);
+        INDEX(L.altup_router_norm);
+        INDEX(L.laurel_l);  INDEX(L.laurel_r);
+        INDEX(L.laurel_post_norm);
 
         // openai-moe
-        SET(L.attn_sinks);
+        INDEX(L.attn_sinks);
 
         // cogvlm
-        SET(L.visexp_attn_wqkv);  SET(L.visexp_attn_wo);
-        SET(L.visexp_ffn_gate);   SET(L.visexp_ffn_down);
-        SET(L.visexp_ffn_up);
+        INDEX(L.visexp_attn_wqkv);  INDEX(L.visexp_attn_wo);
+        INDEX(L.visexp_ffn_gate);   INDEX(L.visexp_ffn_down);
+        INDEX(L.visexp_ffn_up);
 
         // xIELU activation parameters for Apertus
-        SET(L.ffn_act_alpha_n);  SET(L.ffn_act_alpha_p);
-        SET(L.ffn_act_beta);     SET(L.ffn_act_eps);
+        INDEX(L.ffn_act_alpha_n);  INDEX(L.ffn_act_alpha_p);
+        INDEX(L.ffn_act_beta);     INDEX(L.ffn_act_eps);
 
         // Kimi Linear KDA
-        SET(L.ssm_q_conv); SET(L.ssm_k_conv); SET(L.ssm_v_conv);
-        SET(L.ssm_f_a);    SET(L.ssm_f_b);    SET(L.ssm_beta);
-        SET(L.ssm_g_a);    SET(L.ssm_g_b);    SET(L.ssm_o_norm);
+        INDEX(L.ssm_q_conv); INDEX(L.ssm_k_conv); INDEX(L.ssm_v_conv);
+        INDEX(L.ssm_f_a);    INDEX(L.ssm_f_b);    INDEX(L.ssm_beta);
+        INDEX(L.ssm_g_a);    INDEX(L.ssm_g_b);    INDEX(L.ssm_o_norm);
 
         // DSA
-        SET(L.indexer_k_norm); SET(L.indexer_k_norm_b); SET(L.indexer_proj);
-        SET(L.indexer_attn_k); SET(L.indexer_attn_q_b);
+        INDEX(L.indexer_k_norm); INDEX(L.indexer_k_norm_b); INDEX(L.indexer_proj);
+        INDEX(L.indexer_attn_k); INDEX(L.indexer_attn_q_b);
 
         // DeepSeek V4
-        SET(L.hc_attn_fn);       SET(L.hc_ffn_fn);
-        SET(L.hc_attn_base);     SET(L.hc_attn_scale);
-        SET(L.hc_ffn_base);      SET(L.hc_ffn_scale);
-        SET(L.attn_comp_wkv);    SET(L.attn_comp_wgate);
-        SET(L.attn_comp_ape);    SET(L.attn_comp_norm);
-        SET(L.indexer_comp_wkv); SET(L.indexer_comp_wgate);
-        SET(L.indexer_comp_ape); SET(L.indexer_comp_norm);
+        INDEX(L.hc_attn_fn);       INDEX(L.hc_ffn_fn);
+        INDEX(L.hc_attn_base);     INDEX(L.hc_attn_scale);
+        INDEX(L.hc_ffn_base);      INDEX(L.hc_ffn_scale);
+        INDEX(L.attn_comp_wkv);    INDEX(L.attn_comp_wgate);
+        INDEX(L.attn_comp_ape);    INDEX(L.attn_comp_norm);
+        INDEX(L.indexer_comp_wkv); INDEX(L.indexer_comp_wgate);
+        INDEX(L.indexer_comp_ape); INDEX(L.indexer_comp_norm);
 
         // gemma4 layer output scale, reused for talkie embedding skip scale
-        SET(L.out_scale);
+        INDEX(L.out_scale);
     }
 
-    // keep the name map coherent too
-    if (cname) {
-        for (auto & kv : model->tensors_by_name) {
-            if (kv.second == w_cpu || kv.first == cname) {
-                kv.second = w_gpu;
-                // don't break: same name can appear multiple times
-            }
-        }
+    // Index model->tensors_by_name using both value-pointer identity and the map key as the old name fallback.
+    for (auto & kv : model->tensors_by_name)
+    {
+        if (kv.second && cpu_weight_set.find(kv.second) != cpu_weight_set.end())
+            register_slot(kv.second, kv.second);
+
+        auto it = cpu_weights_by_name.find(kv.first);
+        if (it == cpu_weights_by_name.end())
+            continue;
+
+        for (ggml_tensor * w_cpu : it->second)
+            register_slot(w_cpu, kv.second);
     }
+}
+
+// Patch every pre-indexed model slot that refers to this CPU tensor.
+void parameter_offloader::patch_model_refs_for(ggml_tensor * w_cpu, ggml_tensor * w_gpu)
+{
+    auto it = model_ref_slots.find(w_cpu);
+    if (it == model_ref_slots.end())
+        return;
+
+    for (ggml_tensor ** slot : it->second)
+        *slot = w_gpu;
 }
 
 ggml_tensor * parameter_offloader::init_cpu_tensor_to_arena(ggml_tensor * w_cpu, size_t & current_offset)
@@ -779,7 +821,7 @@ ggml_tensor * parameter_offloader::init_cpu_tensor_to_arena(ggml_tensor * w_cpu,
     // Bump arena pointer
     current_offset = off + slot_bytes;
 
-    patch_model_refs_for(model, w_cpu, w_gpu);
+    patch_model_refs_for(w_cpu, w_gpu);
 
 #ifdef LLAMA_CHECK_WEIGHTS
     //record hashes right after we create the gpu tensors
@@ -821,9 +863,14 @@ void parameter_offloader::init(
     LLAMA_LOG_INFO("host-packing: %zu/%zu weights packed on host\n",
                 packed, collected_order.size());
 
+    // Build the model-slot index once, then patch each mirrored tensor through direct lookup.
+    build_model_ref_lookup();
+
     size_t current_offset = 0;
     for (ggml_tensor * w_cpu : collected_order)
         (void) init_cpu_tensor_to_arena(w_cpu, current_offset);
+
+    model_ref_slots.clear();
 
     //print_model_tensor_stats(model);
 

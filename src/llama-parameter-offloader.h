@@ -181,6 +181,15 @@ public:
 private:
     void seed_all_weights_from_model();
 
+    // Index every model tensor pointer slot once so CPU->GPU patching can use direct lookup.
+    void build_model_ref_lookup();
+
+    // Patch every indexed model tensor pointer slot associated with one CPU tensor.
+    void patch_model_refs_for(ggml_tensor * w_cpu, ggml_tensor * w_gpu);
+
+    // CPU weight -> every llama_model/llama_layer/name-map pointer slot that must follow its GPU twin.
+    std::unordered_map<ggml_tensor *, std::vector<ggml_tensor **>> model_ref_slots;
+
     ggml_tensor * init_cpu_tensor_to_arena(ggml_tensor * w_cpu, size_t & current_offset);
 
     void attach_arena(ggml_backend_buffer_t arena);
