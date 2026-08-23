@@ -3058,6 +3058,7 @@ void parameter_offloader::seat_dense_tensors(offloader_schedule & schedule)
 {
     const size_t tensor_count = schedule.gpu_tensors_in_order.size(); // number of streamed GPU twins to retarget
     const size_t a = arena_alignment ? arena_alignment : 1; // alignment used for arena start offsets
+    const size_t reusable_static_count = common_prefix_len(static_dense_order_current, static_dense_order); // unchanged top-down static prefix already resident at the same offsets
 
     // Seat every streamed tensor at the exact offset stored in the solved schedule.
     if (tensor_count > 0)
@@ -3085,11 +3086,12 @@ void parameter_offloader::seat_dense_tensors(offloader_schedule & schedule)
         }
     }
 
-    // Pack static dense tensors downward from the top of the dense arena and upload their authoritative host bytes.
+    // Pack static dense tensors downward from the top of the dense arena and upload only the changed suffix.
     size_t static_cursor = arena_dense_size;
 
-    for (ggml_tensor * w_gpu : static_dense_order)
+    for (size_t i = 0; i < static_dense_order.size(); ++i)
     {
+        ggml_tensor * w_gpu = static_dense_order[i];
         ggml_tensor * w_cpu = gpu2cpu.at(w_gpu);
         const size_t slot_bytes = ggml_backend_buft_get_alloc_size(arena_buffer_type, w_cpu);
 
@@ -3104,15 +3106,20 @@ void parameter_offloader::seat_dense_tensors(offloader_schedule & schedule)
         w_gpu->data = arena_base + off;
         ggml_backend_buffer_init_tensor(arena, w_gpu);
 
-        ggml_cuda_copy_event * ev = upload_weight_auto(w_cpu, w_gpu);
-        if (ev)
+        if (i >= reusable_static_count)
         {
-            ggml_cuda_copy_event_wait(ev);
-            ggml_cuda_copy_event_destroy(ev);
+            ggml_cuda_copy_event * ev = upload_weight_auto(w_cpu, w_gpu);
+            if (ev)
+            {
+                ggml_cuda_copy_event_wait(ev);
+                ggml_cuda_copy_event_destroy(ev);
+            }
         }
 
         static_cursor = off;
     }
+
+    static_dense_order_current = static_dense_order;
 }
 
 void parameter_offloader::build_schedule_gates(offloader_schedule & schedule)
@@ -3217,7 +3224,7 @@ bool llama_offloader_graph_cb(ggml_backend_sched_t sched, struct ggml_cgraph * g
     std::unordered_set<ggml_tensor *> newly_deprioritized;
 
     // Deprioritize tensors that are actually static now but are omitted from the incoming graph.
-    for (ggml_tensor * w_gpu : po->static_dense_order)
+    for (ggml_tensor * w_gpu : po->static_dense_order_current)
     {
         if (po->graph_analysis_next.gpu2index.find(w_gpu) != po->graph_analysis_next.gpu2index.end())
             continue;
@@ -3267,6 +3274,14 @@ bool llama_offloader_graph_cb(ggml_backend_sched_t sched, struct ggml_cgraph * g
             po->streaming_fit_calculate_bounds(po->graph_analysis_next);
         }
         while (po->static_tensor_bytes > (po->streaming_fit_upper_bound >= po->arena_dense_size ? 0 : po->arena_dense_size - po->streaming_fit_upper_bound));
+
+        // Canonicalize the finalized static layout so the same tensor set always receives the same top-down placement.
+        std::sort(po->static_dense_order.begin(), po->static_dense_order.end(), [](ggml_tensor * lhs, ggml_tensor * rhs) {
+            const char * lhs_name = ggml_get_name(lhs);
+            const char * rhs_name = ggml_get_name(rhs);
+            const int name_cmp = std::strcmp(lhs_name ? lhs_name : "", rhs_name ? rhs_name : "");
+            return name_cmp != 0 ? name_cmp < 0 : (uintptr_t)lhs < (uintptr_t)rhs;
+        });
 
         po->build_next_schedule(po->schedule_next, po->graph_analysis_next);
         po->build_graph_runtime_metadata(po->graph_analysis_next, po->schedule_next);

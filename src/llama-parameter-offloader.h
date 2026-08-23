@@ -137,6 +137,7 @@ public:
     size_t static_tensor_bytes = 0;
 
     std::vector<ggml_tensor *> static_dense_order;
+    std::vector<ggml_tensor *> static_dense_order_current;
     std::unordered_set<ggml_tensor *> static_dense_set;
     std::unordered_set<ggml_tensor *> deprioritized_dense_set;
 
