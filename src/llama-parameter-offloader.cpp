@@ -1995,13 +1995,14 @@ bool parameter_offloader::select_static_dense_tensors(const dense_graph_analysis
 
     const size_t original_static_count = static_dense_order.size();
 
-    // Greedily choose fitting tensors that maximize cyclic distance from tensors already selected for static storage.
+    // Greedily choose fitting non-deprioritized tensors first, then maximize cyclic distance from tensors already selected for static storage.
     while (selected_indices.size() + 1 < tensor_count)
     {
         size_t best_idx = SIZE_MAX;
         size_t best_spacing = 0;
         size_t best_bytes = SIZE_MAX;
         size_t best_footprint = 0;
+        bool best_deprioritized = false;
 
         for (size_t i = 0; i < tensor_count; ++i)
         {
@@ -2032,12 +2033,15 @@ bool parameter_offloader::select_static_dense_tensors(const dense_graph_analysis
                 spacing = std::min(spacing, cyclic_distance);
             }
 
-            if (best_idx == SIZE_MAX || spacing > best_spacing || (spacing == best_spacing && bytes < best_bytes))
+            const bool deprioritized = deprioritized_dense_set.find(w_gpu) != deprioritized_dense_set.end();
+
+            if (best_idx == SIZE_MAX || (best_deprioritized && !deprioritized) || (best_deprioritized == deprioritized && (spacing > best_spacing || (spacing == best_spacing && bytes < best_bytes))))
             {
                 best_idx = i;
                 best_spacing = spacing;
                 best_bytes = bytes;
                 best_footprint = footprint;
+                best_deprioritized = deprioritized;
             }
         }
 
@@ -3209,12 +3213,48 @@ bool llama_offloader_graph_cb(ggml_backend_sched_t sched, struct ggml_cgraph * g
 #endif
 
     const uint64_t graph_hash = po->analyze_dense_graph(sched, graph, po->graph_analysis_next);
+
+    std::unordered_set<ggml_tensor *> newly_deprioritized;
+
+    // Deprioritize tensors that are actually static now but are omitted from the incoming graph.
+    for (ggml_tensor * w_gpu : po->static_dense_order)
+    {
+        if (po->graph_analysis_next.gpu2index.find(w_gpu) != po->graph_analysis_next.gpu2index.end())
+            continue;
+
+        if (po->deprioritized_dense_set.insert(w_gpu).second)
+            newly_deprioritized.insert(w_gpu);
+    }
+
+    // Invalidate only cached layouts that made a newly deprioritized tensor static.
+    if (!newly_deprioritized.empty())
+    {
+        for (auto it = po->dense_graph_cache.begin(); it != po->dense_graph_cache.end(); )
+        {
+            bool invalidate = false;
+
+            for (ggml_tensor * w_gpu : it->second.static_dense_order)
+            {
+                if (newly_deprioritized.find(w_gpu) == newly_deprioritized.end())
+                    continue;
+
+                invalidate = true;
+                break;
+            }
+
+            if (invalidate)
+                it = po->dense_graph_cache.erase(it);
+            else
+                ++it;
+        }
+    }
+
     auto cache_it = po->dense_graph_cache.find(graph_hash);
     size_t streaming_fit = 0;
 
     if (cache_it == po->dense_graph_cache.end())
     {
-        // A new graph gets its own static/streamed partition; graph omission blacklisting is deliberately not implemented yet.
+        // A new graph gets its own static/streamed partition.
         po->static_dense_order.clear();
         po->static_dense_set.clear();
         po->static_tensor_bytes = 0;

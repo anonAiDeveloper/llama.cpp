@@ -138,6 +138,7 @@ public:
 
     std::vector<ggml_tensor *> static_dense_order;
     std::unordered_set<ggml_tensor *> static_dense_set;
+    std::unordered_set<ggml_tensor *> deprioritized_dense_set;
 
     // Analyze managed dense-weight reads for this graph and build the graph-specific read structure/hash.
     uint64_t analyze_dense_graph(ggml_backend_sched_t sched, const ggml_cgraph * graph, dense_graph_analysis & analysis);
