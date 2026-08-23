@@ -23,13 +23,29 @@ int32_t llama_offloader_moe_residency_cb(int block_id, int32_t expert_id, void *
 struct parameter_offloader
 {
 public:
-    static constexpr int32_t MOE_CACHE_SLOT_COUNT = 16;     //temporary hardcoded slot count. In the future we will make this configurable, perhaps with per-model recommended defaults
-
+    // Misc helper functions
     struct parameter_offloader_model_i {
         bool (*weight_supported)(const std::string & name);
         bool (*node_may_read_dense_weight)(const ggml_tensor * node);
     };
 
+    // Fast lookups
+    // GPU->CPU: answer "what CPU weight backs this GPU twin?"
+    std::unordered_map<ggml_tensor*, ggml_tensor*> gpu2cpu;
+    // CPU->GPU: answer "do we already have a GPU twin for this CPU weight?"
+    std::unordered_map<ggml_tensor*, ggml_tensor*> cpu2gpu;
+
+    // Must preserve original CPU tensors by name even after patch_model_refs_for()
+    // changes model->tensors_by_name to point at GPU/placeholder twins.
+    std::unordered_map<std::string, ggml_tensor *> cpu_weight_by_name;
+
+
+    std::unordered_set<ggml_tensor*> cpu_weight_set; // CPU weight ptrs
+    std::unordered_set<ggml_tensor*> gpu_weight_set; // GPU weight ptrs
+
+    void copy_host_to_arena_with_transform(ggml_tensor * src_host, ggml_tensor * dst_arena);
+
+    // Init and destructor functions
     bool ready = false;
 
     std::vector<ggml_tensor*> collected_order;      // CPU weights in first-use order
@@ -39,9 +55,7 @@ public:
     const parameter_offloader_model_i * model_i = nullptr; // selected once from model->arch
     ggml_backend_buffer_t       arena           = nullptr; // offloader CUDA arena buffer
     ggml_context*               ctx_gpu_twins   = nullptr; // no-alloc ctx for duplicated GPU tensors
-    ggml_context*               ctx_moe_cache   = nullptr;
     bool                        owns_arena      = false;
-    int32_t                     moe_cache_n_slots = 0;
 
     // Cached placement info
     ggml_backend_buffer_type_t  arena_buffer_type  = nullptr;   // backend type for arena allocation sizing/layout
@@ -51,6 +65,12 @@ public:
     size_t                      arena_stream_size  = 0;         // dense streaming region size
     size_t                      arena_alignment = 0;            // required byte alignment for arena placement
 
+    void init(ggml_backend_buffer_t arena,     llama_context_params params,
+              ggml_context        * ctx_twins, llama_context      * lctx);
+    parameter_offloader(llama_model * model);
+    ~parameter_offloader();
+
+    // Streaming thread functions
     struct offloader_schedule
     {
         // Scheduling
@@ -63,6 +83,26 @@ public:
         std::vector<size_t> end_offset;   // arena end offset for each scheduled GPU tensor
     };
 
+    std::atomic<bool> schedule_swap_requested { false };
+    std::mutex schedule_mutex;                    // protects schedule_current / schedule_next swaps and schedule reads
+    offloader_schedule schedule_current;          // active schedule used by reader and streamer
+    offloader_schedule schedule_next;             // candidate schedule built from latest graph callback
+    std::atomic<uint64_t> schedule_generation{0}; // latest published schedule generation
+
+    // runtime
+    std::thread        copy_thread;
+    std::atomic<bool>  stop_stream{false};
+
+    // start/stop the streaming worker
+    void start_streamer();
+    void stop_streamer_join();
+
+    // Eval callback functions
+    bool node_reads_tracked_weight(ggml_tensor * t, int * out_idx);
+    bool wants_observe(ggml_tensor * node);
+    bool on_eval_tensor(ggml_tensor * node);
+
+    // Graph callback functions
     struct dense_graph_analysis
     {
         uint64_t hash = 0;
@@ -87,13 +127,8 @@ public:
         std::vector<std::vector<int>> resident_tensor_indices;
     };
 
-    std::atomic<bool> schedule_swap_requested { false };
-    std::mutex schedule_mutex;                    // protects schedule_current / schedule_next swaps and schedule reads
-    offloader_schedule schedule_current;          // active schedule used by reader and streamer
-    offloader_schedule schedule_next;             // candidate schedule built from latest graph callback
     dense_graph_analysis graph_analysis_current;  // active graph read/release metadata used by runtime
     dense_graph_analysis graph_analysis_next;     // analysis for the graph currently being prepared
-    std::atomic<uint64_t> schedule_generation{0}; // latest published schedule generation
 
     std::unordered_map<uint64_t, dense_graph_cache_entry> dense_graph_cache;
 
@@ -137,47 +172,27 @@ public:
 
     void build_schedule_gates(offloader_schedule & schedule); // compute copy barriers
 
-    // Fast lookups
-    // GPU->CPU: answer "what CPU weight backs this GPU twin?"
-    std::unordered_map<ggml_tensor*, ggml_tensor*> gpu2cpu;
-    // CPU->GPU: answer "do we already have a GPU twin for this CPU weight?"
-    std::unordered_map<ggml_tensor*, ggml_tensor*> cpu2gpu;
+    // MoE cache
+    static constexpr int32_t MOE_CACHE_SLOT_COUNT = 16;     //temporary hardcoded slot count. In the future we will make this configurable, perhaps with per-model recommended defaults
 
-    // Must preserve original CPU tensors by name even after patch_model_refs_for()
-    // changes model->tensors_by_name to point at GPU/placeholder twins.
-    std::unordered_map<std::string, ggml_tensor *> cpu_weight_by_name;
-
-    //map the gpu tensors to hashes recorded at init, to ensure data integrity
-    std::unordered_map<ggml_tensor*, uint64_t> gpu_hashes;
-
-    std::unordered_set<ggml_tensor*> cpu_weight_set; // CPU weight ptrs
-    std::unordered_set<ggml_tensor*> gpu_weight_set; // GPU weight ptrs
+    ggml_context*               ctx_moe_cache   = nullptr;
+    int32_t                     moe_cache_n_slots = 0;
 
     void init_moe_cache(ggml_backend_buffer_t arena, int32_t n_slots);
     int32_t debug_cache_moe_expert(int block_id, int32_t expert_id);
 
-    void init(ggml_backend_buffer_t arena,     llama_context_params params,
-              ggml_context        * ctx_twins, llama_context      * lctx);
-    parameter_offloader(llama_model * model);
-    ~parameter_offloader();
-
-    void copy_host_to_arena_with_transform(ggml_tensor * src_host, ggml_tensor * dst_arena);
-
-
-    // runtime
-    std::thread        copy_thread;
-    std::atomic<bool>  stop_stream{false};
-
-    bool node_reads_tracked_weight(ggml_tensor * t, int * out_idx);
-    bool wants_observe(ggml_tensor * node);
-    bool on_eval_tensor(ggml_tensor * node);
-
-    // start/stop the streaming worker
-    void start_streamer();
-    void stop_streamer_join();
+    // Diagnostics
+    //map the gpu tensors to hashes recorded at init, to ensure data integrity
+    std::unordered_map<ggml_tensor*, uint64_t> gpu_hashes;
 
     void print_snapshot(offloader_schedule & schedule);
 private:
+    // Misc helper functions
+    inline bool no_transform_needed_for_backend_(const ggml_tensor *t) const;
+
+    inline ggml_cuda_copy_event * upload_weight_auto(ggml_tensor *w_cpu, ggml_tensor *w_gpu);
+
+    // Init and destructor functions
     void seed_all_weights_from_model();
 
     // Index every model tensor pointer slot once so CPU->GPU patching can use direct lookup.
@@ -192,15 +207,6 @@ private:
     ggml_tensor * init_cpu_tensor_to_arena(ggml_tensor * w_cpu, size_t & current_offset);
 
     void attach_arena(ggml_backend_buffer_t arena);
-    void clear_moe_cache_refs();
-    std::mutex moe_cache_mu;
-    int32_t moe_cache_next_slot = 0;
-
-    std::atomic<long long> tensor_idx_copied_ordinal{-1}; // last copied ordinal in current schedule stream
-    std::atomic<long long> tensor_idx_used_ordinal{-1};   // last read ordinal in current schedule stream
-
-    std::mutex              node_mu_;
-    std::condition_variable node_cv_;
 
     struct PackedHostBytes {
         ggml_backend_buffer_t buf = nullptr;  // owns the RAM block
@@ -218,13 +224,27 @@ private:
     // (optional) helper: transform all collected host weights
     size_t transform_all_cpu_weights_to_device_layout();
 
+    // Streaming thread functions
+    std::atomic<long long> tensor_idx_copied_ordinal{-1}; // last copied ordinal in current schedule stream
+    std::atomic<long long> tensor_idx_used_ordinal{-1};   // last read ordinal in current schedule stream
+
+    std::mutex              node_mu_;
+    std::condition_variable node_cv_;
+
     void stream_worker();
-    
-    inline bool no_transform_needed_for_backend_(const ggml_tensor *t) const;
 
     std::atomic<int> copy_publishers_in_flight{0};
     void publish_copy_when_ready(long long ordinal, uint64_t generation, ggml_cuda_copy_event * ev);
     void publish_copy_now(long long ordinal, uint64_t generation);
-    
-    inline ggml_cuda_copy_event * upload_weight_auto(ggml_tensor *w_cpu, ggml_tensor *w_gpu);
+
+    // Eval callback functions
+
+    // Graph callback functions
+
+    // MoE cache
+    void clear_moe_cache_refs();
+    std::mutex moe_cache_mu;
+    int32_t moe_cache_next_slot = 0;
+
+    // Diagnostics
 };

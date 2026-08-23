@@ -2150,94 +2150,6 @@ void parameter_offloader::build_next_schedule(offloader_schedule & schedule, den
     }
 }
 
-bool llama_offloader_graph_cb(ggml_backend_sched_t sched, struct ggml_cgraph * graph, void * ud)
-{
-    LLAMA_LOG_INFO("%s 1\n", __func__);
-
-    struct parameter_offloader *po = static_cast<parameter_offloader *>(ud);
-    if (!po || !sched || !graph)
-        return true;
-
-    if (!po->ready)
-        return true;
-
-#ifdef LLAMA_PRINT_WEIGHT_READS
-    print_all_weight_reads(po, graph);
-#endif
-
-    const uint64_t graph_hash = po->analyze_dense_graph(sched, graph, po->graph_analysis_next);
-    auto cache_it = po->dense_graph_cache.find(graph_hash);
-    size_t streaming_fit = 0;
-
-    if (cache_it == po->dense_graph_cache.end())
-    {
-        // A new graph gets its own static/streamed partition; graph omission blacklisting is deliberately not implemented yet.
-        po->static_dense_order.clear();
-        po->static_dense_set.clear();
-        po->static_tensor_bytes = 0;
-
-        po->streaming_fit_calculate_bounds(po->graph_analysis_next);
-
-        do
-        {
-            po->select_static_dense_tensors(po->graph_analysis_next);
-            po->streaming_fit_calculate_bounds(po->graph_analysis_next);
-        }
-        while (po->static_tensor_bytes > (po->streaming_fit_upper_bound >= po->arena_dense_size ? 0 : po->arena_dense_size - po->streaming_fit_upper_bound));
-
-        po->build_next_schedule(po->schedule_next, po->graph_analysis_next);
-        po->build_graph_runtime_metadata(po->graph_analysis_next, po->schedule_next);
-        streaming_fit = po->generate_streaming_fit(po->schedule_next, po->graph_analysis_next);
-        po->build_schedule_gates(po->schedule_next);
-
-        parameter_offloader::dense_graph_cache_entry cache_entry;
-        cache_entry.static_dense_order = po->static_dense_order;
-        cache_entry.schedule = po->schedule_next;
-        po->dense_graph_cache.emplace(graph_hash, std::move(cache_entry));
-    }
-    else
-    {
-        po->static_dense_order = cache_it->second.static_dense_order;
-        po->static_dense_set.clear();
-        po->static_tensor_bytes = 0;
-
-        const size_t alignment = po->arena_alignment ? po->arena_alignment : 1;
-        size_t static_cursor = po->arena_dense_size;
-
-        // Rebuild the non-cached lookup/counting state from the cached static order.
-        for (ggml_tensor * w_gpu : po->static_dense_order)
-        {
-            ggml_tensor * w_cpu = po->gpu2cpu.at(w_gpu);
-            const size_t slot_bytes = ggml_backend_buft_get_alloc_size(po->arena_buffer_type, w_cpu);
-
-            po->static_dense_set.insert(w_gpu);
-
-            if (slot_bytes > static_cursor)
-                throw std::runtime_error("parameter_offloader: cached static dense layout exceeds dense arena");
-
-            static_cursor = align_down(static_cursor - slot_bytes, alignment);
-        }
-
-        po->static_tensor_bytes = po->arena_dense_size - static_cursor;
-
-        po->schedule_next = cache_it->second.schedule;
-        po->build_graph_runtime_metadata(po->graph_analysis_next, po->schedule_next);
-
-        // A cached schedule already contains the solved physical placement, so recover its streaming extent directly.
-        // TODO: should the streaming_fit be cached?
-        for (size_t end_offset : po->schedule_next.end_offset)
-            streaming_fit = std::max(streaming_fit, end_offset);
-    }
-
-    LLAMA_LOG_INFO("%s 2\n", __func__);
-
-    po->swap_next_schedule(streaming_fit);
-
-    LLAMA_LOG_INFO("%s 3\n", __func__);
-
-    return true;
-}
-
 // Generate a compact no-halt streaming arena size and a valid fixed offset for every streamed tensor.
 // Graph nodes are used only to derive tensor read lifetimes; placement itself is entirely tensor based.
 
@@ -3280,6 +3192,95 @@ void parameter_offloader::build_schedule_gates(offloader_schedule & schedule)
         schedule.ready_after[r] = barrier % N;
     }
 }
+
+bool llama_offloader_graph_cb(ggml_backend_sched_t sched, struct ggml_cgraph * graph, void * ud)
+{
+    LLAMA_LOG_INFO("%s 1\n", __func__);
+
+    struct parameter_offloader *po = static_cast<parameter_offloader *>(ud);
+    if (!po || !sched || !graph)
+        return true;
+
+    if (!po->ready)
+        return true;
+
+#ifdef LLAMA_PRINT_WEIGHT_READS
+    print_all_weight_reads(po, graph);
+#endif
+
+    const uint64_t graph_hash = po->analyze_dense_graph(sched, graph, po->graph_analysis_next);
+    auto cache_it = po->dense_graph_cache.find(graph_hash);
+    size_t streaming_fit = 0;
+
+    if (cache_it == po->dense_graph_cache.end())
+    {
+        // A new graph gets its own static/streamed partition; graph omission blacklisting is deliberately not implemented yet.
+        po->static_dense_order.clear();
+        po->static_dense_set.clear();
+        po->static_tensor_bytes = 0;
+
+        po->streaming_fit_calculate_bounds(po->graph_analysis_next);
+
+        do
+        {
+            po->select_static_dense_tensors(po->graph_analysis_next);
+            po->streaming_fit_calculate_bounds(po->graph_analysis_next);
+        }
+        while (po->static_tensor_bytes > (po->streaming_fit_upper_bound >= po->arena_dense_size ? 0 : po->arena_dense_size - po->streaming_fit_upper_bound));
+
+        po->build_next_schedule(po->schedule_next, po->graph_analysis_next);
+        po->build_graph_runtime_metadata(po->graph_analysis_next, po->schedule_next);
+        streaming_fit = po->generate_streaming_fit(po->schedule_next, po->graph_analysis_next);
+        po->build_schedule_gates(po->schedule_next);
+
+        parameter_offloader::dense_graph_cache_entry cache_entry;
+        cache_entry.static_dense_order = po->static_dense_order;
+        cache_entry.schedule = po->schedule_next;
+        po->dense_graph_cache.emplace(graph_hash, std::move(cache_entry));
+    }
+    else
+    {
+        po->static_dense_order = cache_it->second.static_dense_order;
+        po->static_dense_set.clear();
+        po->static_tensor_bytes = 0;
+
+        const size_t alignment = po->arena_alignment ? po->arena_alignment : 1;
+        size_t static_cursor = po->arena_dense_size;
+
+        // Rebuild the non-cached lookup/counting state from the cached static order.
+        for (ggml_tensor * w_gpu : po->static_dense_order)
+        {
+            ggml_tensor * w_cpu = po->gpu2cpu.at(w_gpu);
+            const size_t slot_bytes = ggml_backend_buft_get_alloc_size(po->arena_buffer_type, w_cpu);
+
+            po->static_dense_set.insert(w_gpu);
+
+            if (slot_bytes > static_cursor)
+                throw std::runtime_error("parameter_offloader: cached static dense layout exceeds dense arena");
+
+            static_cursor = align_down(static_cursor - slot_bytes, alignment);
+        }
+
+        po->static_tensor_bytes = po->arena_dense_size - static_cursor;
+
+        po->schedule_next = cache_it->second.schedule;
+        po->build_graph_runtime_metadata(po->graph_analysis_next, po->schedule_next);
+
+        // A cached schedule already contains the solved physical placement, so recover its streaming extent directly.
+        // TODO: should the streaming_fit be cached?
+        for (size_t end_offset : po->schedule_next.end_offset)
+            streaming_fit = std::max(streaming_fit, end_offset);
+    }
+
+    LLAMA_LOG_INFO("%s 2\n", __func__);
+
+    po->swap_next_schedule(streaming_fit);
+
+    LLAMA_LOG_INFO("%s 3\n", __func__);
+
+    return true;
+}
+
 /////////////////////////////////////
 //   MOE EXPERT CACHE
 /////////////////////////////////////
