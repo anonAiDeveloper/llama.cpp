@@ -881,22 +881,6 @@ void parameter_offloader::init(ggml_backend_buffer_t arena, llama_context_params
 
     //print_snapshot(schedule_current);
 
-#if defined(LLAMA_DIAGNOSE_COPY)
-    //streamer thread disabled during debug mode, so get things started with the first copy
-    ggml_tensor *w_cpu = schedule_current.cpu_tensors_in_order[0];
-    ggml_tensor *w_gpu = schedule_current.gpu_tensors_in_order[0];
-
-    ggml_cuda_copy_event * ev = upload_weight_auto(w_cpu, w_gpu);
-    if (ev) {
-        ggml_cuda_copy_event_wait(ev);
-        ggml_cuda_copy_event_destroy(ev);
-    }
-
-    tensor_idx_copied_ordinal.store((long long)tensor_count, std::memory_order_release);
-#else
-    start_streamer();                         // begin background H2D streaming
-#endif
-
     // Optional log
     size_t peak = 0;
     if (!schedule_current.end_offset.empty())
@@ -927,6 +911,25 @@ parameter_offloader::~parameter_offloader()
     host_packed_.clear();
 }
 
+void parameter_offloader::start()
+{
+    GGML_ASSERT(ready);
+#if defined(LLAMA_DIAGNOSE_COPY)
+    //streamer thread disabled during debug mode, so get things started with the first copy
+    ggml_tensor *w_cpu = schedule_current.cpu_tensors_in_order[0];
+    ggml_tensor *w_gpu = schedule_current.gpu_tensors_in_order[0];
+
+    ggml_cuda_copy_event * ev = upload_weight_auto(w_cpu, w_gpu);
+    if (ev) {
+        ggml_cuda_copy_event_wait(ev);
+        ggml_cuda_copy_event_destroy(ev);
+    }
+
+    tensor_idx_copied_ordinal.store((long long)tensor_count, std::memory_order_release);
+#else
+    start_streamer();                         // begin background H2D streaming
+#endif
+}
 void parameter_offloader::start_streamer() {
     stop_stream.store(false, std::memory_order_release);
     copy_thread = std::thread(&parameter_offloader::stream_worker, this);

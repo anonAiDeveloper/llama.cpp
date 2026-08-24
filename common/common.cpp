@@ -1431,6 +1431,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     }
 
     pimpl->context.reset(lctx);
+
+    pimpl->param_offloader->start();
 }
 
 llama_model * common_init_result::model() {

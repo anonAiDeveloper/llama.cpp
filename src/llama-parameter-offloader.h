@@ -92,9 +92,7 @@ public:
     std::thread        copy_thread;
     std::atomic<bool>  stop_stream{false};
 
-    // start/stop the streaming worker
-    void start_streamer();
-    void stop_streamer_join();
+    void start();
 
     // Eval callback functions
     bool node_reads_tracked_weight(ggml_tensor * t, int * out_idx);
@@ -206,6 +204,10 @@ private:
     std::unordered_map<ggml_tensor *, std::vector<ggml_tensor **>> model_ref_slots;
 
     ggml_tensor * init_cpu_tensor_to_arena(ggml_tensor * w_cpu, size_t & current_offset);
+
+    // start/stop the streaming worker
+    void start_streamer();
+    void stop_streamer_join();
 
     void attach_arena(ggml_backend_buffer_t arena);
 
