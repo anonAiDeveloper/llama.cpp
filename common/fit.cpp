@@ -847,6 +847,117 @@ enum common_params_fit_status common_fit_params(
     return status;
 }
 
+enum common_params_fit_status common_fit_parameter_offloader(
+        const char * path_model,
+        llama_model_params * mparams,
+        llama_context_params * cparams,
+        ggml_backend_dev_t device,
+        size_t * arena_size,
+        size_t margin,
+        size_t max_arena_size,
+        ggml_log_level log_level) {
+    const int64_t t0_us = llama_time_us();
+    common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
+
+    if (!mparams || !cparams || !device || !arena_size) {
+        LOG_ERR("%s: invalid parameter-offloader fit arguments\n", __func__);
+        return COMMON_PARAMS_FIT_STATUS_ERROR;
+    }
+
+    *arena_size = 0;
+
+    try {
+        llama_model_params mparams_probe = *mparams;
+        llama_context_params cparams_probe = *cparams;
+
+        //TODO: Apply the future CPU-computed-layer policy to this probe so it can reclaim GPU context/compute headroom instead of assuming all managed layers run on GPU.
+        // Probe the GPU-side context/compute footprint as though all ordinary layers were GPU-computed, but do not count their model-weight bytes toward the final reservation.
+        mparams_probe.n_gpu_layers = INT32_MAX;
+
+        // Preserve any existing tensor placement overrides in the probe, then add the
+        // parameter-offloader-specific placement for routed MoE expert banks. The real
+        // offloader leaves these authoritative expert tensors CPU-backed, so the fit
+        // graph must see the same placement or it substantially underestimates CUDA
+        // compute-buffer requirements.
+        std::vector<llama_model_tensor_buft_override> probe_tensor_buft_overrides;
+
+        if (mparams->tensor_buft_overrides) {
+            for (const llama_model_tensor_buft_override * override = mparams->tensor_buft_overrides;
+                 override->pattern != nullptr || override->buft != nullptr;
+                 ++override) {
+                probe_tensor_buft_overrides.push_back(*override);
+            }
+        }
+
+        probe_tensor_buft_overrides.push_back({
+            "blk\\.\\d+\\.ffn_(up|down|gate_up|gate)_(ch|)exps",
+            ggml_backend_cpu_buffer_type(),
+        });
+        probe_tensor_buft_overrides.push_back({nullptr, nullptr});
+
+        mparams_probe.tensor_buft_overrides = probe_tensor_buft_overrides.data();
+
+        // The MoE cache is carved out of the final arena, which does not exist yet during this probe.
+        cparams_probe.moe_expert_prefetch = false;
+
+        //TODO: Generalize this probe together with parameter_offloader before supporting multiple accelerator devices; the current arena targets one CUDA device.
+        std::vector<ggml_backend_dev_t> devs;
+        uint32_t hp_ngl = 0;
+        uint32_t hp_n_ctx_train = 0;
+        uint32_t hp_n_expert = 0;
+
+        const std::vector<llama_device_memory_data> dmds = common_get_device_memory_data_impl(
+            path_model, &mparams_probe, &cparams_probe, nullptr, devs, hp_ngl, hp_n_ctx_train, hp_n_expert, log_level);
+
+        size_t device_id = devs.size();
+
+        for (size_t id = 0; id < devs.size(); ++id) {
+            if (devs[id] == device) {
+                device_id = id;
+                break;
+            }
+        }
+
+        if (device_id == devs.size())
+            throw std::runtime_error("parameter-offloader device is not part of the model device set");
+
+        const llama_device_memory_data & dmd = dmds[device_id];
+        const int64_t projected_non_model = (int64_t)dmd.mb.context + (int64_t)dmd.mb.compute;
+        const int64_t available = dmd.free - projected_non_model - (int64_t)margin;
+
+        if (available <= 0)
+            throw common_params_fit_exception("no VRAM remains for the parameter-offloader arena after projected context/compute allocations and margin");
+
+        size_t selected = (size_t)available;
+
+        if (max_arena_size != 0)
+            selected = std::min(selected, max_arena_size);
+
+        //TODO: Add a minimum viable arena-size check once the offloader's minimum requirement is defined.
+        *arena_size = selected;
+
+        // Keep layers logically GPU-assigned while forcing the authoritative source weights to remain CPU-backed for parameter_offloader.
+        //TODO: Merge or explicitly reject user tensor buffer overrides instead of replacing them when parameter-offloader mode becomes user-selectable.
+        static const llama_model_tensor_buft_override source_weight_overrides[] = {{".*", ggml_backend_cpu_buffer_type()}, {nullptr, nullptr}};
+        mparams->n_gpu_layers = INT32_MAX;
+        mparams->tensor_buft_overrides = source_weight_overrides;
+
+        constexpr int64_t MiB = 1024 * 1024;
+        LOG_TRC("%s: device=%s free=%" PRId64 " MiB projected_context=%zu MiB projected_compute=%zu MiB margin=%zu MiB arena=%zu MiB\n",
+            __func__, ggml_backend_dev_name(device), dmd.free/MiB, dmd.mb.context/(size_t)MiB, dmd.mb.compute/(size_t)MiB, margin/(size_t)MiB, selected/(size_t)MiB);
+    } catch (const common_params_fit_exception & e) {
+        LOG_WRN("%s: failed to fit parameter-offloader arena: %s\n", __func__, e.what());
+        status = COMMON_PARAMS_FIT_STATUS_FAILURE;
+    } catch (const std::runtime_error & e) {
+        LOG_ERR("%s: encountered an error while fitting parameter-offloader arena: %s\n", __func__, e.what());
+        status = COMMON_PARAMS_FIT_STATUS_ERROR;
+    }
+
+    const int64_t t1_us = llama_time_us();
+    LOG_TRC("%s: parameter-offloader fitting took %.2f seconds\n", __func__, (t1_us - t0_us) * 1e-6);
+    return status;
+}
+
 void common_memory_breakdown_print(const struct llama_context * ctx) {
     //const auto & devices = ctx->get_model().devices;
     const auto * model = llama_get_model(ctx);

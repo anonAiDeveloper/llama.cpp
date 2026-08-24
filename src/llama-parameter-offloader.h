@@ -65,8 +65,7 @@ public:
     size_t                      arena_stream_size  = 0;         // dense streaming region size
     size_t                      arena_alignment = 0;            // required byte alignment for arena placement
 
-    void init(ggml_backend_buffer_t arena,     llama_context_params params,
-              ggml_context        * ctx_twins, llama_context      * lctx);
+    void init(ggml_backend_buffer_t arena, llama_context_params params, ggml_context * ctx_twins);
     parameter_offloader(llama_model * model);
     ~parameter_offloader();
 

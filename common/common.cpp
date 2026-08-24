@@ -67,7 +67,23 @@
 #pragma warning(disable: 4244 4267) // possible loss of data
 #endif
 
-#define PARAMETER_OFFLOADER_VRAM_GBS 4
+//TODO: Replace these development-only macros with CLI parameters after the arena fit policy is validated.
+#ifndef PARAMETER_OFFLOADER_VRAM_MARGIN_MIB
+#define PARAMETER_OFFLOADER_VRAM_MARGIN_MIB 512
+#endif
+
+#ifndef PARAMETER_OFFLOADER_VRAM_MAX_MIB
+#define PARAMETER_OFFLOADER_VRAM_MAX_MIB 0
+#endif
+
+#ifndef DISABLE_OFFLOADER
+// parameter_offloader keeps canonical model weights in host memory. Managed
+// tensors are exposed to the graph through GPU twins backed by the arena.
+static const llama_model_tensor_buft_override parameter_offloader_source_weight_overrides[] = {
+    {".*", ggml_backend_cpu_buffer_type()},
+    {nullptr, nullptr},
+};
+#endif
 
 common_time_meas::common_time_meas(int64_t & t_acc, bool disable) : t_start_us(disable ? -1 : ggml_time_us()), t_acc(t_acc) {}
 
@@ -1237,15 +1253,44 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
+    bool parameter_offloader_fit_active = false;
+
 #ifndef DISABLE_OFFLOADER
     if (!model_only) {
         //TODO: Today this only supports CUDA. Given how simple ggml-cuda-arena.cu is I dont think it'd be too hard to support other types of device?
         ggml_backend_dev_t cuda_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
 
         if (cuda_dev) {
-            const size_t arena_bytes = (size_t) PARAMETER_OFFLOADER_VRAM_GBS * 1024ull * 1024ull * 1024ull;
+            const size_t MiB = 1024ull * 1024ull;
+            //TODO: Replace the fixed margin with separate runtime headroom and measured maximum temporary device-packing scratch.
+            const size_t margin = (size_t)PARAMETER_OFFLOADER_VRAM_MARGIN_MIB * MiB;
+            const size_t max_arena_size = PARAMETER_OFFLOADER_VRAM_MAX_MIB == 0 ? 0 : (size_t)PARAMETER_OFFLOADER_VRAM_MAX_MIB * MiB;
+            size_t arena_bytes = 0;
+
+            COM_TRC("%s", "fitting parameter-offloader arena to device memory ...\n");
+
+            const common_params_fit_status fit_status = common_fit_parameter_offloader(
+                params.model.path.c_str(),
+                &mparams,
+                &cparams,
+                cuda_dev,
+                &arena_bytes,
+                margin,
+                max_arena_size,
+                params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+
+            if (fit_status != COMMON_PARAMS_FIT_STATUS_SUCCESS)
+                return;
 
             pimpl->param_offloader_arena = ggml_cuda_arena_create_on(cuda_dev, arena_bytes, 0);
+
+            if (!pimpl->param_offloader_arena) {
+                COM_ERR("%s: failed to allocate %zu MiB parameter-offloader arena\n", __func__, arena_bytes / MiB);
+                return;
+            }
+
+            parameter_offloader_fit_active = true;
+            COM_INF("%s: parameter-offloader arena = %zu MiB; reserved free VRAM = %zu MiB\n", __func__, arena_bytes / MiB, margin / MiB);
         }
 
         if (!pimpl->param_offloader_arena && cparams.moe_expert_prefetch) {
@@ -1255,17 +1300,29 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     }
 #endif
 
-    if (params.fit_params) {
+    //TODO: When parameter_offloader_fit_active is true, reuse only the stock context-size reduction stage instead of bypassing --fit entirely.
+    if (params.fit_params && !parameter_offloader_fit_active) {
         COM_TRC("%s", "fitting params to device memory ...\n");
         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
         common_fit_params(params.model.path.c_str(), &mparams, &cparams,
-            pimpl->param_offloader_arena,
+            nullptr,
             params.tensor_split,
             params.tensor_buft_overrides.data(),
             params.fit_params_target.data(),
             params.fit_params_min_ctx,
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
     }
+
+#ifndef DISABLE_OFFLOADER
+    if (parameter_offloader_fit_active) {
+        // Keep the real model logically GPU-assigned so graph construction chooses
+        // GPU execution, while loading all canonical source weights into host memory.
+        // parameter_offloader selectively replaces managed model references with
+        // arena-backed GPU twins before the context is constructed.
+        mparams.n_gpu_layers = INT32_MAX;
+        mparams.tensor_buft_overrides = parameter_offloader_source_weight_overrides;
+    }
+#endif
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
     if (model == NULL) {
@@ -1355,6 +1412,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             parameter_offloader::MOE_CACHE_SLOT_COUNT);
     }
 
+    init_parameter_offloader(params);
+
     cparams.cb_eval = llama_offloader_eval_cb;
     cparams.cb_eval_user_data = pimpl->param_offloader.get();
 
@@ -1406,9 +1465,8 @@ void common_init_result::init_parameter_offloader(common_params & params) {
     }
 
     llama_model * model = pimpl->model.get();
-    llama_context * lctx = pimpl->context.get();
 
-    if (!model || !lctx) {
+    if (!model) {
         return;
     }
 
@@ -1422,7 +1480,7 @@ void common_init_result::init_parameter_offloader(common_params & params) {
 
     auto cparams = common_context_params_to_llama(params);
 
-    pimpl->param_offloader->init(arena, cparams, ggml_init(twins), lctx);
+    pimpl->param_offloader->init(arena, cparams, ggml_init(twins));
     pimpl->param_offloader_arena = nullptr;
 
 #else
@@ -1504,8 +1562,6 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
     if (!params.lora_init_without_apply) {
         common_set_adapter_lora(lctx, params.lora_adapters);
     }
-
-    res->init_parameter_offloader(params);
 
     if (params.warmup) {
         COM_TRC("%s", "warming up the model with an empty run - please wait ... (--no-warmup to disable)\n");

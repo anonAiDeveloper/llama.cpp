@@ -27,6 +27,17 @@ common_params_fit_status common_fit_params(
                            uint32_t   n_ctx_min,             // minimum context size to set when trying to reduce memory use
                      ggml_log_level   log_level);            // minimum log level to print during fitting, lower levels go to debug log
 
+// Size the parameter-offloader arena from projected non-model device memory.
+common_params_fit_status common_fit_parameter_offloader(
+                         const char * path_model,
+                 llama_model_params * mparams,
+               llama_context_params * cparams,
+                 ggml_backend_dev_t   device,
+                             size_t * arena_size,
+                             size_t   margin,
+                             size_t   max_arena_size,
+                     ggml_log_level   log_level);
+
 // print estimated memory to stdout
 void common_fit_print(
                          const char * path_model,

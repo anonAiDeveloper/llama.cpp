@@ -407,12 +407,16 @@ bool parameter_offloader::transform_cpu_tensor_to_device_layout(ggml_tensor * w_
     // already packed?
     if (host_packed_.count(w_cpu)) return false;
 
-    ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
-    GGML_ASSERT(dev);
-    ggml_backend_buffer_type_t dev_buft = ggml_backend_dev_buffer_type(dev);
+    GGML_ASSERT(arena);
+    GGML_ASSERT(arena_buffer_type);
+    GGML_ASSERT(arena_base);
 
     const size_t logical   = ggml_nbytes(w_cpu);
-    const size_t dev_bytes = ggml_backend_buft_get_alloc_size(dev_buft, w_cpu);
+    const size_t dev_bytes = ggml_backend_buft_get_alloc_size(arena_buffer_type, w_cpu);
+
+    //TODO: Move this requirement into the arena fitter once minimum viable arena sizing is defined.
+    if (dev_bytes > arena_dense_size)
+        throw std::runtime_error("parameter_offloader: tensor device layout does not fit inside dense arena scratch space");
 
     // Allocate a host RAM buffer sized like the device allocation so we can memcpy the whole region later.
     ggml_backend_buffer_type_t host_buft = ggml_backend_cpu_buffer_type(); // use pinned-host type if you have one
@@ -420,20 +424,17 @@ bool parameter_offloader::transform_cpu_tensor_to_device_layout(ggml_tensor * w_
     GGML_ASSERT(host_buf);
     uint8_t * host_base = (uint8_t *) ggml_backend_buffer_get_base(host_buf);
 
-    // Create a temporary device tensor to invoke the backend’s packing path
-    ggml_backend_buffer_t tmp_dev_buf = ggml_backend_buft_alloc_buffer(dev_buft, dev_bytes);
-    GGML_ASSERT(tmp_dev_buf);
-
     ggml_init_params tmp_ip{ 64*1024, nullptr, true };
     ggml_context * tmp_ctx = ggml_init(tmp_ip);
     GGML_ASSERT(tmp_ctx);
 
+    // Reuse the beginning of the dense arena as temporary transform scratch; no persistent dense tensor has been seated yet.
     ggml_tensor * tmp_dev = ggml_dup_tensor_layout_public(tmp_ctx, w_cpu);
     GGML_ASSERT(tmp_dev);
-    GGML_ASSERT(ggml_backend_tensor_alloc(tmp_dev_buf, tmp_dev,
-                ggml_backend_buffer_get_base(tmp_dev_buf)) == GGML_STATUS_SUCCESS);
+    GGML_ASSERT(ggml_backend_tensor_alloc(arena, tmp_dev, arena_base) == GGML_STATUS_SUCCESS);
 
-    // H2D: this call triggers CUDA-side transform/packing for the tensor layout
+    //TODO: Verify the CUDA arena tensor_set path applies the same type-specific device packing as the standard CUDA device buffer for every managed quantized type.
+    // H2D: this call should trigger CUDA-side transform/packing for the tensor layout
     ggml_backend_tensor_set(tmp_dev, w_cpu->data, 0, logical);
 
     // D2H: read back ONLY the logical payload (tensor_get is bounded by ggml_nbytes())
@@ -444,9 +445,8 @@ bool parameter_offloader::transform_cpu_tensor_to_device_layout(ggml_tensor * w_
         std::memset(host_base + logical, 0, dev_bytes - logical);
     }
 
-    // Cleanup temps
+    // Cleanup temporary metadata; arena scratch is intentionally left disposable.
     ggml_free(tmp_ctx);
-    ggml_backend_buffer_free(tmp_dev_buf);
 
     // Remember the packed bytes for this weight
     host_packed_.emplace(w_cpu, PackedHostBytes{ host_buf, host_base, dev_bytes });
@@ -833,11 +833,7 @@ ggml_tensor * parameter_offloader::init_cpu_tensor_to_arena(ggml_tensor * w_cpu,
     return w_gpu;
 }
 
-void parameter_offloader::init(
-    ggml_backend_buffer_t   arena,
-    llama_context_params    cparams,
-    ggml_context          * ctx_twins,
-    llama_context         * lctx)
+void parameter_offloader::init(ggml_backend_buffer_t arena, llama_context_params cparams, ggml_context * ctx_twins)
 {
     attach_arena(arena);
 
@@ -846,8 +842,6 @@ void parameter_offloader::init(
 
     owns_arena     = true;
     ctx_gpu_twins  = ctx_twins;
-
-    (void) lctx;
 
     // Optional: reserve to avoid rehash during init
     gpu2cpu.reserve(4096);
@@ -3204,6 +3198,7 @@ void parameter_offloader::build_schedule_gates(offloader_schedule & schedule)
     }
 }
 
+//TODO: the streaming fit can be made tighter. Currently it aims for upper_bound, but we can get very close to lower_bound in theory for additional performance gains
 bool llama_offloader_graph_cb(ggml_backend_sched_t sched, struct ggml_cgraph * graph, void * ud)
 {
     LLAMA_LOG_INFO("%s 1\n", __func__);
