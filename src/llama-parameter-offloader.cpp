@@ -1504,7 +1504,7 @@ void parameter_offloader::stream_worker()
         bool allowed = false;                 // true when selected copy is inside safe window
 
         {
-            std::lock_guard<std::mutex> schedule_lock(schedule_mutex); // blocks schedule swap during copy selection/upload
+            std::unique_lock<std::mutex> schedule_lock(schedule_mutex); // blocks schedule swap during copy selection/upload
 
             // A swap may have been requested after the check above but before this thread acquired schedule_mutex.
             if (schedule_swap_requested.load(std::memory_order_acquire))
@@ -1512,7 +1512,24 @@ void parameter_offloader::stream_worker()
 
             const int tensor_count = (int)schedule_current.gpu_tensors_in_order.size(); // active schedule size
             if (tensor_count == 0)
+            {
+                const uint64_t empty_generation = schedule_generation.load(std::memory_order_acquire);
+
+                // A future graph may require streaming again. Release schedule_mutex so
+                // swap_next_schedule() can publish it, then sleep until the schedule changes.
+                schedule_lock.unlock();
+
+                std::unique_lock<std::mutex> lk(node_mu_);
+                node_cv_.wait(lk, [&] {
+                    return stop_stream.load(std::memory_order_acquire) ||
+                        schedule_generation.load(std::memory_order_acquire) != empty_generation;
+                });
+
+                if (stop_stream.load(std::memory_order_acquire))
                 return;
+
+                continue;
+            }
 
             const uint64_t cur_generation = schedule_generation.load(std::memory_order_acquire);
             if (cur_generation != submitted_generation) {
@@ -2984,6 +3001,8 @@ bool parameter_offloader::swap_next_schedule(size_t streaming_fit)
     #if defined(LLAMA_DIAGNOSE_COPY)
         const size_t tensor_count = schedule_current.gpu_tensors_in_order.size();
 
+        if (tensor_count > 0)
+        {
         long long copied_ordinal = tensor_idx_copied_ordinal.load(std::memory_order_relaxed);
 
         for (;;)
@@ -3024,11 +3043,12 @@ bool parameter_offloader::swap_next_schedule(size_t streaming_fit)
 
         const long long startup_copied_ordinal = tensor_idx_copied_ordinal.load(std::memory_order_acquire);
         GGML_ASSERT(startup_copied_ordinal >= startup_copy_idx);
+        }
     #endif /* defined(LLAMA_DIAGNOSE_COPY) */
 
         changed = true;
 
-        //print_snapshot(schedule_current);
+        print_snapshot(schedule_current);
     }
 
     // The new schedule is now completely published and schedule_mutex is free.
