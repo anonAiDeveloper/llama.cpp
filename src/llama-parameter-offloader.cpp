@@ -1015,6 +1015,9 @@ bool parameter_offloader::node_reads_tracked_weight(ggml_tensor * t, int * out_i
 // Keeps batching intact for other nodes.
 bool parameter_offloader::wants_observe(ggml_tensor * node)
 {
+    if (schedule_current.gpu_tensors_in_order.empty())
+        return false;
+
 #ifdef LLAMA_CHECK_NODES
     const char * name = ggml_get_name(node);
     for (int i = 0; i < GGML_MAX_SRC; ++i)
@@ -1093,6 +1096,9 @@ bool parameter_offloader::wants_observe(ggml_tensor * node)
 // Called after an observed node executes; advance all schedule positions released by this node and wait for the next required streamed tensor if COPY has not reached it yet.
 bool parameter_offloader::on_eval_tensor(ggml_tensor * node)
 {
+    if (schedule_current.gpu_tensors_in_order.empty())
+        return false;
+
     int idx = -1;
     if (!node_reads_tracked_weight(node, &idx))
         return false;  //should this be a return true?
@@ -1526,7 +1532,7 @@ void parameter_offloader::stream_worker()
                 });
 
                 if (stop_stream.load(std::memory_order_acquire))
-                return;
+                    return;
 
                 continue;
             }
@@ -1669,6 +1675,9 @@ uint64_t parameter_offloader::analyze_dense_graph(ggml_backend_sched_t sched, co
     std::unordered_set<ggml_tensor *> seen;
     seen.reserve(gpu_weight_set.size());
 
+    const size_t alignment = arena_alignment ? arena_alignment : 1;
+    size_t dense_tensor_bytes = 0;
+
     // Record one managed dense-read node without applying any static/streaming placement decision.
     auto collect_node_weights = [&](ggml_tensor * node) {
         if (!model_i->node_may_read_dense_weight(node))
@@ -1699,6 +1708,11 @@ uint64_t parameter_offloader::analyze_dense_graph(ggml_backend_sched_t sched, co
                 const int idx = (int)analysis.gpu_tensors_in_order.size();
                 analysis.gpu_tensors_in_order.push_back(w_gpu);
                 analysis.gpu2index.emplace(w_gpu, idx);
+
+                ggml_tensor * w_cpu = gpu2cpu.at(w_gpu);
+                const size_t slot_bytes = ggml_backend_buft_get_alloc_size(arena_buffer_type, w_cpu);
+
+                dense_tensor_bytes += align_up(slot_bytes, alignment);
             }
         }
 
@@ -1742,6 +1756,19 @@ uint64_t parameter_offloader::analyze_dense_graph(ggml_backend_sched_t sched, co
     hash_value(analysis.read_nodes.size());
     hash_value(analysis.gpu_tensors_in_order.size());
     analysis.hash = hash;
+
+    analysis.dense_fits_arena = !analysis.gpu_tensors_in_order.empty() && dense_tensor_bytes <= arena_dense_size;
+
+    if (analysis.dense_fits_arena)
+    {
+        LLAMA_LOG_INFO(
+            "%s: all managed dense tensors for this graph fit in the arena "
+            "(required=%zu MiB, available=%zu MiB, tensors=%zu)\n",
+            __func__,
+            dense_tensor_bytes / (1024 * 1024),
+            arena_dense_size / (1024 * 1024),
+            analysis.gpu_tensors_in_order.size());
+    }
 
     return hash;
 }
@@ -1995,7 +2022,7 @@ bool parameter_offloader::select_static_dense_tensors(const dense_graph_analysis
         return ejected_count != 0;
     }
 
-    if (tensor_count <= 1)
+    if (tensor_count == 0)
         return false;
 
     std::vector<size_t> selected_indices;
@@ -2012,12 +2039,12 @@ bool parameter_offloader::select_static_dense_tensors(const dense_graph_analysis
 
     const size_t original_static_count = static_dense_order.size();
 
-    // Greedily choose fitting non-deprioritized tensors first, then maximize cyclic distance from tensors already selected for static storage.
-    while (selected_indices.size() + 1 < tensor_count)
+    // Greedily choose fitting non-deprioritized tensors first, then largest tensors, then maximize cyclic distance from tensors already selected for static storage.
+    while (selected_indices.size() < tensor_count)
     {
         size_t best_idx = SIZE_MAX;
         size_t best_spacing = 0;
-        size_t best_bytes = SIZE_MAX;
+        size_t best_bytes = 0;
         size_t best_footprint = 0;
         bool best_deprioritized = false;
 
@@ -2052,7 +2079,7 @@ bool parameter_offloader::select_static_dense_tensors(const dense_graph_analysis
 
             const bool deprioritized = deprioritized_dense_set.find(w_gpu) != deprioritized_dense_set.end();
 
-            if (best_idx == SIZE_MAX || (best_deprioritized && !deprioritized) || (best_deprioritized == deprioritized && (spacing > best_spacing || (spacing == best_spacing && bytes < best_bytes))))
+            if (best_idx == SIZE_MAX || (best_deprioritized && !deprioritized) || (best_deprioritized == deprioritized && (bytes > best_bytes || (bytes == best_bytes && spacing > best_spacing))))
             {
                 best_idx = i;
                 best_spacing = spacing;
@@ -2832,7 +2859,10 @@ size_t parameter_offloader::generate_streaming_fit(offloader_schedule & schedule
 ////////////////       ADVANCE TO NEXT MEANINGFUL ARENA SIZE       ///////////////////
 
         if (candidate_size == search_ceiling)
+        {
+            print_tensor_order(schedule.gpu_tensors_in_order, GGML_LOG_LEVEL_ERROR);
             throw std::runtime_error("parameter_offloader: bounded local repair failed to construct a no-halt streaming layout inside the search ceiling");
+        }
 
         // Search is intentionally lossy. Once local repair has exceeded its useful scope, pay the small amount of VRAM
         // needed to reach the next placement event rather than searching deeper into repetitive model blocks.
@@ -2922,7 +2952,7 @@ bool parameter_offloader::swap_next_schedule(size_t streaming_fit)
     {
         std::lock_guard<std::mutex> schedule_lock(schedule_mutex); // blocks streamer while tensor pointers move
         
-            //wait for in-flight copies to complete
+        //wait for in-flight copies to complete
         {
             std::unique_lock<std::mutex> lk(node_mu_);
             node_cv_.wait(lk, [&] {
@@ -3003,46 +3033,46 @@ bool parameter_offloader::swap_next_schedule(size_t streaming_fit)
 
         if (tensor_count > 0)
         {
-        long long copied_ordinal = tensor_idx_copied_ordinal.load(std::memory_order_relaxed);
+            long long copied_ordinal = tensor_idx_copied_ordinal.load(std::memory_order_relaxed);
 
-        for (;;)
-        {
-            // snapshot the current reader ordinal
-            long long cur_used_ordinal = tensor_idx_used_ordinal.load(std::memory_order_acquire);
-            const int i = ordinal_mod(copied_ordinal + 1, tensor_count);
-
+            for (;;)
             {
-                const int r_idx = cur_used_ordinal < 0 ? tensor_count - 1 : ordinal_mod(cur_used_ordinal, tensor_count); // current reader index
-                const int bar   = schedule_current.ready_after[r_idx];         // last copyable index while r is read
-                const int di    = ring_distance(r_idx, i, tensor_count);       // distance from reader to copy slot
-                const int dbar  = ring_distance(r_idx, bar, tensor_count);     // distance from reader to barrier
+                // snapshot the current reader ordinal
+                long long cur_used_ordinal = tensor_idx_used_ordinal.load(std::memory_order_acquire);
+                const int i = ordinal_mod(copied_ordinal + 1, tensor_count);
 
-                bool allowed = (di <= dbar) && (di <= LLAMA_DIAGNOSE_COPY || copied_ordinal < startup_copy_idx);
+                {
+                    const int r_idx = cur_used_ordinal < 0 ? tensor_count - 1 : ordinal_mod(cur_used_ordinal, tensor_count); // current reader index
+                    const int bar   = schedule_current.ready_after[r_idx];         // last copyable index while r is read
+                    const int di    = ring_distance(r_idx, i, tensor_count);       // distance from reader to copy slot
+                    const int dbar  = ring_distance(r_idx, bar, tensor_count);     // distance from reader to barrier
 
-                if (!allowed)
-                    break;
+                    bool allowed = (di <= dbar) && (di <= LLAMA_DIAGNOSE_COPY || copied_ordinal < startup_copy_idx);
+
+                    if (!allowed)
+                        break;
+                }
+
+                // Safe to copy slot i
+                ggml_tensor *w_cpu_ = schedule_current.cpu_tensors_in_order[i];
+                ggml_tensor *w_gpu_ = schedule_current.gpu_tensors_in_order[i];
+
+                ggml_cuda_copy_event * ev = upload_weight_auto(w_cpu_, w_gpu_);
+                if (ev) {
+                    ggml_cuda_copy_event_wait(ev);
+                    ggml_cuda_copy_event_destroy(ev);
+                }
+
+            #ifdef LLAMA_LOG_COPIES
+                LLAMA_LOG_INFO("[C.%d]", i);
+            #endif
+
+                ++copied_ordinal;
+                tensor_idx_copied_ordinal.store(copied_ordinal, std::memory_order_release);
             }
 
-            // Safe to copy slot i
-            ggml_tensor *w_cpu_ = schedule_current.cpu_tensors_in_order[i];
-            ggml_tensor *w_gpu_ = schedule_current.gpu_tensors_in_order[i];
-
-            ggml_cuda_copy_event * ev = upload_weight_auto(w_cpu_, w_gpu_);
-            if (ev) {
-                ggml_cuda_copy_event_wait(ev);
-                ggml_cuda_copy_event_destroy(ev);
-            }
-
-        #ifdef LLAMA_LOG_COPIES
-            LLAMA_LOG_INFO("[C.%d]", i);
-        #endif
-
-            ++copied_ordinal;
-            tensor_idx_copied_ordinal.store(copied_ordinal, std::memory_order_release);
-        }
-
-        const long long startup_copied_ordinal = tensor_idx_copied_ordinal.load(std::memory_order_acquire);
-        GGML_ASSERT(startup_copied_ordinal >= startup_copy_idx);
+            const long long startup_copied_ordinal = tensor_idx_copied_ordinal.load(std::memory_order_acquire);
+            GGML_ASSERT(startup_copied_ordinal >= startup_copy_idx);
         }
     #endif /* defined(LLAMA_DIAGNOSE_COPY) */
 
@@ -3057,7 +3087,7 @@ bool parameter_offloader::swap_next_schedule(size_t streaming_fit)
 
     //TODO: This must block if we don't have the first tensor copied into the new schedule. If the first schedule changed between schedules, this should always fire
 #if !defined(LLAMA_DIAGNOSE_COPY)
-    if (new_copied_ordinal < startup_copy_idx)
+    if (!schedule_current.gpu_tensors_in_order.empty() && new_copied_ordinal < startup_copy_idx)
     {
     #if LLAMA_LOG_READS > 1
         const long long cur_copied_ordinal = tensor_idx_copied_ordinal.load(std::memory_order_acquire); // copied ordinal after publishing schedule
@@ -3139,6 +3169,7 @@ void parameter_offloader::seat_dense_tensors(offloader_schedule & schedule)
         static_cursor = off;
     }
 
+    static_tensor_bytes = arena_dense_size - static_cursor;
     static_dense_order_current = static_dense_order;
 }
 
@@ -3241,6 +3272,7 @@ bool llama_offloader_graph_cb(ggml_backend_sched_t sched, struct ggml_cgraph * g
 #endif
 
     const uint64_t graph_hash = po->analyze_dense_graph(sched, graph, po->graph_analysis_next);
+    const bool dense_fits_arena = po->graph_analysis_next.dense_fits_arena;
 
     std::unordered_set<ggml_tensor *> newly_deprioritized;
 
@@ -3287,14 +3319,36 @@ bool llama_offloader_graph_cb(ggml_backend_sched_t sched, struct ggml_cgraph * g
         po->static_dense_set.clear();
         po->static_tensor_bytes = 0;
 
-        po->streaming_fit_calculate_bounds(po->graph_analysis_next);
-
-        do
+        if (dense_fits_arena)
         {
-            po->select_static_dense_tensors(po->graph_analysis_next);
-            po->streaming_fit_calculate_bounds(po->graph_analysis_next);
+            po->static_dense_order = po->graph_analysis_next.gpu_tensors_in_order;
+            po->static_dense_set.insert(po->static_dense_order.begin(), po->static_dense_order.end());
         }
-        while (po->static_tensor_bytes > (po->streaming_fit_upper_bound >= po->arena_dense_size ? 0 : po->arena_dense_size - po->streaming_fit_upper_bound));
+        else
+        {
+            po->streaming_fit_calculate_bounds(po->graph_analysis_next);
+
+            bool ejecting = false;
+
+            for (;;)
+            {
+                if (!po->select_static_dense_tensors(po->graph_analysis_next))
+                    break;
+
+                po->streaming_fit_calculate_bounds(po->graph_analysis_next);
+
+                const size_t static_capacity = po->streaming_fit_upper_bound >= po->arena_dense_size ? 0 : po->arena_dense_size - po->streaming_fit_upper_bound;
+
+                if (po->static_tensor_bytes > static_capacity)
+                {
+                    ejecting = true;
+                    continue;
+                }
+
+                if (ejecting)
+                    break;
+            }
+        }
 
         // Canonicalize the finalized static layout so the same tensor set always receives the same top-down placement.
         std::sort(po->static_dense_order.begin(), po->static_dense_order.end(), [](ggml_tensor * lhs, ggml_tensor * rhs) {
@@ -3304,10 +3358,17 @@ bool llama_offloader_graph_cb(ggml_backend_sched_t sched, struct ggml_cgraph * g
             return name_cmp != 0 ? name_cmp < 0 : (uintptr_t)lhs < (uintptr_t)rhs;
         });
 
-        po->build_next_schedule(po->schedule_next, po->graph_analysis_next);
-        po->build_graph_runtime_metadata(po->graph_analysis_next, po->schedule_next);
-        streaming_fit = po->generate_streaming_fit(po->schedule_next, po->graph_analysis_next);
-        po->build_schedule_gates(po->schedule_next);
+        if (dense_fits_arena)
+        {
+            po->schedule_next = parameter_offloader::offloader_schedule{};
+        }
+        else
+        {
+            po->build_next_schedule(po->schedule_next, po->graph_analysis_next);
+            po->build_graph_runtime_metadata(po->graph_analysis_next, po->schedule_next);
+            streaming_fit = po->generate_streaming_fit(po->schedule_next, po->graph_analysis_next);
+            po->build_schedule_gates(po->schedule_next);
+        }
 
         parameter_offloader::dense_graph_cache_entry cache_entry;
         cache_entry.static_dense_order = po->static_dense_order;
@@ -3340,12 +3401,16 @@ bool llama_offloader_graph_cb(ggml_backend_sched_t sched, struct ggml_cgraph * g
         po->static_tensor_bytes = po->arena_dense_size - static_cursor;
 
         po->schedule_next = cache_it->second.schedule;
-        po->build_graph_runtime_metadata(po->graph_analysis_next, po->schedule_next);
 
-        // A cached schedule already contains the solved physical placement, so recover its streaming extent directly.
-        // TODO: should the streaming_fit be cached?
-        for (size_t end_offset : po->schedule_next.end_offset)
-            streaming_fit = std::max(streaming_fit, end_offset);
+        if (!dense_fits_arena)
+        {
+            po->build_graph_runtime_metadata(po->graph_analysis_next, po->schedule_next);
+
+            // A cached schedule already contains the solved physical placement, so recover its streaming extent directly.
+            // TODO: should the streaming_fit be cached?
+            for (size_t end_offset : po->schedule_next.end_offset)
+                streaming_fit = std::max(streaming_fit, end_offset);
+        }
     }
 
     LLAMA_LOG_INFO("%s 2\n", __func__);
@@ -3821,7 +3886,7 @@ int32_t llama_offloader_moe_residency_cb(
 /////////////////////////////////////
 //   DIAGNOSTICS
 /////////////////////////////////////
-void parameter_offloader::print_snapshot(offloader_schedule & schedule)
+void parameter_offloader::print_snapshot(offloader_schedule & schedule, ggml_log_level level)
 {
     size_t tensor_count = schedule.gpu_tensors_in_order.size();
 
@@ -3830,39 +3895,39 @@ void parameter_offloader::print_snapshot(offloader_schedule & schedule)
     start.reserve(tensor_count);
     end.reserve(tensor_count);
 
-    for (size_t i = 0; i < tensor_count; ++i)
-    {
-        ggml_tensor *t_gpu = schedule.gpu_tensors_in_order[i];
-        GGML_ASSERT(t_gpu && t_gpu->data);
-        ggml_tensor *t_cpu = gpu2cpu.at(t_gpu);
-
-        const size_t off   = (size_t)((char*)t_gpu->data - arena_base);                  // arena-relative
-        const size_t bytes = ggml_backend_buft_get_alloc_size(arena_buffer_type, t_cpu); // padded size
-
-        start[i] = off;
-        end[i]   = off + bytes;
-        GGML_ASSERT(end[i] <= arena_dense_size);
-    }
-
     for (int i = 0; i < tensor_count; ++i)
     {
         ggml_tensor * w_gpu  = schedule.gpu_tensors_in_order[i]; // GPU tensor being printed
         const char * name    = ggml_get_name(w_gpu); // mirrored model tensor name
-        const char * op_name = ggml_op_name(w_gpu->op); // ggml op name without the GGML_OP_ prefix
 
-        LLAMA_LOG_INFO("%s %4d %4d %10lu %10lu %5d %-24s %s\n",
+        llama_log_internal(level, "%s %4d %4d %10lu %10lu %5d %s\n",
             __func__,
             i,
             schedule.ready_after[i],
             start[i],
             end[i],
             schedule.ready_after[i] - i,
-            op_name ? std::string("GGML_OP_").append(op_name).c_str() : "GGML_OP_UNKNOWN",
             name ? name : "(unnamed)");
-
-        //LLAMA_LOG_INFO("\"%s\",\n", name);
     }
+}
 
+void parameter_offloader::print_tensor_order(const std::vector<ggml_tensor *> & tensors, ggml_log_level level)
+{
+    for (int i = 0; i < tensors.size(); ++i)
+    {
+        ggml_tensor * w_gpu = tensors[i];
+        GGML_ASSERT(w_gpu);
+
+        ggml_tensor * w_cpu = gpu2cpu.at(w_gpu);
+        const size_t bytes = ggml_backend_buft_get_alloc_size(arena_buffer_type, w_cpu);
+        const char * name = ggml_get_name(w_gpu);
+
+        llama_log_internal(level, "%s %4d %10lu %s\n",
+            __func__,
+            i,
+            bytes,
+            name ? name : "(unnamed)");
+    }
 }
 
 #ifdef LLAMA_PRINT_WEIGHT_READS
