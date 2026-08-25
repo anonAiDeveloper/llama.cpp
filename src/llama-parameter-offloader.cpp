@@ -16,6 +16,9 @@
 #include <cstring>
 #include <stdexcept>
 
+// TODO: Investigate Page-Locked Host Memory for host_packed_ upload buffers.
+//Explanation: CPU tensors are not currently pinned. Pinning them speeds up cpu->gpu copies but also requires some VRAM overheard
+
 /////////////////////////////////////
 //   DEBUGGING SWITCHES
 /////////////////////////////////////

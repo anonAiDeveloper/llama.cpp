@@ -69,7 +69,7 @@
 
 //TODO: Replace these development-only macros with CLI parameters after the arena fit policy is validated.
 #ifndef PARAMETER_OFFLOADER_VRAM_MARGIN_MIB
-#define PARAMETER_OFFLOADER_VRAM_MARGIN_MIB 512
+#define PARAMETER_OFFLOADER_VRAM_MARGIN_MIB 200
 #endif
 
 #ifndef PARAMETER_OFFLOADER_VRAM_MAX_MIB
@@ -1315,10 +1315,32 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
 #ifndef DISABLE_OFFLOADER
     if (parameter_offloader_fit_active) {
-        // Keep the real model logically GPU-assigned so graph construction chooses
-        // GPU execution, while loading all canonical source weights into host memory.
-        // parameter_offloader selectively replaces managed model references with
-        // arena-backed GPU twins before the context is constructed.
+        // The parameter offloader does not use the canonical model buffer for
+        // GPU transfers:
+        //
+        // - dense weights are streamed from host_packed_
+        // - MoE misses execute directly from the canonical CPU weights
+        //
+        // no_host must be true so the canonical model is not allocated in
+        // CUDA_Host memory. Pinning the full model with CUDA_Host causes a
+        // large persistent VRAM mapping/page-table overhead that the offloader
+        // does not benefit from.
+        //
+        // no_host alone is not sufficient: removing CUDA_Host allows CPU extra
+        // buffer types such as CPU_REPACK to win buffer selection. That changes
+        // the physical representation of large portions of the model and causes
+        // a major performance regression in the parameter-offloader path.
+        //
+        // use_extra_bufts must therefore also be false so those weights fall
+        // back to the ordinary CPU buffer instead. Conversely,
+        // use_extra_bufts=false alone is not sufficient because CUDA_Host would
+        // still remain eligible and would still pin the canonical model.
+        //
+        // Together these settings keep canonical weights in ordinary CPU memory
+        // without CUDA pinning and without CPU repacking.
+        mparams.no_host = true;
+        mparams.use_extra_bufts = false;
+        
         mparams.n_gpu_layers = INT32_MAX;
         mparams.tensor_buft_overrides = parameter_offloader_source_weight_overrides;
     }
