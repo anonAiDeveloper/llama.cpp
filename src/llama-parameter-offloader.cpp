@@ -3895,6 +3895,20 @@ void parameter_offloader::print_snapshot(offloader_schedule & schedule, ggml_log
     start.reserve(tensor_count);
     end.reserve(tensor_count);
 
+    for (size_t i = 0; i < tensor_count; ++i)
+    {
+        ggml_tensor *t_gpu = schedule.gpu_tensors_in_order[i];
+        GGML_ASSERT(t_gpu && t_gpu->data);
+        ggml_tensor *t_cpu = gpu2cpu.at(t_gpu);
+
+        const size_t off   = (size_t)((char*)t_gpu->data - base);              // arena-relative
+        const size_t bytes = ggml_backend_buft_get_alloc_size(buft, t_cpu);    // padded size
+
+        start[i] = off;
+        end[i]   = off + bytes;
+        GGML_ASSERT(end[i] <= cap);
+    }
+
     for (int i = 0; i < tensor_count; ++i)
     {
         ggml_tensor * w_gpu  = schedule.gpu_tensors_in_order[i]; // GPU tensor being printed
