@@ -186,7 +186,7 @@ public:
     std::unordered_map<ggml_tensor*, uint64_t> gpu_hashes;
 
     void print_snapshot(offloader_schedule & schedule, ggml_log_level level = GGML_LOG_LEVEL_INFO);
-    void print_tensor_order(const std::vector<ggml_tensor *> & tensors, ggml_log_level level = GGML_LOG_LEVEL_INFO);
+    void print_tensor_order(const std::vector<ggml_tensor *> & tensors, const std::vector<size_t> & offsets, ggml_log_level level = GGML_LOG_LEVEL_INFO);
 private:
     // Misc helper functions
     inline bool no_transform_needed_for_backend_(const ggml_tensor *t) const;

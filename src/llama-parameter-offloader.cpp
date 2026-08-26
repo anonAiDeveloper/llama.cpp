@@ -3925,42 +3925,44 @@ void parameter_offloader::print_snapshot(offloader_schedule & schedule, ggml_log
     }
 }
 
-void parameter_offloader::print_tensor_order(const std::vector<ggml_tensor *> & tensors, ggml_log_level level)
+void parameter_offloader::print_tensor_order(const std::vector<ggml_tensor *> & tensors, const std::vector<size_t> & offsets, ggml_log_level level)
 {
-    size_t tensor_count = tensors.size();
+    const size_t tensor_count = tensors.size();
 
-    std::vector<size_t> start(tensor_count);
-    std::vector<size_t> end(tensor_count);
-    start.reserve(tensor_count);
-    end.reserve(tensor_count);
+    GGML_ASSERT(offsets.size() == tensor_count);
 
     for (size_t i = 0; i < tensor_count; ++i)
     {
-        ggml_tensor *t_gpu = tensors[i];
-        GGML_ASSERT(t_gpu && t_gpu->data);
-        ggml_tensor *t_cpu = gpu2cpu.at(t_gpu);
+        ggml_tensor * t_gpu = tensors[i];
+        GGML_ASSERT(t_gpu);
 
-        const size_t off   = (size_t)((char*)t_gpu->data - arena_base);                  // arena-relative
-        const size_t bytes = ggml_backend_buft_get_alloc_size(arena_buffer_type, t_cpu); // padded size
+        const char * name = ggml_get_name(t_gpu);
+        ggml_tensor * t_cpu = gpu2cpu.at(t_gpu);
+        const size_t bytes = ggml_backend_buft_get_alloc_size(arena_buffer_type, t_cpu);
+        const size_t off = offsets[i];
 
-        start[i] = off;
-        end[i]   = off + bytes;
-        GGML_ASSERT(end[i] <= arena_dense_size);
-    }
-
-    for (int i = 0; i < tensor_count; ++i)
+        if (off == SIZE_MAX)
     {
-        ggml_tensor * w_gpu = tensors[i];
-        GGML_ASSERT(w_gpu);
+            llama_log_internal(level, "%s %4zu %10zu %10s %10s %s\n",
+                __func__,
+                i,
+                bytes,
+                "UNPLACED",
+                "UNPLACED",
+                name ? name : "(unnamed)");
+            continue;
+        }
 
-        ggml_tensor * w_cpu = gpu2cpu.at(w_gpu);
-        const size_t bytes = ggml_backend_buft_get_alloc_size(arena_buffer_type, w_cpu);
-        const char * name = ggml_get_name(w_gpu);
+        const size_t end = off + bytes;
 
-        llama_log_internal(level, "%s %4d %10lu %s\n",
+        GGML_ASSERT(end <= arena_dense_size);
+
+        llama_log_internal(level, "%s %4zu %10zu %10zu %10zu %s\n",
             __func__,
             i,
             bytes,
+            off,
+            end,
             name ? name : "(unnamed)");
     }
 }
