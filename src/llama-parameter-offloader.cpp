@@ -1879,118 +1879,161 @@ void parameter_offloader::streaming_fit_calculate_bounds(const dense_graph_analy
     std::vector<int> first_read(tensor_count, -1);
     std::vector<int> last_read(tensor_count, -1);
 
-    int read_position_count = 0;
+    int node_count = 0;
 
-    // Collapse static-only graph nodes and record first/last streamed read positions.
     for (const std::vector<ggml_tensor *> & node_reads : analysis.node_reads)
     {
-        bool streamed_read = false;
+        bool streamed = false;
 
         for (ggml_tensor * w_gpu : node_reads)
         {
             if (static_dense_set.find(w_gpu) != static_dense_set.end())
                 continue;
 
-            const size_t tensor_idx = (size_t)analysis.gpu2index.at(w_gpu);
+            const size_t tensor = (size_t)analysis.gpu2index.at(w_gpu);
 
-            if (first_read[tensor_idx] < 0)
-                first_read[tensor_idx] = read_position_count;
+            if (first_read[tensor] < 0)
+                first_read[tensor] = node_count;
 
-            last_read[tensor_idx] = read_position_count;
-            streamed_read = true;
+            last_read[tensor] = node_count;
+            streamed = true;
         }
 
-        if (streamed_read)
-            ++read_position_count;
+        if (streamed)
+            ++node_count;
     }
 
-    if (read_position_count == 0)
+    if (node_count == 0)
     {
         streaming_fit_lower_bound = 0;
         streaming_fit_upper_bound = 0;
         return;
     }
 
-    std::vector<int> prefetch(tensor_count, -1);
-    std::vector<int> release(tensor_count, -1);
     std::vector<size_t> tensor_bytes(tensor_count, 0);
+    std::vector<std::vector<size_t>> resident((size_t)node_count);
 
-    int latest_release = -1;
+    int release = -1;
 
-    // Build the simple streamed lifetime of each tensor in streamed tensor order.
     for (ggml_tensor * w_gpu : analysis.gpu_tensors_in_order)
     {
         if (static_dense_set.find(w_gpu) != static_dense_set.end())
             continue;
 
-        const size_t tensor_idx = (size_t)analysis.gpu2index.at(w_gpu);
+        const size_t tensor = (size_t)analysis.gpu2index.at(w_gpu);
 
-        GGML_ASSERT(first_read[tensor_idx] >= 0);
-        GGML_ASSERT(last_read[tensor_idx] >= first_read[tensor_idx]);
+        GGML_ASSERT(first_read[tensor] >= 0);
 
-        latest_release = std::max(latest_release, last_read[tensor_idx]);
+        release = std::max(release, last_read[tensor]);
 
-        prefetch[tensor_idx] = first_read[tensor_idx] == 0 ? read_position_count - 1 : first_read[tensor_idx] - 1;
-        release[tensor_idx] = latest_release;
-        tensor_bytes[tensor_idx] = align_up(ggml_backend_buft_get_alloc_size(arena_buffer_type, gpu2cpu.at(w_gpu)), alignment);
+        tensor_bytes[tensor] = align_up(
+            ggml_backend_buft_get_alloc_size(arena_buffer_type, gpu2cpu.at(w_gpu)),
+            alignment);
+
+        for (int node = first_read[tensor]; node <= release; ++node)
+            resident[(size_t)node].push_back(tensor);
     }
 
-    // Test whether a streamed tensor must be resident at one streamed read position.
-    auto is_resident = [&](size_t tensor_idx, int position) {
-        return prefetch[tensor_idx] < first_read[tensor_idx]
-            ? prefetch[tensor_idx] <= position && position <= release[tensor_idx]
-            : position >= prefetch[tensor_idx] || position <= release[tensor_idx];
-    };
+    std::unordered_map<size_t, size_t> pair_counts;
+    std::unordered_map<size_t, size_t> triple_counts;
 
-    size_t lower_max = 0;
-    size_t upper_max = 0;
-    size_t lower_max_count = 0;
-    size_t upper_max_count = 0;
+    size_t lower_bound = 0;
+    size_t upper_bound = 0;
 
-    // Track a maximum and how many streamed positions tie for that maximum.
-    auto update_max = [](size_t requirement, size_t & maximum, size_t & maximum_count) {
-        if (requirement > maximum)
-        {
-            maximum = requirement;
-            maximum_count = 1;
-        }
-        else if (requirement == maximum)
-        {
-            ++maximum_count;
-        }
-    };
-
-    // Lower is one resident set; upper is the union of this resident set and the next one.
-    for (int position = 0; position < read_position_count; ++position)
+    for (int start = 0; start < node_count; ++start)
     {
-        const int next_position = position + 1 == read_position_count ? 0 : position + 1;
-        size_t lower_requirement = 0;
-        size_t upper_requirement = 0;
+        std::vector<int> group;
+        group.reserve(3);
 
-        for (size_t tensor_idx = 0; tensor_idx < tensor_count; ++tensor_idx)
+        std::vector<unsigned int> coverage(tensor_count, 0);
+        size_t group_bytes = 0;
+
+        group.push_back(start);
+
+        for (size_t tensor : resident[(size_t)start])
         {
-            if (first_read[tensor_idx] < 0)
-                continue;
-
-            const bool resident_here = is_resident(tensor_idx, position);
-            const bool resident_next = is_resident(tensor_idx, next_position);
-
-            if (resident_here)
-                lower_requirement += tensor_bytes[tensor_idx];
-
-            if (resident_here || resident_next)
-                upper_requirement += tensor_bytes[tensor_idx];
+            coverage[tensor] = 1;
+            group_bytes += tensor_bytes[tensor];
         }
 
-        update_max(lower_requirement, lower_max, lower_max_count);
-        update_max(upper_requirement, upper_max, upper_max_count);
+        bool pair_recorded = false;
+
+        for (int lookahead = 1; lookahead < node_count; ++lookahead)
+        {
+            const int node = (start + lookahead) % node_count;
+
+            group.push_back(node);
+
+            for (size_t tensor : resident[(size_t)node])
+            {
+                if (coverage[tensor]++ == 0)
+                    group_bytes += tensor_bytes[tensor];
+            }
+
+            // Remove nodes that no longer contribute a unique tensor.
+            for (;;)
+            {
+                size_t redundant = group.size();
+
+                for (size_t i = group.size(); i-- > 0; )
+                {
+                    bool unique = false;
+
+                    for (size_t tensor : resident[(size_t)group[i]])
+                    {
+                        if (coverage[tensor] == 1)
+                        {
+                            unique = true;
+                            break;
+                        }
+                    }
+
+                    if (!unique)
+                    {
+                        redundant = i;
+                        break;
+                    }
+                }
+
+                if (redundant == group.size())
+                    break;
+
+                for (size_t tensor : resident[(size_t)group[redundant]])
+                    --coverage[tensor];
+
+                group.erase(group.begin() + redundant);
+            }
+
+            if (!pair_recorded && group.size() == 2)
+            {
+                const size_t ties = ++pair_counts[group_bytes];
+                lower_bound = std::max(
+                    lower_bound,
+                    group_bytes + (ties - 1) * alignment);
+
+                pair_recorded = true;
+            }
+
+            if (group.size() == 3)
+                break;
+        }
+
+        if (!pair_recorded)
+        {
+            const size_t ties = ++pair_counts[group_bytes];
+            lower_bound = std::max(
+                lower_bound,
+                group_bytes + (ties - 1) * alignment);
+        }
+
+        const size_t ties = ++triple_counts[group_bytes];
+        upper_bound = std::max(
+            upper_bound,
+            group_bytes + (ties - 1) * alignment);
     }
 
-    const size_t lower_ties = lower_max_count > 0 ? lower_max_count - 1 : 0;
-    const size_t upper_ties = upper_max_count > 0 ? upper_max_count - 1 : 0;
-
-    streaming_fit_lower_bound = lower_max + lower_ties * alignment;
-    streaming_fit_upper_bound = std::max(upper_max + upper_ties * alignment, streaming_fit_lower_bound);
+    streaming_fit_lower_bound = lower_bound;
+    streaming_fit_upper_bound = std::max(upper_bound, lower_bound);
 }
 
 // CONTRACT: May modify only static_dense_order, static_dense_set, and static_tensor_bytes; returns whether static membership changed.
@@ -2104,7 +2147,7 @@ bool parameter_offloader::select_static_dense_tensors(const dense_graph_analysis
     if (selected_count == 0)
         return false;
 
-    LLAMA_LOG_INFO("%s: selected %zu static dense tensors; static_bytes=%zu upper_bound=%zu\n", __func__, selected_count, static_tensor_bytes, streaming_fit_upper_bound);
+    LLAMA_LOG_INFO("%s: selected %zu static dense tensors; static_bytes=%zu lower_bound=%zu upper_bound=%zu\n", __func__, selected_count, static_tensor_bytes, streaming_fit_lower_bound, streaming_fit_upper_bound);
     return true;
 }
 
@@ -2860,7 +2903,7 @@ size_t parameter_offloader::generate_streaming_fit(offloader_schedule & schedule
 
         if (candidate_size == search_ceiling)
         {
-            print_tensor_order(schedule.gpu_tensors_in_order, GGML_LOG_LEVEL_ERROR);
+            print_tensor_order(schedule.gpu_tensors_in_order, baseline_offsets, GGML_LOG_LEVEL_ERROR);
             throw std::runtime_error("parameter_offloader: bounded local repair failed to construct a no-halt streaming layout inside the search ceiling");
         }
 
@@ -3078,7 +3121,7 @@ bool parameter_offloader::swap_next_schedule(size_t streaming_fit)
 
         changed = true;
 
-        print_snapshot(schedule_current);
+        //print_snapshot(schedule_current);
     }
 
     // The new schedule is now completely published and schedule_mutex is free.
@@ -3942,7 +3985,7 @@ void parameter_offloader::print_tensor_order(const std::vector<ggml_tensor *> & 
         const size_t off = offsets[i];
 
         if (off == SIZE_MAX)
-    {
+        {
             llama_log_internal(level, "%s %4zu %10zu %10s %10s %s\n",
                 __func__,
                 i,
