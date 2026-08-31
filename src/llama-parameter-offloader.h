@@ -99,30 +99,37 @@ public:
     bool wants_observe(ggml_tensor * node);
     bool on_eval_tensor(ggml_tensor * node);
 
+    struct node_group {
+        std::vector<ggml_tensor *> nodes;
+        std::set<ggml_tensor *> tensors;
+        size_t bytes;
+    };
+
     // Graph callback functions
     struct dense_graph_analysis
     {
-        uint64_t hash = 0;
-        std::vector<ggml_tensor *> gpu_tensors_in_order;
-        std::unordered_map<ggml_tensor *, int> gpu2index;
-        std::vector<ggml_tensor *> read_nodes;
-        std::vector<std::vector<ggml_tensor *>> node_reads;
-        std::vector<ggml_tensor *> read_last_node;
-        std::unordered_map<ggml_tensor *, int> read_next;
-        bool dense_fits_arena = false;
+        uint64_t hash = 0;                                              // Hash of the managed dense-read graph used for graph-cache lookup and comparison.
+        std::vector<ggml_tensor *> gpu_tensors_in_order;                // Managed dense GPU tensors in first-read order for this graph.
+        std::unordered_map<ggml_tensor *, int> gpu2index;               // Reverse lookup from managed GPU tensor to gpu_tensors_in_order index.
+        std::vector<ggml_tensor *> graph_nodes;                         // Graph nodes that read one or more managed dense tensors, in graph order.
+        std::vector<std::vector<ggml_tensor *>> graph_nodes_tensors;    // Managed dense tensors read by each corresponding entry in read_nodes.
+        std::vector<ggml_tensor *> release_node_by_tensor;              // For each streamed schedule index, the graph node whose completion releases that index and every preceding unreleased index.
+        std::unordered_map<ggml_tensor *, int> next_required_tensor_idx;// Graph node -> first newly-read streamed tensor index that COPY must reach before compute advances.
+        std::vector<node_group> largest_node_pairs;
+        bool dense_fits_arena = false;                                  // True when all managed dense tensors for this graph fit in the dense arena simultaneously.
     };
 
     struct dense_graph_cache_entry
     {
-        std::vector<ggml_tensor *> static_dense_order;
-        offloader_schedule schedule;
+        std::vector<ggml_tensor *> static_dense_order;                  // Static dense tensor membership/order selected for this cached graph.
+        offloader_schedule schedule;                                    // Final streamed tensor order, arena placement, and copy gates for this cached graph.
     };
 
     struct streaming_fit_lifetime_analysis
     {
-        std::vector<std::vector<int>> managed_node_reads;
-        std::vector<size_t> tensor_bytes;
-        std::vector<std::vector<int>> resident_tensor_indices;
+        std::vector<std::vector<int>> managed_node_reads;               // Streamed schedule indices read at each managed streamed read position.
+        std::vector<size_t> tensor_bytes;                               // Device allocation size of each streamed tensor, indexed by streamed schedule index.
+        std::vector<std::vector<int>> resident_tensor_indices;          // Streamed tensors that must coexist at each read position, including prefetch and monotonic-release lifetimes.
     };
 
     dense_graph_analysis graph_analysis_current;  // active graph read/release metadata used by runtime
@@ -143,7 +150,7 @@ public:
     uint64_t analyze_dense_graph(ggml_backend_sched_t sched, const ggml_cgraph * graph, dense_graph_analysis & analysis);
 
     // Calculate the current streamed lower/upper arena-size bounds from graph reads and static membership.
-    void streaming_fit_calculate_bounds(const dense_graph_analysis & analysis);
+    void streaming_fit_calculate_bounds(dense_graph_analysis & analysis);
 
     // Add or eject static dense tensors to fit the current upper-bound split while preserving the spacing heuristic.
     //TODO: Eventually we want to get this to fit as close to LOWER bound as we can, but that can get complicated.

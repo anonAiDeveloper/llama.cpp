@@ -1870,170 +1870,106 @@ void parameter_offloader::build_streaming_fit_lifetimes(
     }
 }
 
-// CONTRACT: Calculates only streaming_fit_lower_bound and streaming_fit_upper_bound from the current graph analysis and static membership.
-void parameter_offloader::streaming_fit_calculate_bounds(const dense_graph_analysis & analysis)
+// CONTRACT: Calculates only streaming_fit_lower_bound, streaming_fit_upper_bound, largest_node_pairs and largest_node_triples
+//TODO: We probably want to establish virtual multi-tensor nodes prior to calling this for 100% accuracy
+void parameter_offloader::streaming_fit_calculate_bounds(dense_graph_analysis & analysis)
 {
-    const size_t tensor_count = analysis.gpu_tensors_in_order.size();
+    analysis.largest_node_pairs.clear();
+    std::vector<node_group> largest_node_triples;
+
     const size_t alignment = arena_alignment ? arena_alignment : 1;
+    const int node_total = analysis.graph_nodes.size();
 
-    std::vector<int> first_read(tensor_count, -1);
-    std::vector<int> last_read(tensor_count, -1);
-
-    int node_count = 0;
-
-    for (const std::vector<ggml_tensor *> & node_reads : analysis.node_reads)
+    for (int i = 0; i < node_total; ++i)
     {
-        bool streamed = false;
+        std::vector<ggml_tensor *> streaming_tensors;
+        for (const auto & tensor : analysis.graph_nodes_tensors[i])
+            if (static_dense_set.find(tensor) == static_dense_set.end())
+                streaming_tensors.push_back(tensor);
 
-        for (ggml_tensor * w_gpu : node_reads)
-        {
-            if (static_dense_set.find(w_gpu) != static_dense_set.end())
-                continue;
-
-            const size_t tensor = (size_t)analysis.gpu2index.at(w_gpu);
-
-            if (first_read[tensor] < 0)
-                first_read[tensor] = node_count;
-
-            last_read[tensor] = node_count;
-            streamed = true;
-        }
-
-        if (streamed)
-            ++node_count;
-    }
-
-    if (node_count == 0)
-    {
-        streaming_fit_lower_bound = 0;
-        streaming_fit_upper_bound = 0;
-        return;
-    }
-
-    std::vector<size_t> tensor_bytes(tensor_count, 0);
-    std::vector<std::vector<size_t>> resident((size_t)node_count);
-
-    int release = -1;
-
-    for (ggml_tensor * w_gpu : analysis.gpu_tensors_in_order)
-    {
-        if (static_dense_set.find(w_gpu) != static_dense_set.end())
+        //skip nodes that are subsets of the previous node
+        bool is_subset = i != 0;
+        for (int j = 0; is_subset && j < streaming_tensors.size(); ++j)
+            is_subset = is_subset && std::find(analysis.graph_nodes_tensors[i - 1].begin(),
+                                               analysis.graph_nodes_tensors[i - 1].end(),
+                                               streaming_tensors[j]) != analysis.graph_nodes_tensors[i - 1].end();
+        if (is_subset)
             continue;
 
-        const size_t tensor = (size_t)analysis.gpu2index.at(w_gpu);
-
-        GGML_ASSERT(first_read[tensor] >= 0);
-
-        release = std::max(release, last_read[tensor]);
-
-        tensor_bytes[tensor] = align_up(
-            ggml_backend_buft_get_alloc_size(arena_buffer_type, gpu2cpu.at(w_gpu)),
-            alignment);
-
-        for (int node = first_read[tensor]; node <= release; ++node)
-            resident[(size_t)node].push_back(tensor);
-    }
-
-    std::unordered_map<size_t, size_t> pair_counts;
-    std::unordered_map<size_t, size_t> triple_counts;
-
-    size_t lower_bound = 0;
-    size_t upper_bound = 0;
-
-    for (int start = 0; start < node_count; ++start)
-    {
-        std::vector<int> group;
-        group.reserve(3);
-
-        std::vector<unsigned int> coverage(tensor_count, 0);
-        size_t group_bytes = 0;
-
-        group.push_back(start);
-
-        for (size_t tensor : resident[(size_t)start])
+        auto new_node_group = [&](int target_nodes)
         {
-            coverage[tensor] = 1;
-            group_bytes += tensor_bytes[tensor];
-        }
-
-        bool pair_recorded = false;
-
-        for (int lookahead = 1; lookahead < node_count; ++lookahead)
-        {
-            const int node = (start + lookahead) % node_count;
-
-            group.push_back(node);
-
-            for (size_t tensor : resident[(size_t)node])
+            node_group group {
+                { analysis.graph_nodes[i] },
+                std::set<ggml_tensor *>(streaming_tensors.begin(), streaming_tensors.end()),
+                0
+            };
+            int n_nodes = 1;
+            
+            for (int j = i == node_total - 1 ? 0 : i + 1;
+                j != i;
+                j == node_total - 1 ? j = 0 : ++j)
             {
-                if (coverage[tensor]++ == 0)
-                    group_bytes += tensor_bytes[tensor];
-            }
-
-            // Remove nodes that no longer contribute a unique tensor.
-            for (;;)
-            {
-                size_t redundant = group.size();
-
-                for (size_t i = group.size(); i-- > 0; )
+                bool found_unique_tensor = false;
+                for (const auto &tensor : analysis.graph_nodes_tensors[j])
                 {
-                    bool unique = false;
-
-                    for (size_t tensor : resident[(size_t)group[i]])
+                    if (group.tensors.find(tensor) == group.tensors.end() && static_dense_set.find(tensor) == static_dense_set.end())
                     {
-                        if (coverage[tensor] == 1)
-                        {
-                            unique = true;
-                            break;
-                        }
-                    }
-
-                    if (!unique)
-                    {
-                        redundant = i;
-                        break;
+                        if (n_nodes < target_nodes)
+                            found_unique_tensor = group.tensors.insert(tensor).second;
+                        else
+                            return group;
                     }
                 }
 
-                if (redundant == group.size())
-                    break;
+                if (found_unique_tensor)
+                    ++n_nodes;
 
-                for (size_t tensor : resident[(size_t)group[redundant]])
-                    --coverage[tensor];
-
-                group.erase(group.begin() + redundant);
+                group.nodes.push_back(analysis.graph_nodes[j]);
             }
 
-            if (!pair_recorded && group.size() == 2)
-            {
-                const size_t ties = ++pair_counts[group_bytes];
-                lower_bound = std::max(
-                    lower_bound,
-                    group_bytes + (ties - 1) * alignment);
+            return group;
+        };
 
-                pair_recorded = true;
-            }
-
-            if (group.size() == 3)
-                break;
-        }
-
-        if (!pair_recorded)
+        auto count_group_bytes = [&](node_group & group)
         {
-            const size_t ties = ++pair_counts[group_bytes];
-            lower_bound = std::max(
-                lower_bound,
-                group_bytes + (ties - 1) * alignment);
+            group.bytes = 0;
+            for (const auto & tensor : group.tensors)
+                group.bytes += align_up(ggml_backend_buft_get_alloc_size(arena_buffer_type, gpu2cpu.at(tensor)), alignment);
+        };
+
+        node_group pair = new_node_group(2);
+        node_group triple = new_node_group(3);
+
+        count_group_bytes(pair);
+        count_group_bytes(triple);
+
+        analysis.largest_node_pairs.push_back(std::move(pair));
+        largest_node_triples.push_back(std::move(triple));
+    }
+    
+    auto keep_largest = [&](std::vector<node_group> & groups)
+    {
+        size_t largest = 0;
+        size_t bound = 0;
+
+        for (const auto & group : groups)
+        {
+            size_t ties = 0;
+            for (const auto & other : groups)
+                ties += other.bytes == group.bytes;
+
+            largest = std::max(largest, group.bytes);
+            bound = std::max(bound, group.bytes + (ties - 1) * alignment);
         }
 
-        const size_t ties = ++triple_counts[group_bytes];
-        upper_bound = std::max(
-            upper_bound,
-            group_bytes + (ties - 1) * alignment);
-    }
+        groups.erase(std::remove_if(groups.begin(), groups.end(),
+            [=](const node_group & group) { return group.bytes != largest; }), groups.end());
 
-    streaming_fit_lower_bound = lower_bound;
-    streaming_fit_upper_bound = std::max(upper_bound, lower_bound);
+        return bound;
+    };
+
+    streaming_fit_lower_bound = keep_largest(analysis.largest_node_pairs);
+    streaming_fit_upper_bound = std::max(streaming_fit_lower_bound, keep_largest(largest_node_triples));
 }
 
 // CONTRACT: May modify only static_dense_order, static_dense_set, and static_tensor_bytes; returns whether static membership changed.
