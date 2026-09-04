@@ -29,6 +29,8 @@ public:
         bool (*node_may_read_dense_weight)(const ggml_tensor * node);
     };
 
+    size_t get_gpu_aligned_size(ggml_tensor * tensor, size_t alignment);
+
     // Fast lookups
     // GPU->CPU: answer "what CPU weight backs this GPU twin?"
     std::unordered_map<ggml_tensor*, ggml_tensor*> gpu2cpu;
@@ -101,7 +103,7 @@ public:
 
     struct node_group {
         std::vector<ggml_tensor *> nodes;
-        std::set<ggml_tensor *> tensors;
+        std::vector<ggml_tensor *> tensors;       // read order must be kept intact
         size_t bytes;
     };
 
@@ -112,10 +114,10 @@ public:
         std::vector<ggml_tensor *> gpu_tensors_in_order;                // Managed dense GPU tensors in first-read order for this graph.
         std::unordered_map<ggml_tensor *, int> gpu2index;               // Reverse lookup from managed GPU tensor to gpu_tensors_in_order index.
         std::vector<ggml_tensor *> graph_nodes;                         // Graph nodes that read one or more managed dense tensors, in graph order.
-        std::vector<std::vector<ggml_tensor *>> graph_nodes_tensors;    // Managed dense tensors read by each corresponding entry in read_nodes.
+        std::vector<std::vector<ggml_tensor *>> graph_nodes_tensors;    // Managed dense tensors read by each corresponding entry in read_nodes. Read order must be kept intact
         std::vector<ggml_tensor *> release_node_by_tensor;              // For each streamed schedule index, the graph node whose completion releases that index and every preceding unreleased index.
         std::unordered_map<ggml_tensor *, int> next_required_tensor_idx;// Graph node -> first newly-read streamed tensor index that COPY must reach before compute advances.
-        std::vector<node_group> largest_node_pairs;
+        std::vector<node_group> node_pairs;                             // Adjacent pairs of nodes (duplicates are collapsed), filtering away static tensors
         bool dense_fits_arena = false;                                  // True when all managed dense tensors for this graph fit in the dense arena simultaneously.
     };
 

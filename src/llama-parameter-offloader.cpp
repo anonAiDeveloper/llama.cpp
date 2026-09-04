@@ -7,6 +7,7 @@
 #include "llama-graph.h"
 #include "../ggml/src/ggml-impl.h"
 
+#include <cstdint>
 #include <thread>
 #include <condition_variable>
 #include <mutex>
@@ -54,6 +55,11 @@ static inline size_t align_up(size_t x, size_t a)
 static inline size_t align_down(size_t x, size_t a)
 {
     return x & ~(a - 1);
+}
+
+inline size_t parameter_offloader::get_gpu_aligned_size(ggml_tensor * tensor, size_t alignment)
+{
+    return align_up(ggml_backend_buft_get_alloc_size(arena_buffer_type, gpu2cpu.at(tensor)), alignment);
 }
 
 static inline bool ranges_overlap(size_t a0, size_t a1, size_t b0, size_t b1)
@@ -1114,7 +1120,7 @@ bool parameter_offloader::on_eval_tensor(ggml_tensor * node)
     for (int i = 0; i < tensor_count; ++i)
     {
         const int release_idx = ordinal_mod(used_ordinal + 1, tensor_count);
-        if (graph_analysis_current.read_last_node[release_idx] != node)
+        if (graph_analysis_current.release_node_by_tensor[release_idx] != node)
             break;
 
         ++used_ordinal;
@@ -1129,13 +1135,15 @@ bool parameter_offloader::on_eval_tensor(ggml_tensor * node)
         node_cv_.notify_all();
     }
 
-    // Verbose, but super handy while tuning:
 #ifdef LLAMA_LOG_READS
     LLAMA_LOG_INFO("[R.%d]", idx);
 #endif
 
-    auto read_next_it = graph_analysis_current.read_next.find(node);
-    const long long needed_copy_ordinal = read_next_it != graph_analysis_current.read_next.end() ? advance_ordinal_to_idx(used_ordinal, read_next_it->second, tensor_count) : -1;
+    // Find the first newly-required streamed tensor that COPY must reach before compute advances past this node.
+    auto read_next_it = graph_analysis_current.next_required_tensor_idx.find(node);
+    
+    // Convert that schedule index to its monotonic COPY ordinal for the current traversal of the ring.
+    const long long needed_copy_ordinal = read_next_it != graph_analysis_current.next_required_tensor_idx.end() ? advance_ordinal_to_idx(used_ordinal, read_next_it->second, tensor_count) : -1;
 
 #if defined(LLAMA_DIAGNOSE_COPY)
     long long copied_ordinal = tensor_idx_copied_ordinal.load(std::memory_order_relaxed);
@@ -1177,15 +1185,15 @@ bool parameter_offloader::on_eval_tensor(ggml_tensor * node)
     }
 #endif /* defined(LLAMA_DIAGNOSE_COPY) */
     
-    if (read_next_it != graph_analysis_current.read_next.end())
+    // Wait only when this node has a next-tensor COPY requirement.
+    if (read_next_it != graph_analysis_current.next_required_tensor_idx.end())
     {
         long long cur_copied_ordinal = tensor_idx_copied_ordinal.load(std::memory_order_acquire);
 
         if (cur_copied_ordinal < needed_copy_ordinal)
         {
         #if LLAMA_LOG_READS > 1
-            LLAMA_LOG_INFO("[RB.%d.%lld.%lld.%lld]",
-                           idx, cur_copied_ordinal, needed_copy_ordinal, used_ordinal);
+            LLAMA_LOG_INFO("[RB.%d.%lld.%lld.%lld]", idx, cur_copied_ordinal, needed_copy_ordinal, used_ordinal);
         #endif
             std::unique_lock<std::mutex> lk(node_mu_);
             node_cv_.wait(lk, [&]{
@@ -1683,7 +1691,7 @@ uint64_t parameter_offloader::analyze_dense_graph(ggml_backend_sched_t sched, co
         if (!model_i->node_may_read_dense_weight(node))
             return;
 
-        std::vector<ggml_tensor *> node_reads;
+        std::vector<ggml_tensor *> graph_nodes_tensors;
 
         for (int k = 0; k < GGML_MAX_SRC; ++k)
         {
@@ -1698,10 +1706,11 @@ uint64_t parameter_offloader::analyze_dense_graph(ggml_backend_sched_t sched, co
             if (gpu_weight_set.find(w_gpu) == gpu_weight_set.end())
                 continue;
 
-            if (std::find(node_reads.begin(), node_reads.end(), w_gpu) != node_reads.end())
+            if (std::find(graph_nodes_tensors.begin(), graph_nodes_tensors.end(), w_gpu) != graph_nodes_tensors.end())
                 continue;
 
-            node_reads.push_back(w_gpu);
+            //TODO: Confirm that this maintains tensor read order
+            graph_nodes_tensors.push_back(w_gpu);
 
             if (seen.insert(w_gpu).second)
             {
@@ -1716,15 +1725,15 @@ uint64_t parameter_offloader::analyze_dense_graph(ggml_backend_sched_t sched, co
             }
         }
 
-        if (node_reads.empty())
+        if (graph_nodes_tensors.empty())
             return;
 
-        analysis.read_nodes.push_back(node);
-        analysis.node_reads.push_back(node_reads);
+        analysis.graph_nodes.push_back(node);
+        analysis.graph_nodes_tensors.push_back(graph_nodes_tensors);
 
-        hash_value(node_reads.size());
+        hash_value(graph_nodes_tensors.size());
 
-        for (ggml_tensor * w_gpu : node_reads)
+        for (ggml_tensor * w_gpu : graph_nodes_tensors)
             hash_value((uint64_t)(uintptr_t)w_gpu);
 
         hash_value(UINT64_MAX);
@@ -1746,14 +1755,14 @@ uint64_t parameter_offloader::analyze_dense_graph(ggml_backend_sched_t sched, co
     }
 
     // Fall back to the full graph if no managed dense reads were found in matching splits.
-    if (analysis.read_nodes.empty())
+    if (analysis.graph_nodes.empty())
 #endif /* if PO_GRAPH_FILTER_BY_BACKEND > 0 */
     {
         for (int i = 0; i < graph->n_nodes; ++i)
             collect_node_weights(graph->nodes[i]);
     }
 
-    hash_value(analysis.read_nodes.size());
+    hash_value(analysis.graph_nodes.size());
     hash_value(analysis.gpu_tensors_in_order.size());
     analysis.hash = hash;
 
@@ -1786,14 +1795,14 @@ void parameter_offloader::build_streaming_fit_lifetimes(
     if (tensor_count == 0)
         return;
 
-    fit_analysis.managed_node_reads.reserve(analysis.node_reads.size());
+    fit_analysis.managed_node_reads.reserve(analysis.graph_nodes_tensors.size());
 
     // Project the graph's managed dense reads onto the CURRENT streamed tensor set.
-    for (const std::vector<ggml_tensor *> & node_reads : analysis.node_reads)
+    for (const std::vector<ggml_tensor *> & graph_nodes_tensors : analysis.graph_nodes_tensors)
     {
         std::vector<int> streamed_tensor_indices;
 
-        for (ggml_tensor * w_gpu : node_reads)
+        for (ggml_tensor * w_gpu : graph_nodes_tensors)
         {
             auto index_it = gpu2index.find(w_gpu);
 
@@ -1870,12 +1879,12 @@ void parameter_offloader::build_streaming_fit_lifetimes(
     }
 }
 
-// CONTRACT: Calculates only streaming_fit_lower_bound, streaming_fit_upper_bound, largest_node_pairs and largest_node_triples
+// CONTRACT: Calculates only streaming_fit_lower_bound, streaming_fit_upper_bound, node_pairs
 //TODO: We probably want to establish virtual multi-tensor nodes prior to calling this for 100% accuracy
 void parameter_offloader::streaming_fit_calculate_bounds(dense_graph_analysis & analysis)
 {
-    analysis.largest_node_pairs.clear();
-    std::vector<node_group> largest_node_triples;
+    analysis.node_pairs.clear();
+    std::vector<node_group> node_triples;
 
     const size_t alignment = arena_alignment ? arena_alignment : 1;
     const int node_total = analysis.graph_nodes.size();
@@ -1900,7 +1909,7 @@ void parameter_offloader::streaming_fit_calculate_bounds(dense_graph_analysis & 
         {
             node_group group {
                 { analysis.graph_nodes[i] },
-                std::set<ggml_tensor *>(streaming_tensors.begin(), streaming_tensors.end()),
+                streaming_tensors,
                 0
             };
             int n_nodes = 1;
@@ -1912,10 +1921,14 @@ void parameter_offloader::streaming_fit_calculate_bounds(dense_graph_analysis & 
                 bool found_unique_tensor = false;
                 for (const auto &tensor : analysis.graph_nodes_tensors[j])
                 {
-                    if (group.tensors.find(tensor) == group.tensors.end() && static_dense_set.find(tensor) == static_dense_set.end())
+                    if (std::find(group.tensors.begin(), group.tensors.end(), tensor) == group.tensors.end()
+                         && static_dense_set.find(tensor) == static_dense_set.end())
                     {
                         if (n_nodes < target_nodes)
-                            found_unique_tensor = group.tensors.insert(tensor).second;
+                        {
+                            group.tensors.push_back(tensor);
+                            found_unique_tensor = true;
+                        }
                         else
                             return group;
                     }
@@ -1943,13 +1956,12 @@ void parameter_offloader::streaming_fit_calculate_bounds(dense_graph_analysis & 
         count_group_bytes(pair);
         count_group_bytes(triple);
 
-        analysis.largest_node_pairs.push_back(std::move(pair));
-        largest_node_triples.push_back(std::move(triple));
+        analysis.node_pairs.push_back(std::move(pair));
+        node_triples.push_back(std::move(triple));
     }
     
-    auto keep_largest = [&](std::vector<node_group> & groups)
+    auto calculate_bound = [&](std::vector<node_group> & groups)
     {
-        size_t largest = 0;
         size_t bound = 0;
 
         for (const auto & group : groups)
@@ -1958,18 +1970,14 @@ void parameter_offloader::streaming_fit_calculate_bounds(dense_graph_analysis & 
             for (const auto & other : groups)
                 ties += other.bytes == group.bytes;
 
-            largest = std::max(largest, group.bytes);
             bound = std::max(bound, group.bytes + (ties - 1) * alignment);
         }
-
-        groups.erase(std::remove_if(groups.begin(), groups.end(),
-            [=](const node_group & group) { return group.bytes != largest; }), groups.end());
 
         return bound;
     };
 
-    streaming_fit_lower_bound = keep_largest(analysis.largest_node_pairs);
-    streaming_fit_upper_bound = std::max(streaming_fit_lower_bound, keep_largest(largest_node_triples));
+    streaming_fit_lower_bound = calculate_bound(analysis.node_pairs);
+    streaming_fit_upper_bound = std::max(streaming_fit_lower_bound, calculate_bound(node_triples));
 }
 
 // CONTRACT: May modify only static_dense_order, static_dense_set, and static_tensor_bytes; returns whether static membership changed.
@@ -2091,8 +2099,8 @@ void parameter_offloader::build_graph_runtime_metadata(dense_graph_analysis & an
 {
     const size_t tensor_count = schedule.gpu_tensors_in_order.size();
 
-    analysis.read_last_node.assign(tensor_count, nullptr);
-    analysis.read_next.clear();
+    analysis.release_node_by_tensor.assign(tensor_count, nullptr);
+    analysis.next_required_tensor_idx.clear();
 
     if (tensor_count == 0)
         return;
@@ -2103,13 +2111,13 @@ void parameter_offloader::build_graph_runtime_metadata(dense_graph_analysis & an
     int first_read_idx = -1;
 
     // Materialize the current graph's release/copy synchronization metadata from the one graph analysis pass.
-    for (size_t read_pos = 0; read_pos < analysis.node_reads.size(); ++read_pos)
+    for (size_t read_pos = 0; read_pos < analysis.graph_nodes_tensors.size(); ++read_pos)
     {
-        ggml_tensor * node = analysis.read_nodes[read_pos];
+        ggml_tensor * node = analysis.graph_nodes[read_pos];
         bool node_reads_streamed_weight = false;
         int node_first_read_idx = -1;
 
-        for (ggml_tensor * w_gpu : analysis.node_reads[read_pos])
+        for (ggml_tensor * w_gpu : analysis.graph_nodes_tensors[read_pos])
         {
             auto it = schedule.gpu2index.find(w_gpu);
 
@@ -2125,7 +2133,7 @@ void parameter_offloader::build_graph_runtime_metadata(dense_graph_analysis & an
                 node_first_read_idx = idx;
             }
 
-            analysis.read_last_node[(size_t)idx] = node;
+            analysis.release_node_by_tensor[(size_t)idx] = node;
             read_last_position[(size_t)idx] = (int)read_pos;
         }
 
@@ -2136,13 +2144,13 @@ void parameter_offloader::build_graph_runtime_metadata(dense_graph_analysis & an
             first_read_idx = node_first_read_idx;
 
         if (previous_read_node && node_first_read_idx >= 0)
-            analysis.read_next[previous_read_node] = node_first_read_idx;
+            analysis.next_required_tensor_idx[previous_read_node] = node_first_read_idx;
 
         previous_read_node = node;
     }
 
     if (previous_read_node && first_read_idx >= 0)
-        analysis.read_next[previous_read_node] = first_read_idx;
+        analysis.next_required_tensor_idx[previous_read_node] = first_read_idx;
 
     int release_position = -1;
     ggml_tensor * release_node = nullptr;
@@ -2153,10 +2161,10 @@ void parameter_offloader::build_graph_runtime_metadata(dense_graph_analysis & an
         if (read_last_position[i] > release_position)
         {
             release_position = read_last_position[i];
-            release_node = analysis.read_last_node[i];
+            release_node = analysis.release_node_by_tensor[i];
         }
 
-        analysis.read_last_node[i] = release_node;
+        analysis.release_node_by_tensor[i] = release_node;
     }
 }
 
@@ -2203,698 +2211,440 @@ void parameter_offloader::build_next_schedule(offloader_schedule & schedule, den
  *                         Z to [6, 10) solves this issue, but such an easy solution may not always be easy to find.
  */
 
+//this version solves unique addresses last
 size_t parameter_offloader::generate_streaming_fit(offloader_schedule & schedule, const dense_graph_analysis & analysis)
 {
-    static constexpr size_t MAX_REPAIR_TENSORS_BACK = 30;
-    static constexpr size_t MAX_REPAIR_STATES = 4096;
-    static constexpr size_t MAX_REPAIR_CANDIDATES = 8;
-
-    const size_t tensor_count = schedule.cpu_tensors_in_order.size();
     const size_t alignment = arena_alignment ? arena_alignment : 1;
+    size_t pos = 0;
 
-    if (tensor_count == 0)
+    const int node_groups_total = analysis.node_pairs.size();
+
+    //Identify priority node groups, they are the ones tied for largest size
+    size_t largest_size = 0;
+    for (int i = 0; i < node_groups_total; ++i)
+        largest_size = std::max(largest_size, analysis.node_pairs[i].bytes);
+
+    //size_t fit_size = analysis.lower_bound;
+    size_t fit_size = largest_size;         //dont use lower_bound, we're going to nudge fit_size up in the final step of fitting
+    
+    /*
+    * Fit recursively by valleys: anchor the largest constrained node-pair near the arena boundaries,
+    * then immediately solve the interval between placed constraints. Within each valley, place the
+    * largest remaining constraint, solve the smaller sub-valley first, and use available slack to move
+    * the new wall outward on failure. Try the alternate boundary configuration before rejecting the
+    * candidate arena size; increasing the size moves right-anchored constraints and opens fresh starts.
+    */
+
+    std::map<ggml_tensor *, std::pair<size_t, int>> tensor_offsets;     //key: tensor, value: size, cycle
+    std::vector<ggml_tensor *> placement_log;
+
+    //return false if it fails to fit a node
+    auto fit_next_largest_node = [&](auto&& self, const std::vector<node_group> & groups, size_t left_bound, size_t right_bound) -> size_t
     {
-        schedule.start_offset.clear();
-        schedule.end_offset.clear();
-        return 0;
-    }
+        if (groups.empty())
+            return 0;
 
-///////////////////////       BUILD STREAMED READ TIMELINE       ///////////////////////
+        size_t smallest_conflict = 0;
 
-    streaming_fit_lifetime_analysis fit_analysis;
-    build_streaming_fit_lifetimes(schedule.gpu_tensors_in_order, schedule.gpu2index, analysis, fit_analysis);
+        //Get the largest node_pair, leftmost breaks ties
+        std::vector<node_group>::const_iterator target = std::max_element(
+            groups.begin(), groups.end(),
+            [](const node_group& a, const node_group& b) { return a.bytes < b.bytes; });
 
-    const int managed_node_count = (int)fit_analysis.managed_node_reads.size();
-    const std::vector<size_t> & tensor_bytes = fit_analysis.tensor_bytes;
-    const std::vector<std::vector<int>> & resident_tensor_indices = fit_analysis.resident_tensor_indices;
+        bool is_largest = target->bytes == largest_size;
 
-/////////////////       BUILD TENSOR COEXISTENCE CONSTRAINTS       ///////////////////
+        std::vector<node_group> left(groups.begin(), target);
+        std::vector<node_group> right(target + 1, groups.end());
 
-    std::vector<uint8_t> tensor_conflicts(tensor_count * tensor_count, 0);
+        size_t left_bytes = 0, right_bytes = 0;
+        std::set<ggml_tensor *> seen;
 
-    // Convert the resident sets into pairwise physical-overlap constraints used by the placement search.
-    for (const std::vector<int> & resident : resident_tensor_indices)
-    {
-        for (size_t i = 0; i < resident.size(); ++i)
-        {
-            for (size_t j = i + 1; j < resident.size(); ++j)
-            {
-                const size_t lhs = (size_t)resident[i];
-                const size_t rhs = (size_t)resident[j];
-
-                tensor_conflicts[lhs * tensor_count + rhs] = 1;
-                tensor_conflicts[rhs * tensor_count + lhs] = 1;
-            }
-        }
-    }
-
-    std::vector<std::vector<int>> tensor_conflict_indices(tensor_count);
-
-    for (size_t lhs = 0; lhs < tensor_count; ++lhs)
-    {
-        for (size_t rhs = lhs + 1; rhs < tensor_count; ++rhs)
-        {
-            if (!tensor_conflicts[lhs * tensor_count + rhs])
-                continue;
-
-            tensor_conflict_indices[lhs].push_back((int)rhs);
-            tensor_conflict_indices[rhs].push_back((int)lhs);
-        }
-    }
-
-//////////////////////       USE PRECALCULATED SIZE BOUNDS       ///////////////////////
-
-    const size_t streaming_size_lower_bound = streaming_fit_lower_bound;
-    const size_t streaming_size_upper_bound = streaming_fit_upper_bound;
-    const size_t search_ceiling = std::min(streaming_size_upper_bound, arena_dense_size - static_tensor_bytes);
-
-    if (streaming_size_lower_bound > search_ceiling)
-        throw std::runtime_error("parameter_offloader: no no-halt streaming fit can fit inside the finalized streaming region");
-
-    struct local_repair_search
-    {
-        size_t tensor_count;
-        size_t alignment;
-        size_t arena_size;
-        size_t max_states;
-        size_t max_candidates;
-
-        const std::vector<size_t> & tensor_bytes;
-        const std::vector<std::vector<int>> & tensor_conflict_indices;
-        const std::vector<size_t> & baseline_offsets;
-        const std::vector<uint8_t> & movable;
-        const std::vector<uint8_t> & violation_tensor;
-
-        size_t & next_size_event;
-
-        std::vector<size_t> offsets;
-        std::vector<uint8_t> placed;
-        std::unordered_set<size_t> used_starts;
-        std::vector<int> movable_order;
-
-        size_t states = 0;
-
-        local_repair_search(
-            size_t tensor_count,
-            size_t alignment,
-            size_t arena_size,
-            size_t max_states,
-            size_t max_candidates,
-            const std::vector<size_t> & tensor_bytes,
-            const std::vector<std::vector<int>> & tensor_conflict_indices,
-            const std::vector<size_t> & baseline_offsets,
-            const std::vector<uint8_t> & movable,
-            const std::vector<uint8_t> & violation_tensor,
-            size_t & next_size_event)
-            : tensor_count(tensor_count),
-              alignment(alignment),
-              arena_size(arena_size),
-              max_states(max_states),
-              max_candidates(max_candidates),
-              tensor_bytes(tensor_bytes),
-              tensor_conflict_indices(tensor_conflict_indices),
-              baseline_offsets(baseline_offsets),
-              movable(movable),
-              violation_tensor(violation_tensor),
-              next_size_event(next_size_event),
-              offsets(baseline_offsets),
-              placed(tensor_count, 0)
-        {
-            used_starts.reserve(tensor_count * 2);
-            movable_order.reserve(tensor_count);
-        }
-
-        bool legal(size_t tensor_idx, size_t start) const
-        {
-            const size_t bytes = tensor_bytes[tensor_idx];
-
-            if ((start % alignment) != 0)
-                return false;
-
-            if (bytes > arena_size)
-                return false;
-
-            if (start > arena_size - bytes)
-                return false;
-
-            if (used_starts.find(start) != used_starts.end())
-                return false;
-
-            const size_t end = start + bytes;
-
-            for (int other_idx : tensor_conflict_indices[tensor_idx])
-            {
-                const size_t other = (size_t)other_idx;
-
-                if (!placed[other])
-                    continue;
-
-                if (ranges_overlap(start, end, offsets[other], offsets[other] + tensor_bytes[other]))
-                    return false;
-            }
-
-            return true;
-        }
-
-        bool prepare()
-        {
-            // Freeze every tensor outside the repair set. If frozen tensors already contain a violation, moving the
-            // selected repair tensors cannot possibly fix this candidate size, so reject this repair set immediately.
-            for (size_t i = 0; i < tensor_count; ++i)
-            {
-                if (movable[i])
+        //Naively walk the superset of all tensors in the left and right nodes
+        pos = left_bound;
+        for (const node_group & group : left)
+            for (ggml_tensor * tensor : group.tensors)
+                if (tensor_offsets.count(tensor) == 0 && seen.insert(tensor).second)
                 {
-                    offsets[i] = SIZE_MAX;
-                    continue;
-                }
-
-                if (used_starts.find(offsets[i]) != used_starts.end())
-                    return false;
-
-                for (int other_idx : tensor_conflict_indices[i])
-                {
-                    const size_t other = (size_t)other_idx;
-
-                    if (other >= i || movable[other])
-                        continue;
-
-                    if (ranges_overlap(offsets[i], offsets[i] + tensor_bytes[i], offsets[other], offsets[other] + tensor_bytes[other]))
-                        return false;
-                }
-
-                placed[i] = 1;
-                used_starts.insert(offsets[i]);
-            }
-
-            // Search the actual offending tensors nearest the cyclic seam first, then the remaining movable tensors.
-            for (size_t i = tensor_count; i-- > 0; )
-                if (movable[i] && violation_tensor[i])
-                    movable_order.push_back((int)i);
-
-            for (size_t i = tensor_count; i-- > 0; )
-                if (movable[i] && !violation_tensor[i])
-                    movable_order.push_back((int)i);
-
-            return true;
-        }
-
-        void add_candidate(std::vector<size_t> & candidates, size_t tensor_idx, size_t start)
-        {
-            if (!legal(tensor_idx, start))
-                return;
-
-            if (std::find(candidates.begin(), candidates.end(), start) == candidates.end())
-                candidates.push_back(start);
-        }
-
-        void collect_candidates(size_t tensor_idx, std::vector<size_t> & candidates)
-        {
-            candidates.clear();
-
-            const size_t bytes = tensor_bytes[tensor_idx];
-            const size_t preferred = baseline_offsets[tensor_idx];
-
-            // Keeping the tensor at its baseline address is cheapest and usually preserves the useful structure of the
-            // sequential layout. The remaining candidates are interval boundaries or a midpoint inside a legal hole.
-            add_candidate(candidates, tensor_idx, preferred);
-
-            struct range
-            {
-                size_t start;
-                size_t end;
-            };
-
-            std::vector<range> blocked;
-            blocked.reserve(tensor_conflict_indices[tensor_idx].size());
-
-            // Build every range currently occupied by an already-placed tensor
-            // that this tensor is not allowed to overlap.
-            for (int other_idx : tensor_conflict_indices[tensor_idx])
-            {
-                const size_t other = (size_t)other_idx;
-
-                if (!placed[other])
-                    continue;
-
-                blocked.push_back({ offsets[other], offsets[other] + tensor_bytes[other] });
-
-                const size_t after = align_up(offsets[other] + tensor_bytes[other], alignment);
-
-                if (after <= SIZE_MAX - bytes)
-                    update_next_size_event(arena_size, after + bytes, alignment, next_size_event);
-            }
-
-            std::sort(blocked.begin(), blocked.end(), [](const range & lhs, const range & rhs) { return lhs.start < rhs.start; });
-
-            // Merge overlapping blocked ranges so the gaps between them can be examined directly.
-            std::vector<range> merged;
-            merged.reserve(blocked.size());
-
-            for (const range & current : blocked)
-            {
-                if (merged.empty() || merged.back().end < current.start)
-                    merged.push_back(current);
-                else
-                    merged.back().end = std::max(merged.back().end, current.end);
-            }
-
-            // Try a small number of representative starts from each legal gap.
-            size_t gap_start = 0;
-
-            for (size_t gap_idx = 0; gap_idx <= merged.size(); ++gap_idx)
-            {
-                const size_t gap_end = gap_idx < merged.size() ? merged[gap_idx].start : arena_size;
-
-                if (gap_end >= gap_start + bytes)
-                {
-                    // Left-most legal start.
-                    size_t left = align_up(gap_start, alignment);
-
-                    while (left <= gap_end - bytes && used_starts.find(left) != used_starts.end())
-                        left += alignment;
-
-                    if (left <= gap_end - bytes)
-                        add_candidate(candidates, tensor_idx, left);
-
-                    // Right-most legal start.
-                    size_t right = align_down(gap_end - bytes, alignment);
-
-                    while (right >= gap_start && used_starts.find(right) != used_starts.end())
+                    size_t bytes = get_gpu_aligned_size(tensor, alignment);
+                    if (pos + bytes > fit_size)
                     {
-                        if (right < alignment)
-                            break;
-
-                        right -= alignment;
+                        left_bytes += fit_size - pos;
+                        pos = 0;
                     }
-
-                    if (right >= gap_start && right <= gap_end - bytes)
-                        add_candidate(candidates, tensor_idx, right);
-
-                    // Midpoint gives the bounded search one non-boundary choice
-                    // without enumerating every aligned address in the gap.
-                    const size_t midpoint_limit = gap_end - bytes;
-                    const size_t midpoint = align_down(gap_start + (midpoint_limit - gap_start) / 2, alignment);
-
-                    add_candidate(candidates, tensor_idx, midpoint);
+                    pos += bytes;
+                    left_bytes += bytes;
                 }
 
-                if (gap_idx < merged.size())
-                    gap_start = merged[gap_idx].end;
-            }
+        seen.clear();
+        pos = right_bound;
+        for (auto group = right.rbegin(); group != right.rend(); ++group)
+            for (auto tensor = group->tensors.rbegin(); tensor != group->tensors.rend(); ++tensor)
+                if (tensor_offsets.count(*tensor) == 0 && seen.insert(*tensor).second)
+                {
+                    size_t bytes = get_gpu_aligned_size(*tensor, alignment);
+                    if (pos < bytes)
+                    {
+                        right_bytes += pos;
+                        pos = fit_size;
+                    }
+                    pos -= bytes;
+                    right_bytes += bytes;
+                }
+        //TODO: bytes isn't necessarily a measure of complexity, we probably want to count nodes or tensors
+        const bool left_first = left_bytes <= right_bytes;
+        //const bool left_first = left.count() <= right.count();
 
-            // Unplaced conflicting tensors still have useful baseline boundaries. Trying those boundaries gives the
-            // bounded search a chance to exchange positions without recursively exploring arbitrary byte addresses.
-            for (int other_idx : tensor_conflict_indices[tensor_idx])
+        //some of this node-pair's tensors might already be placed, only place unplaced tensors
+        std::vector<ggml_tensor *> unplaced_tensors, placed_tensors;
+        for (ggml_tensor * tensor : target->tensors)
+            tensor_offsets.count(tensor) == 0 ?
+                unplaced_tensors.push_back(tensor)
+                : placed_tensors.push_back(tensor);
+
+        //I thought I needed this but now im not sure
+        //size_t unplaced_bytes = 0;
+        //for (ggml_tensor * tensor : unplaced_tensors)
+        //    unplaced_bytes += get_gpu_aligned_size(tensor, alignment);
+
+        //largest node pairs only have a few different valid places they can fit
+        std::vector<size_t> lnp_offsets;
+        if (is_largest)
+        {
+            pos = 0;
+            if (placed_tensors.empty())
             {
-                const size_t other = (size_t)other_idx;
+                for (auto it = target->tensors.rbegin(); it != target->tensors.rend(); ++it)
+                {
+                    lnp_offsets.push_back(pos);
+                    pos += get_gpu_aligned_size(*it, alignment);
+                }
 
-                if (placed[other])
-                    continue;
+                pos = left_bound + left_bytes;
+                while (pos > fit_size)
+                    pos -= fit_size;
 
-                const size_t other_start = baseline_offsets[other];
-                const size_t other_end = other_start + tensor_bytes[other];
-
-                if (other_start >= bytes)
-                    add_candidate(candidates, tensor_idx, align_down(other_start - bytes, alignment));
-
-                add_candidate(candidates, tensor_idx, align_up(other_end, alignment));
+                //rotate it so we try the tightest fit first
+                std::rotate(lnp_offsets.begin(), std::lower_bound(lnp_offsets.begin(), lnp_offsets.end(), pos), lnp_offsets.end());
             }
-
-            // Prefer addresses nearest the original sequential placement.
-            std::sort(candidates.begin(), candidates.end(), [&](size_t lhs, size_t rhs) {
-                const size_t lhs_distance = lhs > preferred ? lhs - preferred : preferred - lhs;
-                const size_t rhs_distance = rhs > preferred ? rhs - preferred : preferred - rhs;
-
-                if (lhs_distance != rhs_distance)
-                    return lhs_distance < rhs_distance;
-
-                return lhs < rhs;
-            });
-
-            if (candidates.size() > max_candidates)
-                candidates.resize(max_candidates);
-        }
-
-        bool run(size_t movable_pos)
-        {
-            if (++states > max_states)
-                return false;
-
-            if (movable_pos == movable_order.size())
-                return true;
-
-            const size_t tensor_idx = (size_t)movable_order[movable_pos];
-
-            std::vector<size_t> candidates;
-            collect_candidates(tensor_idx, candidates);
-
-            for (size_t start : candidates)
-            {
-                offsets[tensor_idx] = start;
-                placed[tensor_idx] = 1;
-                used_starts.insert(start);
-
-                if (run(movable_pos + 1))
-                    return true;
-
-                used_starts.erase(start);
-                placed[tensor_idx] = 0;
-                offsets[tensor_idx] = SIZE_MAX;
-
-                if (states >= max_states)
-                    break;
-            }
-
-            return false;
-        }
-    };
-
-////////////////////       BUILD SEQUENTIAL WRAPPED BASELINE       ///////////////////
-
-    // Build the cheap streaming-order layout for this candidate size. A cycle is only a run of tensors between wraps;
-    // tensors remain the allocation objects. Unique starts are enforced while building the baseline because duplicate
-    // starts are otherwise common at wrap points and would create repair work unrelated to fragmentation.
-    auto build_sequential_layout = [&](
-        size_t arena_size,
-        std::vector<size_t> & offsets,
-        std::vector<int> & cycle_idx,
-        size_t & next_size_event) -> bool
-    {
-        offsets.assign(tensor_count, SIZE_MAX);
-        cycle_idx.assign(tensor_count, 0);
-
-        std::unordered_set<size_t> used_starts;
-        used_starts.reserve(tensor_count * 2);
-
-        size_t cursor = 0;
-        int cycle = 0;
-
-        for (size_t i = 0; i < tensor_count; ++i)
-        {
-            const size_t bytes = tensor_bytes[i];
-
-            if (bytes > arena_size)
-                return false;
-
-            size_t natural_start = align_up(cursor, alignment);
-            bool wrapped = false;
-
-            if (natural_start > arena_size - bytes)
-            {
-                update_next_size_event(arena_size, natural_start + bytes, alignment, next_size_event);
-
-                natural_start = 0;
-                ++cycle;
-                wrapped = true;
-            }
-
-            size_t start = natural_start;
-
-            while (start <= arena_size - bytes && used_starts.find(start) != used_starts.end())
-                start += alignment;
-
-            // A unique start was not available before the current end of cycle. Wrap and reuse the physical holes
-            // from earlier cycles; only the start address itself must be globally unique.
-            if (start > arena_size - bytes)
-            {
-                update_next_size_event(arena_size, start + bytes, alignment, next_size_event);
-
-                start = 0;
-
-                while (start <= arena_size - bytes && used_starts.find(start) != used_starts.end())
-                    start += alignment;
-
-                if (start > arena_size - bytes)
-                    return false;
-
-                if (!wrapped)
-                    ++cycle;
-            }
-
-            offsets[i] = start;
-            cycle_idx[i] = cycle;
-            used_starts.insert(start);
-
-            cursor = start + bytes;
-        }
-
-        return true;
-    };
-
-////////////////////       GLOBAL LAYOUT VIOLATION DETECTION       ///////////////////
-
-    auto collect_layout_violations = [&](const std::vector<size_t> & offsets, std::vector<std::pair<int, int>> & violations) {
-        violations.clear();
-
-        // First detect globally duplicated tensor starts.
-        std::unordered_map<size_t, int> start_owner;
-        start_owner.reserve(tensor_count * 2);
-
-        for (size_t i = 0; i < tensor_count; ++i)
-        {
-            const auto inserted = start_owner.emplace(offsets[i], (int)i);
-
-            if (!inserted.second)
-                violations.emplace_back(inserted.first->second, (int)i);
-        }
-
-        // Then detect every physical overlap between tensors that must coexist.
-        for (size_t lhs = 0; lhs < tensor_count; ++lhs)
-        {
-            for (int rhs_idx : tensor_conflict_indices[lhs])
-            {
-                const size_t rhs = (size_t)rhs_idx;
-
-                if (rhs <= lhs)
-                    continue;
-
-                if (ranges_overlap(offsets[lhs], offsets[lhs] + tensor_bytes[lhs], offsets[rhs], offsets[rhs] + tensor_bytes[rhs]))
-                    violations.emplace_back((int)lhs, (int)rhs);
-            }
-        }
-    };
-
-///////////////////////       SEARCH CANDIDATE ARENA SIZES       ///////////////////////
-
-    size_t candidate_size = streaming_size_lower_bound;
-    std::vector<size_t> best_tensor_offsets;
-    size_t attempt_count = 0;
-    size_t total_repair_states = 0;
-
-    while (candidate_size <= search_ceiling)
-    {
-        ++attempt_count;
-
-        size_t next_size_event = SIZE_MAX;
-        std::vector<size_t> baseline_offsets;
-        std::vector<int> cycle_idx;
-
-//////////////////       BUILD BASELINE FOR THIS CANDIDATE SIZE       //////////////////
-
-        if (!build_sequential_layout(candidate_size, baseline_offsets, cycle_idx, next_size_event))
-        {
-            if (candidate_size == search_ceiling)
-                throw std::runtime_error("parameter_offloader: failed to construct a unique-start streaming baseline inside the search ceiling");
-
-            const size_t next_candidate_size = next_size_event == SIZE_MAX ? search_ceiling : std::min(next_size_event, search_ceiling);
-            candidate_size = next_candidate_size > candidate_size ? next_candidate_size : std::min(candidate_size + alignment, search_ceiling);
-
-            continue;
-        }
-
-///////////////////       CHECK BASELINE FOR FRAGMENTATION       /////////////////////
-
-        std::vector<std::pair<int, int>> violations;
-        collect_layout_violations(baseline_offsets, violations);
-
-        if (violations.empty())
-        {
-            best_tensor_offsets = baseline_offsets;
+            else   //the end of the right-most already placed tensor
+                lnp_offsets.push_back(tensor_offsets[placed_tensors.back()].first + get_gpu_aligned_size(placed_tensors.back(), alignment));
         }
         else
+            lnp_offsets.push_back(0);   //TODO: just put a dummy value here for now, but later we may want to explore alternative configurations for non-largest node pairs
+
+        std::map<ggml_tensor *, size_t> tensor_offsets_temp;
+
+        for (size_t candidate_offset : lnp_offsets)
         {
-///////////////////////       BUILD LOCAL REPAIR SETS       //////////////////////////
-
-            std::vector<uint8_t> violation_tensor(tensor_count, 0);
-
-            for (const auto & violation : violations)
+            auto place_tensor_against_left = [&](size_t left_bound, ggml_tensor * tensor)
             {
-                violation_tensor[(size_t)violation.first] = 1;
-                violation_tensor[(size_t)violation.second] = 1;
+                size_t tensor_aligned_size = get_gpu_aligned_size(tensor, alignment);
+                if (left_bound + tensor_aligned_size > fit_size)
+                    left_bound = 0;    //need to wrap around to the beginning
+                tensor_offsets_temp[tensor] = left_bound;
+                return left_bound + tensor_aligned_size;
+            };
+            auto place_tensor_against_right = [&](size_t right_bound, ggml_tensor * tensor)
+            {
+                size_t tensor_aligned_size = get_gpu_aligned_size(tensor, alignment);
+                if (right_bound < tensor_aligned_size)
+                    right_bound = fit_size - tensor_aligned_size;    //need to wrap around to the end
+                else
+                    right_bound -= tensor_aligned_size;
+                tensor_offsets_temp[tensor] = right_bound;
+                return right_bound;
+            };
+
+            if (unplaced_tensors.empty())
+            {
+                //do nothing
+            }
+            else if (!placed_tensors.empty())
+            {
+                if (placed_tensors[0] == target->tensors[0]) //leftmost tensor has been placed
+                {
+                    pos = left_bound;
+                    for (ggml_tensor * tensor : unplaced_tensors)
+                        pos = place_tensor_against_left(pos, tensor);
+                }
+                else if (placed_tensors.back() == target->tensors.back()) //rightmost tensor has been placed
+                {
+                    pos = right_bound;
+                    for (auto it = unplaced_tensors.rbegin(); it != unplaced_tensors.rend(); ++it)
+                        pos = place_tensor_against_right(pos, *it);
+                }
+                else
+                {
+                    size_t anchor = std::find(target->tensors.begin(), target->tensors.end(), placed_tensors[0]) - target->tensors.begin();
+                    pos = tensor_offsets.at(target->tensors[anchor]).first + get_gpu_aligned_size(target->tensors[anchor], alignment);
+
+                    for (size_t i = 1; i < target->tensors.size(); ++i)
+                    {
+                        ggml_tensor * tensor = target->tensors[(anchor + i) % target->tensors.size()];
+                        if (tensor_offsets.count(tensor))
+                            pos = tensor_offsets.at(tensor).first + get_gpu_aligned_size(tensor, alignment);
+                        else
+                            pos = place_tensor_against_left(pos, tensor);
+                    }
+                }          
+            }
+            else if (is_largest)
+            {
+                pos = candidate_offset;
+                for (ggml_tensor * tensor : unplaced_tensors)
+                        pos = place_tensor_against_left(pos, tensor);
+            }
+            else if (left_first) //fit against left side
+            {
+                pos = left_bound + left_bytes;
+                while (pos > fit_size)
+                    pos -= fit_size;
+
+                for (ggml_tensor * tensor : unplaced_tensors)
+                    pos = place_tensor_against_left(pos, tensor);
+            }
+            else    //fit against right side
+            {
+                //Can't do this, it underflows
+                //pos = right_bound - right_bytes;
+                //while (right_bound < right_bytes)
+                //    pos += fit_size;
+                pos = (right_bound + fit_size - right_bytes % fit_size) % fit_size;
+
+                for (auto it = unplaced_tensors.rbegin(); it != unplaced_tensors.rend(); ++it)
+                    pos = place_tensor_against_right(pos, *it);
             }
 
-            const size_t tail_begin = tensor_count > MAX_REPAIR_TENSORS_BACK ? tensor_count - MAX_REPAIR_TENSORS_BACK : 0;
-            const int first_cycle = cycle_idx.front();
-            const int last_cycle = cycle_idx.back();
+            //tensor_offsets.insert(tensor_offsets_temp.begin(), tensor_offsets_temp.end());
+            size_t rollback_pos = placement_log.size();
+            for (const auto & entry : tensor_offsets_temp)
+                if (tensor_offsets.insert({ entry.first, { entry.second, -1 } }).second)
+                    placement_log.push_back(entry.first);
 
-            std::vector<std::vector<uint8_t>> repair_sets;
+            //All tensors are now placed, check that no COPY HALT occurs. This is easy, just check that no tensor in the node-pair conflicts with any other
+            size_t conflict_size = 0;
+            for (int i = 0; i < target->tensors.size(); ++i)
+                for (int j = i + 1; j < target->tensors.size(); ++j)
+                {
+                    ggml_tensor * a = target->tensors[i], * b = target->tensors[j];
+                    size_t a1 = tensor_offsets.at(a).first, a2 = a1 + get_gpu_aligned_size(a, alignment);
+                    size_t b1 = tensor_offsets.at(b).first, b2 = b1 + get_gpu_aligned_size(b, alignment);
+                    if (ranges_overlap(a1, a2, b1, b2))
+                        conflict_size = std::max(conflict_size, std::min(a2, b2) - std::max(a1, b1));
+                }
 
-///////////////////       REPAIR SET 1 - FINAL CYCLE OFFENDERS       ///////////////////
+            //if (unplaced_tensors.empty())
+            //    return conflict_size;
 
-            // First try only actual offenders in the last cycle. Most cyclic fragmentation problems should die here.
-            std::vector<uint8_t> movable_last_cycle(tensor_count, 0);
-
-            for (size_t i = tail_begin; i < tensor_count; ++i)
-                if (cycle_idx[i] == last_cycle && violation_tensor[i])
-                    movable_last_cycle[i] = 1;
-
-            repair_sets.push_back(std::move(movable_last_cycle));
-
-//////////////////////       REPAIR SET 2 - TAIL OFFENDERS       ///////////////////////
-
-            // If the problem reaches farther back within the final block or so, allow every offending tail tensor to move.
-            std::vector<uint8_t> movable_tail_offenders(tensor_count, 0);
-
-            for (size_t i = tail_begin; i < tensor_count; ++i)
-                if (violation_tensor[i])
-                    movable_tail_offenders[i] = 1;
-
-            repair_sets.push_back(std::move(movable_tail_offenders));
-
-////////////////       REPAIR SET 3 - FULL TAIL + HEAD OFFENDERS       /////////////////
-
-            // Final bounded attempt: the last <=30 tensors may move, along with first-cycle tensors that are directly
-            // involved in the current seam failure. We intentionally do not search farther back than this.
-            std::vector<uint8_t> movable_tail_and_head(tensor_count, 0);
-
-            for (size_t i = tail_begin; i < tensor_count; ++i)
-                movable_tail_and_head[i] = 1;
-
-            for (size_t i = 0; i < tensor_count; ++i)
-                if (cycle_idx[i] == first_cycle && violation_tensor[i])
-                    movable_tail_and_head[i] = 1;
-
-            repair_sets.push_back(std::move(movable_tail_and_head));
-
-//////////////////////////       TRY LOCAL REPAIR SETS       ///////////////////////////
-
-            std::vector<uint8_t> previous_repair_set;
-
-            for (const std::vector<uint8_t> & movable : repair_sets)
+            auto handle_failure = [&](size_t error_amount)
             {
-                if (!previous_repair_set.empty() && movable == previous_repair_set)
-                    continue;
+                while (placement_log.size() > rollback_pos)
+                {
+                    tensor_offsets.erase(placement_log.back());
+                    placement_log.pop_back();
+                }
+                smallest_conflict = smallest_conflict == 0 ? error_amount : std::min(smallest_conflict, error_amount);
+            };
 
-                previous_repair_set = movable;
-
-                bool any_movable = false;
-
-                for (uint8_t value : movable)
-                    any_movable = any_movable || value != 0;
-
-                if (!any_movable)
-                    continue;
-
-                local_repair_search repair(
-                    tensor_count,
-                    alignment,
-                    candidate_size,
-                    MAX_REPAIR_STATES,
-                    MAX_REPAIR_CANDIDATES,
-                    tensor_bytes,
-                    tensor_conflict_indices,
-                    baseline_offsets,
-                    movable,
-                    violation_tensor,
-                    next_size_event);
-
-                if (!repair.prepare())
-                    continue;
-
-                const bool repaired = repair.run(0);
-                total_repair_states += repair.states;
-
-                if (!repaired)
-                    continue;
-
-///////////////////       GLOBALLY VERIFY REPAIRED LAYOUT       //////////////////////
-
-                std::vector<std::pair<int, int>> repaired_violations;
-                collect_layout_violations(repair.offsets, repaired_violations);
-
-                if (!repaired_violations.empty())
-                    continue;
-
-                best_tensor_offsets = std::move(repair.offsets);
-                break;
-            }
-        }
-
-/////////////////////       ACCEPT SUCCESSFUL CANDIDATE       ////////////////////////
-
-        if (!best_tensor_offsets.empty())
-        {
-            size_t layout_end = 0;
-
-            for (size_t i = 0; i < tensor_count; ++i)
-                layout_end = std::max(layout_end, best_tensor_offsets[i] + tensor_bytes[i]);
-
-            // Keep the accepted candidate at least as large as the precomputed lower bound.
-            candidate_size = std::max(align_up(layout_end, alignment), streaming_size_lower_bound);
-
-            break;
-        }
-
-////////////////       ADVANCE TO NEXT MEANINGFUL ARENA SIZE       ///////////////////
-
-        if (candidate_size == search_ceiling)
-        {
-            print_tensor_order(schedule.gpu_tensors_in_order, baseline_offsets, GGML_LOG_LEVEL_ERROR);
-            throw std::runtime_error("parameter_offloader: bounded local repair failed to construct a no-halt streaming layout inside the search ceiling");
-        }
-
-        // Search is intentionally lossy. Once local repair has exceeded its useful scope, pay the small amount of VRAM
-        // needed to reach the next placement event rather than searching deeper into repetitive model blocks.
-        size_t next_candidate_size = next_size_event;
-
-        if (next_candidate_size == SIZE_MAX || next_candidate_size <= candidate_size)
-            next_candidate_size = search_ceiling;
-
-        candidate_size = std::min(align_up(next_candidate_size, alignment), search_ceiling);
-    }
-
-//////////////////////       FINAL GLOBAL LAYOUT VALIDATION       //////////////////////
-
-    // Validate the generated tensor layout independently before storing it in the schedule.
-    std::vector<size_t> used_starts;
-    used_starts.reserve(tensor_count);
-
-    for (size_t i = 0; i < tensor_count; ++i)
-    {
-        GGML_ASSERT((best_tensor_offsets[i] % alignment) == 0);
-        GGML_ASSERT(best_tensor_offsets[i] + tensor_bytes[i] <= candidate_size);
-        GGML_ASSERT(std::find(used_starts.begin(), used_starts.end(), best_tensor_offsets[i]) == used_starts.end());
-
-        used_starts.push_back(best_tensor_offsets[i]);
-
-        for (size_t j = 0; j < i; ++j)
-        {
-            if (!tensor_conflicts[i * tensor_count + j])
+            if (conflict_size)
+            {
+                handle_failure(conflict_size);
                 continue;
+            }
 
-            const bool overlap = !(best_tensor_offsets[i] + tensor_bytes[i] <= best_tensor_offsets[j] || best_tensor_offsets[j] + tensor_bytes[j] <= best_tensor_offsets[i]);
-            GGML_ASSERT(!overlap);
+            size_t target_left  = tensor_offsets.at(target->tensors.front()).first;
+            size_t target_right = tensor_offsets.at(target->tensors.back()).first + get_gpu_aligned_size(target->tensors.back(), alignment);
+
+            //recursively solve the rest of the fit
+            size_t extra_bytes_needed = 0;
+            if (left_first)
+            {
+                extra_bytes_needed = self(self, left, left_bound, target_left);
+                if (extra_bytes_needed)
+                {
+                    handle_failure(extra_bytes_needed);
+                    continue;
+                }
+                extra_bytes_needed = self(self, right, target_right, right_bound);
+                if (extra_bytes_needed)
+                {
+                    handle_failure(extra_bytes_needed);
+                    continue;
+                }
+                return 0;
+            }
+            else
+            {
+                extra_bytes_needed = self(self, right, target_right, right_bound);
+                if (extra_bytes_needed)
+                {
+                    handle_failure(extra_bytes_needed);
+                    continue;
+                }
+                extra_bytes_needed = self(self, left, left_bound, target_left);
+                if (extra_bytes_needed)
+                {
+                    handle_failure(extra_bytes_needed);
+                    continue;
+                }
+                return 0;
+            }
         }
-    }
 
-///////////////////////       STORE SOLVED FIT IN SCHEDULE       //////////////////////
+        return smallest_conflict;
+    };
 
-    schedule.start_offset = best_tensor_offsets;
-    schedule.end_offset.resize(tensor_count);
-
-    size_t streaming_size = 0;
-
-    for (size_t i = 0; i < tensor_count; ++i)
+    size_t bytes_needed;
+    while ((bytes_needed = fit_next_largest_node(fit_next_largest_node, analysis.node_pairs, 0, fit_size)) > 0)
     {
-        schedule.end_offset[i] = schedule.start_offset[i] + tensor_bytes[i];
-        streaming_size = std::max(streaming_size, schedule.end_offset[i]);
+        if (fit_size == streaming_fit_upper_bound)
+            throw std::runtime_error("parameter_offloader:: failed to find fit within upper bound");
+
+        tensor_offsets.clear();
+        
+        fit_size += bytes_needed;
+        if (fit_size > streaming_fit_upper_bound)
+            fit_size = streaming_fit_upper_bound;
     }
 
-///////////////////////////       DEBUG STATISTICS       /////////////////////////////
+    //Dedup tensor addresses
 
-    LLAMA_LOG_INFO("%s: fit=%zu lower=%zu upper=%zu tensors=%zu read_positions=%d attempts=%zu repair_states=%zu\n", __func__, streaming_size, streaming_size_lower_bound, streaming_size_upper_bound, tensor_count, managed_node_count, attempt_count, total_repair_states);
+    std::vector<std::vector<ggml_tensor *>> cycles_x_tensors_in_order;
+    std::multimap<size_t, ggml_tensor *> offset_x_tensor_ascending;     //key: offset, value: tensor, order: lowest first
+    std::map<ggml_tensor *, std::multimap<size_t, ggml_tensor *>::iterator> tensor_x_iterator;  //for fast updating of offset_x_tensor_ascending
 
-    return streaming_size;
+    std::map<ggml_tensor *, std::vector<int>> tensor_x_node_pairs;      //lookup node-pairs by tensor
+    for (int i = 0; i < analysis.node_pairs.size(); ++i)
+        for (ggml_tensor * tensor : analysis.node_pairs[i].tensors)
+            tensor_x_node_pairs[tensor].push_back(i);
+    for (auto it = tensor_x_node_pairs.begin(); it != tensor_x_node_pairs.end(); ++it)
+        std::stable_sort(it->second.begin(), it->second.end(), [&](int a, int b) {
+            return analysis.node_pairs[a].bytes > analysis.node_pairs[b].bytes;
+        });
+        
+    int cycle = 0;
+    size_t prev_offset = 0;
+    for (ggml_tensor * tensor : analysis.gpu_tensors_in_order)
+    {
+        std::pair<size_t, int> & offset_info = tensor_offsets.at(tensor);
+        size_t offset = offset_info.first;
+
+        if (!cycles_x_tensors_in_order.empty() && offset <= prev_offset)
+            ++cycle;
+
+        if (cycles_x_tensors_in_order.size() <= (size_t)cycle)
+            cycles_x_tensors_in_order.emplace_back();
+
+        offset_info.second = cycle;
+        cycles_x_tensors_in_order[cycle].push_back(tensor);
+
+        prev_offset = offset;
+
+        tensor_x_iterator[tensor] = offset_x_tensor_ascending.insert({ tensor_offsets.at(tensor).first, tensor });
+    }
+
+    //Search addresses starting at 0 for duplicates, if duplicate is found nudge the smallest tensors up. The largest (leftmost wins ties) tensor remains still
+    while (!offset_x_tensor_ascending.empty())
+    {
+        std::multimap<size_t, ggml_tensor *>::iterator first = offset_x_tensor_ascending.begin();
+        std::multimap<size_t, ggml_tensor *>::iterator next = first;
+
+        std::vector<ggml_tensor *> dup_tensors = { first->second }; //first tensor
+        while (++next != offset_x_tensor_ascending.end() && first->first == next->first)
+            dup_tensors.push_back(next->second);
+
+        if (dup_tensors.size() > 1)
+        {
+            std::sort(dup_tensors.begin(), dup_tensors.end(), [&](ggml_tensor * a, ggml_tensor * b)
+            {
+                int ap = tensor_x_node_pairs[a][0], bp = tensor_x_node_pairs[b][0];
+                return analysis.node_pairs[ap].bytes != analysis.node_pairs[bp].bytes ?
+                    analysis.node_pairs[ap].bytes > analysis.node_pairs[bp].bytes : ap < bp;
+            });
+
+            for (int dup_idx = 1; dup_idx < dup_tensors.size(); ++dup_idx)
+            {
+                auto nudge_tensor = [&](auto&& recurse_tensor, ggml_tensor * tensor, size_t nudge) -> void
+                {
+                    //First nudge the tensor's own cycle
+
+                    std::vector<ggml_tensor *> nudged_tensors;
+                    int cycle = tensor_offsets[tensor].second;
+                    int j = 0;
+                    while (cycles_x_tensors_in_order[cycle][j] != tensor)
+                        ++j;
+                    for (;j < cycles_x_tensors_in_order[cycle].size(); ++j)
+                    {
+                        ggml_tensor * target = cycles_x_tensors_in_order[cycle][j];
+                        size_t target_nudge; 
+                        if (target == tensor)
+                            target_nudge = nudge;
+                        else
+                        {
+                            ggml_tensor * prev_target = cycles_x_tensors_in_order[cycle][j - 1];
+                            size_t prev_end = tensor_offsets[prev_target].first + get_gpu_aligned_size(prev_target, alignment);
+                            target_nudge = prev_end > tensor_offsets[target].first ? prev_end - tensor_offsets[target].first : 0;
+                        }
+
+                        if (target_nudge == 0)
+                            break;
+
+                        nudged_tensors.push_back(target);
+                        tensor_offsets[target].first += target_nudge;
+                        offset_x_tensor_ascending.erase(tensor_x_iterator[target]);
+                        tensor_x_iterator[target] = offset_x_tensor_ascending.insert({ tensor_offsets[target].first, target });
+                    }
+
+                    //Then see if any tensors that share a node-pair with that tensor also need a nudge
+                    auto nudge_node_pair_tensors = [&](auto&& self, ggml_tensor * root)
+                    {
+                        for (int node_idx : tensor_x_node_pairs[root])
+                            for (ggml_tensor * tensor : analysis.node_pairs[node_idx].tensors)
+                                if (tensor != root)
+                                {
+                                    //its important to do the full ranges_overlap check here
+                                    size_t tensor_start = tensor_offsets.at(tensor).first, tensor_end = tensor_start + get_gpu_aligned_size(tensor, alignment);
+                                    size_t prev_start = tensor_offsets.at(root).first, prev_end = prev_start + get_gpu_aligned_size(root, alignment);
+                                    if (ranges_overlap(tensor_start, tensor_end, prev_start, prev_end))
+                                    {
+                                        //The only way it can overlap at this point is if root encroached upon tensor from the left, so nudge it
+                                        recurse_tensor(recurse_tensor, tensor, align_up(prev_end - tensor_start, alignment));
+                                    }
+                                }
+                    };
+
+                    for (int j = 0; j < nudged_tensors.size(); ++j)
+                        nudge_node_pair_tensors(nudge_node_pair_tensors, nudged_tensors[j]);
+                };
+
+                nudge_tensor(nudge_tensor, dup_tensors[dup_idx], alignment * dup_idx);
+            }
+        }
+
+        //drop lowest unique address from the search, it wont be moved later
+        tensor_x_iterator.erase(offset_x_tensor_ascending.begin()->second);
+        offset_x_tensor_ascending.erase(offset_x_tensor_ascending.begin());
+    }
+
+    //recompute fit from final geometry
+    for (const std::vector<ggml_tensor *> & tensors : cycles_x_tensors_in_order)
+    {
+        ggml_tensor * tensor = tensors.back();
+        fit_size = std::max(fit_size,
+            tensor_offsets[tensor].first + get_gpu_aligned_size(tensor, alignment));
+    }
+
+    schedule.start_offset.resize(analysis.gpu_tensors_in_order.size());
+    schedule.end_offset.resize(analysis.gpu_tensors_in_order.size());
+
+    for (size_t i = 0; i < schedule.gpu_tensors_in_order.size(); ++i)
+    {
+        ggml_tensor * tensor = schedule.gpu_tensors_in_order[i];
+        schedule.start_offset[i] = tensor_offsets.at(tensor).first;
+        schedule.end_offset[i] = schedule.start_offset[i] + ggml_backend_buft_get_alloc_size(arena_buffer_type, gpu2cpu.at(tensor));
+    }
+
+    return fit_size;
 }
 
 bool parameter_offloader::swap_next_schedule(size_t streaming_fit)
@@ -2992,10 +2742,10 @@ bool parameter_offloader::swap_next_schedule(size_t streaming_fit)
         std::swap(schedule_current, schedule_next);
         std::swap(graph_analysis_current, graph_analysis_next);
 
-        if (!graph_analysis_current.read_last_node.empty())
+        if (!graph_analysis_current.release_node_by_tensor.empty())
         {
-            auto it = graph_analysis_current.read_next.find(graph_analysis_current.read_last_node.back());
-            if (it != graph_analysis_current.read_next.end())
+            auto it = graph_analysis_current.next_required_tensor_idx.find(graph_analysis_current.release_node_by_tensor.back());
+            if (it != graph_analysis_current.next_required_tensor_idx.end())
                 startup_copy_idx = it->second;
         }
 
@@ -3057,7 +2807,7 @@ bool parameter_offloader::swap_next_schedule(size_t streaming_fit)
 
         changed = true;
 
-        //print_snapshot(schedule_current);
+        print_snapshot(schedule_current);
     }
 
     // The new schedule is now completely published and schedule_mutex is free.
@@ -3888,14 +3638,30 @@ void parameter_offloader::print_snapshot(offloader_schedule & schedule, ggml_log
         GGML_ASSERT(end[i] <= arena_dense_size);
     }
 
-    for (int i = 0; i < tensor_count; ++i)
+    GGML_ASSERT(graph_analysis_current.release_node_by_tensor.size() == tensor_count);
+
+    std::unordered_map<ggml_tensor *, int> read_gate_by_node;
+    read_gate_by_node.reserve(tensor_count);
+
+    for (int i = 0; i < (int)tensor_count; ++i)
+    {
+        ggml_tensor * node = graph_analysis_current.release_node_by_tensor[i];
+        if (node)
+            read_gate_by_node[node] = i;
+    }
+
+    for (int i = 0; i < (int)tensor_count; ++i)
     {
         ggml_tensor * w_gpu  = schedule.gpu_tensors_in_order[i]; // GPU tensor being printed
         const char * name    = ggml_get_name(w_gpu); // mirrored model tensor name
 
-        llama_log_internal(level, "%s %4d %4d %10lu %10lu %5d %s\n",
+        ggml_tensor * read_node = graph_analysis_current.release_node_by_tensor[i];
+        int read_gate = read_node ? read_gate_by_node.at(read_node) : -1;
+
+        llama_log_internal(level, "%s %4d %4d %4d %10lu %10lu %5d %s\n",
             __func__,
             i,
+            read_gate,
             schedule.ready_after[i],
             start[i],
             end[i],
