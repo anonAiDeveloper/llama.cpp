@@ -37,6 +37,7 @@
 //#define LLAMA_LOG_COPIES 2
 
 //#define LLAMA_PRINT_WEIGHT_READS
+//#define LLAMA_DIAGNOSE_FIT
 /////////////////////////////////////
 
 #ifndef GGML_USE_CUDA
@@ -1880,7 +1881,6 @@ void parameter_offloader::build_streaming_fit_lifetimes(
 }
 
 // CONTRACT: Calculates only streaming_fit_lower_bound, streaming_fit_upper_bound, node_pairs
-//TODO: We probably want to establish virtual multi-tensor nodes prior to calling this for 100% accuracy
 void parameter_offloader::streaming_fit_calculate_bounds(dense_graph_analysis & analysis)
 {
     analysis.node_pairs.clear();
@@ -1889,33 +1889,41 @@ void parameter_offloader::streaming_fit_calculate_bounds(dense_graph_analysis & 
     const size_t alignment = arena_alignment ? arena_alignment : 1;
     const int node_total = analysis.graph_nodes.size();
 
-    for (int i = 0; i < node_total; ++i)
+    for (int node_idx = 0; node_idx < node_total; ++node_idx)
     {
         std::vector<ggml_tensor *> streaming_tensors;
-        for (const auto & tensor : analysis.graph_nodes_tensors[i])
+        for (const auto & tensor : analysis.graph_nodes_tensors[node_idx])
             if (static_dense_set.find(tensor) == static_dense_set.end())
                 streaming_tensors.push_back(tensor);
 
+        if (streaming_tensors.empty())
+            continue;
+
         //skip nodes that are subsets of the previous node
-        bool is_subset = i != 0;
+        bool is_subset = node_idx != 0;
         for (int j = 0; is_subset && j < streaming_tensors.size(); ++j)
-            is_subset = is_subset && std::find(analysis.graph_nodes_tensors[i - 1].begin(),
-                                               analysis.graph_nodes_tensors[i - 1].end(),
-                                               streaming_tensors[j]) != analysis.graph_nodes_tensors[i - 1].end();
+            is_subset = is_subset && std::find(analysis.graph_nodes_tensors[node_idx - 1].begin(),
+                                               analysis.graph_nodes_tensors[node_idx - 1].end(),
+                                               streaming_tensors[j]) != analysis.graph_nodes_tensors[node_idx - 1].end();
         if (is_subset)
             continue;
 
         auto new_node_group = [&](int target_nodes)
         {
             node_group group {
-                { analysis.graph_nodes[i] },
-                streaming_tensors,
-                0
+                /* nodes */   { analysis.graph_nodes[node_idx] },
+                /* tensors */ {},
+                /* bytes */   0
             };
             int n_nodes = 1;
+
+            std::vector<std::pair<ggml_tensor *, int>> tensor_x_node_idx;
+            for (int j = 0; j < streaming_tensors.size(); ++j)
+                tensor_x_node_idx.push_back({ streaming_tensors[j], node_idx });
             
-            for (int j = i == node_total - 1 ? 0 : i + 1;
-                j != i;
+            //walk forward until target_nodes nodes have contributed unique streaming tensors
+            for (int j = node_idx == node_total - 1 ? 0 : node_idx + 1;
+                j != node_idx;
                 j == node_total - 1 ? j = 0 : ++j)
             {
                 bool found_unique_tensor = false;
@@ -1926,11 +1934,12 @@ void parameter_offloader::streaming_fit_calculate_bounds(dense_graph_analysis & 
                     {
                         if (n_nodes < target_nodes)
                         {
-                            group.tensors.push_back(tensor);
+                            //group.tensors.push_back(tensor);
+                            tensor_x_node_idx.push_back({tensor, j});
                             found_unique_tensor = true;
                         }
                         else
-                            return group;
+                            goto finish_node;
                     }
                 }
 
@@ -1940,21 +1949,45 @@ void parameter_offloader::streaming_fit_calculate_bounds(dense_graph_analysis & 
                 group.nodes.push_back(analysis.graph_nodes[j]);
             }
 
-            return group;
-        };
+        finish_node:
+            //sort by global read order, keeping tensors from wrapped nodes at the back
+            std::sort(tensor_x_node_idx.begin(), tensor_x_node_idx.end(), [&](const auto & a, const auto & b) {
+                bool a_wrapped = a.second < node_idx, b_wrapped = b.second < node_idx;
+                if (a_wrapped != b_wrapped)
+                    return !a_wrapped;
+                return analysis.gpu2index.at(a.first) < analysis.gpu2index.at(b.first);
+            });
 
-        auto count_group_bytes = [&](node_group & group)
-        {
-            group.bytes = 0;
+            for (const auto & entry : tensor_x_node_idx)
+                group.tensors.push_back(entry.first);
+
+            //add every tensor that appears in global read order between the first and last of the groups tensors
+            if (!group.tensors.empty())
+            {
+                int idx = analysis.gpu2index.at(group.tensors.front());
+                const int last_idx = analysis.gpu2index.at(group.tensors.back());
+                
+                group.tensors.clear();
+                for (;; idx = idx == analysis.gpu_tensors_in_order.size() - 1 ? 0 : idx + 1)
+                {
+                    ggml_tensor * tensor = analysis.gpu_tensors_in_order[idx];
+                    if (static_dense_set.find(tensor) == static_dense_set.end())
+                        group.tensors.push_back(tensor);
+
+                    if (idx == last_idx)
+                        break;
+                }
+            }
+
+            //tally bytes
             for (const auto & tensor : group.tensors)
                 group.bytes += align_up(ggml_backend_buft_get_alloc_size(arena_buffer_type, gpu2cpu.at(tensor)), alignment);
+
+            return group;
         };
 
         node_group pair = new_node_group(2);
         node_group triple = new_node_group(3);
-
-        count_group_bytes(pair);
-        count_group_bytes(triple);
 
         analysis.node_pairs.push_back(std::move(pair));
         node_triples.push_back(std::move(triple));
@@ -2211,7 +2244,6 @@ void parameter_offloader::build_next_schedule(offloader_schedule & schedule, den
  *                         Z to [6, 10) solves this issue, but such an easy solution may not always be easy to find.
  */
 
-//this version solves unique addresses last
 size_t parameter_offloader::generate_streaming_fit(offloader_schedule & schedule, const dense_graph_analysis & analysis)
 {
     const size_t alignment = arena_alignment ? arena_alignment : 1;
@@ -2237,9 +2269,15 @@ size_t parameter_offloader::generate_streaming_fit(offloader_schedule & schedule
 
     std::map<ggml_tensor *, std::pair<size_t, int>> tensor_offsets;     //key: tensor, value: size, cycle
     std::vector<ggml_tensor *> placement_log;
+#ifdef LLAMA_DIAGNOSE_FIT
+    //fit_size = streaming_fit_upper_bound;         //just skip to max fit size so I can test it
+
+    std::map<ggml_tensor *, size_t> debug_tensor_offsets;
+    print_node_groups(analysis.node_pairs, analysis, schedule);
+#endif
 
     //return false if it fails to fit a node
-    auto fit_next_largest_node = [&](auto&& self, const std::vector<node_group> & groups, size_t left_bound, size_t right_bound) -> size_t
+    auto fit_next_largest_node = [&](auto&& self, const std::vector<node_group> & groups, std::set<ggml_tensor *> up, const size_t left_bound, const size_t right_bound) -> size_t
     {
         if (groups.empty())
             return 0;
@@ -2257,40 +2295,53 @@ size_t parameter_offloader::generate_streaming_fit(offloader_schedule & schedule
         std::vector<node_group> right(target + 1, groups.end());
 
         size_t left_bytes = 0, right_bytes = 0;
-        std::set<ggml_tensor *> seen;
+        std::set<ggml_tensor *> left_tensors, right_tensors;
 
-        //Naively walk the superset of all tensors in the left and right nodes
-        pos = left_bound;
         for (const node_group & group : left)
-            for (ggml_tensor * tensor : group.tensors)
-                if (tensor_offsets.count(tensor) == 0 && seen.insert(tensor).second)
-                {
-                    size_t bytes = get_gpu_aligned_size(tensor, alignment);
-                    if (pos + bytes > fit_size)
-                    {
-                        left_bytes += fit_size - pos;
-                        pos = 0;
-                    }
-                    pos += bytes;
-                    left_bytes += bytes;
-                }
+            left_tensors.insert(group.tensors.begin(), group.tensors.end());
 
-        seen.clear();
+        for (const node_group & group : right)
+            right_tensors.insert(group.tensors.begin(), group.tensors.end());
+
+        int target_left_idx  = schedule.gpu2index.at(target->tensors.front());
+        int target_right_idx = schedule.gpu2index.at(target->tensors.back());
+
+        pos = left_bound;
+        for (int i = 0; i < target_left_idx; ++i)
+        {
+            ggml_tensor * tensor = schedule.gpu_tensors_in_order[i];
+
+            if (left_tensors.count(tensor) == 0 || up.count(tensor))
+                continue;
+
+            size_t bytes = get_gpu_aligned_size(tensor, alignment);
+            if (pos + bytes > fit_size)
+            {
+                left_bytes += fit_size - pos;
+                pos = 0;
+            }
+            pos += bytes;
+            left_bytes += bytes;
+        }
+
         pos = right_bound;
-        for (auto group = right.rbegin(); group != right.rend(); ++group)
-            for (auto tensor = group->tensors.rbegin(); tensor != group->tensors.rend(); ++tensor)
-                if (tensor_offsets.count(*tensor) == 0 && seen.insert(*tensor).second)
-                {
-                    size_t bytes = get_gpu_aligned_size(*tensor, alignment);
-                    if (pos < bytes)
-                    {
-                        right_bytes += pos;
-                        pos = fit_size;
-                    }
-                    pos -= bytes;
-                    right_bytes += bytes;
-                }
-        //TODO: bytes isn't necessarily a measure of complexity, we probably want to count nodes or tensors
+        for (int i = (int)schedule.gpu_tensors_in_order.size() - 1; i > target_right_idx; --i)
+        {
+            ggml_tensor * tensor = schedule.gpu_tensors_in_order[i];
+
+            if (right_tensors.count(tensor) == 0 || up.count(tensor))
+                continue;
+
+            size_t bytes = get_gpu_aligned_size(tensor, alignment);
+            if (pos < bytes)
+            {
+                right_bytes += pos;
+                pos = fit_size;
+            }
+            pos -= bytes;
+            right_bytes += bytes;
+        }
+        //TODO: bytes isn't necessarily a measure of complexity, we could also count nodes or tensors
         const bool left_first = left_bytes <= right_bytes;
         //const bool left_first = left.count() <= right.count();
 
@@ -2300,11 +2351,6 @@ size_t parameter_offloader::generate_streaming_fit(offloader_schedule & schedule
             tensor_offsets.count(tensor) == 0 ?
                 unplaced_tensors.push_back(tensor)
                 : placed_tensors.push_back(tensor);
-
-        //I thought I needed this but now im not sure
-        //size_t unplaced_bytes = 0;
-        //for (ggml_tensor * tensor : unplaced_tensors)
-        //    unplaced_bytes += get_gpu_aligned_size(tensor, alignment);
 
         //largest node pairs only have a few different valid places they can fit
         std::vector<size_t> lnp_offsets;
@@ -2330,7 +2376,9 @@ size_t parameter_offloader::generate_streaming_fit(offloader_schedule & schedule
                 lnp_offsets.push_back(tensor_offsets[placed_tensors.back()].first + get_gpu_aligned_size(placed_tensors.back(), alignment));
         }
         else
+        {
             lnp_offsets.push_back(0);   //TODO: just put a dummy value here for now, but later we may want to explore alternative configurations for non-largest node pairs
+        }
 
         std::map<ggml_tensor *, size_t> tensor_offsets_temp;
 
@@ -2342,6 +2390,11 @@ size_t parameter_offloader::generate_streaming_fit(offloader_schedule & schedule
                 if (left_bound + tensor_aligned_size > fit_size)
                     left_bound = 0;    //need to wrap around to the beginning
                 tensor_offsets_temp[tensor] = left_bound;
+#ifdef LLAMA_DIAGNOSE_FIT
+                debug_tensor_offsets[tensor] = left_bound;
+                const char * name = ggml_get_name(tensor);
+                LLAMA_LOG_INFO("%s: fit %-39s %5d %10zu %10zu\n", __func__, name ? name : "(unnamed)", schedule.gpu2index.at(tensor), left_bound, left_bound + tensor_aligned_size);
+#endif
                 return left_bound + tensor_aligned_size;
             };
             auto place_tensor_against_right = [&](size_t right_bound, ggml_tensor * tensor)
@@ -2352,50 +2405,72 @@ size_t parameter_offloader::generate_streaming_fit(offloader_schedule & schedule
                 else
                     right_bound -= tensor_aligned_size;
                 tensor_offsets_temp[tensor] = right_bound;
+#ifdef LLAMA_DIAGNOSE_FIT
+                debug_tensor_offsets[tensor] = right_bound;
+                const char * name = ggml_get_name(tensor);
+                LLAMA_LOG_INFO("%s: fit %-39s %5d %10zu %10zu\n", __func__, name ? name : "(unnamed)", schedule.gpu2index.at(tensor), right_bound, right_bound + tensor_aligned_size);
+#endif
                 return right_bound;
             };
 
+#ifdef LLAMA_DIAGNOSE_FIT
+            LLAMA_LOG_INFO("fit_next_largest_node %s %d %zu %zu %zu %zu %d  %d %d %d\n", left_first ? "left_first " : "right_first", left.size(), left_bound, left_bytes, right_bytes, right_bound, right.size(),
+                placed_tensors.size(), target->tensors.size(), unplaced_tensors.size());
+#endif
+
             if (unplaced_tensors.empty())
             {
+#ifdef LLAMA_DIAGNOSE_FIT
+                LLAMA_LOG_INFO("fit_next_largest_node %-56s\n", "unplaced_tensors.empty()");
+                print_node_groups({*target}, analysis, schedule);
+#endif
                 //do nothing
             }
-            else if (!placed_tensors.empty())
+            else if (placed_tensors.size() && placed_tensors[0] == target->tensors[0]) //leftmost tensor has been placed
             {
-                if (placed_tensors[0] == target->tensors[0]) //leftmost tensor has been placed
+#ifdef LLAMA_DIAGNOSE_FIT
+                LLAMA_LOG_INFO("fit_next_largest_node %-56s\n", "placed_tensors[0] == target->tensors[0]");
+#endif
+                pos = tensor_offsets.at(target->tensors[0]).first + get_gpu_aligned_size(target->tensors[0], alignment);
+                for (size_t i = 1; i < target->tensors.size(); ++i)
                 {
-                    pos = left_bound;
-                    for (ggml_tensor * tensor : unplaced_tensors)
+                    ggml_tensor * tensor = target->tensors[i];
+                    if (tensor_offsets.count(tensor))
+                        pos = tensor_offsets.at(tensor).first + get_gpu_aligned_size(tensor, alignment);
+                    else
                         pos = place_tensor_against_left(pos, tensor);
                 }
-                else if (placed_tensors.back() == target->tensors.back()) //rightmost tensor has been placed
+            }
+            else if (placed_tensors.size() && placed_tensors.back() == target->tensors.back()) //rightmost tensor has been placed
+            {
+#ifdef LLAMA_DIAGNOSE_FIT
+                LLAMA_LOG_INFO("fit_next_largest_node %-56s\n", "placed_tensors.back() == target->tensors.back()");
+#endif
+                pos = tensor_offsets.at(target->tensors.back()).first;
+                for (int i = (int)target->tensors.size() - 2; i >= 0; --i)
                 {
-                    pos = right_bound;
-                    for (auto it = unplaced_tensors.rbegin(); it != unplaced_tensors.rend(); ++it)
-                        pos = place_tensor_against_right(pos, *it);
+                    ggml_tensor * tensor = target->tensors[i];
+                    if (tensor_offsets.count(tensor))
+                        pos = tensor_offsets.at(tensor).first;
+                    else
+                        pos = place_tensor_against_right(pos, tensor);
                 }
-                else
-                {
-                    size_t anchor = std::find(target->tensors.begin(), target->tensors.end(), placed_tensors[0]) - target->tensors.begin();
-                    pos = tensor_offsets.at(target->tensors[anchor]).first + get_gpu_aligned_size(target->tensors[anchor], alignment);
-
-                    for (size_t i = 1; i < target->tensors.size(); ++i)
-                    {
-                        ggml_tensor * tensor = target->tensors[(anchor + i) % target->tensors.size()];
-                        if (tensor_offsets.count(tensor))
-                            pos = tensor_offsets.at(tensor).first + get_gpu_aligned_size(tensor, alignment);
-                        else
-                            pos = place_tensor_against_left(pos, tensor);
-                    }
-                }          
             }
             else if (is_largest)
             {
+#ifdef LLAMA_DIAGNOSE_FIT
+                LLAMA_LOG_INFO("fit_next_largest_node %-56s %10zu\n", "is_largest", candidate_offset);
+#endif
                 pos = candidate_offset;
                 for (ggml_tensor * tensor : unplaced_tensors)
-                        pos = place_tensor_against_left(pos, tensor);
+                    pos = place_tensor_against_left(pos, tensor);
             }
             else if (left_first) //fit against left side
             {
+#ifdef LLAMA_DIAGNOSE_FIT
+                LLAMA_LOG_INFO("fit_next_largest_node left_first\n");
+                //print_node_groups(left, analysis, schedule);
+#endif
                 pos = left_bound + left_bytes;
                 while (pos > fit_size)
                     pos -= fit_size;
@@ -2405,10 +2480,10 @@ size_t parameter_offloader::generate_streaming_fit(offloader_schedule & schedule
             }
             else    //fit against right side
             {
-                //Can't do this, it underflows
-                //pos = right_bound - right_bytes;
-                //while (right_bound < right_bytes)
-                //    pos += fit_size;
+#ifdef LLAMA_DIAGNOSE_FIT
+                LLAMA_LOG_INFO("fit_next_largest_node right_first\n");
+                //print_node_groups(right, analysis, schedule);
+#endif
                 pos = (right_bound + fit_size - right_bytes % fit_size) % fit_size;
 
                 for (auto it = unplaced_tensors.rbegin(); it != unplaced_tensors.rend(); ++it)
@@ -2429,8 +2504,17 @@ size_t parameter_offloader::generate_streaming_fit(offloader_schedule & schedule
                     ggml_tensor * a = target->tensors[i], * b = target->tensors[j];
                     size_t a1 = tensor_offsets.at(a).first, a2 = a1 + get_gpu_aligned_size(a, alignment);
                     size_t b1 = tensor_offsets.at(b).first, b2 = b1 + get_gpu_aligned_size(b, alignment);
+                    //TODO: If somehow a very small tensor is entirely within a very large tensor, the conflict_size might not be meaningful
+                    //      conflict size would equal the entirety of the very small tensor, perhaps only 128 bytes.
+                    //      What might be more meaningful is the smallest nudge needed to resolve the conflict, for either tensor in the conflict.
                     if (ranges_overlap(a1, a2, b1, b2))
-                        conflict_size = std::max(conflict_size, std::min(a2, b2) - std::max(a1, b1));
+                    {
+                        size_t overlap = std::min(a2, b2) - std::max(a1, b1);
+                        conflict_size = std::max(conflict_size, overlap);
+#ifdef LLAMA_DIAGNOSE_FIT
+                        LLAMA_LOG_INFO("%s: conflict indexes %4d %4d  ranges %10zu %10zu  %10zu %10zu  overlap %10zu\n", __func__, schedule.gpu2index.at(a), schedule.gpu2index.at(b), a1, a2, b1, b2, overlap);
+#endif
+                    }
                 }
 
             //if (unplaced_tensors.empty())
@@ -2438,8 +2522,22 @@ size_t parameter_offloader::generate_streaming_fit(offloader_schedule & schedule
 
             auto handle_failure = [&](size_t error_amount)
             {
+#ifdef LLAMA_DIAGNOSE_FIT
+                std::string undo_indexes;
+                for (size_t i = placement_log.size(); i > rollback_pos; --i)
+                {
+                    if (!undo_indexes.empty())
+                        undo_indexes += ",";
+                    undo_indexes += std::to_string(schedule.gpu2index.at(placement_log[i - 1]));
+                }
+                LLAMA_LOG_INFO("%s: undo indexes %s\n", __func__, undo_indexes.c_str());
+#endif
                 while (placement_log.size() > rollback_pos)
                 {
+#ifdef LLAMA_DIAGNOSE_FIT
+                    const char * name = ggml_get_name(placement_log.back());
+                    LLAMA_LOG_INFO("%s: undo %s \n", __func__, name ? name : "(unnamed)");
+#endif
                     tensor_offsets.erase(placement_log.back());
                     placement_log.pop_back();
                 }
@@ -2452,20 +2550,46 @@ size_t parameter_offloader::generate_streaming_fit(offloader_schedule & schedule
                 continue;
             }
 
-            size_t target_left  = tensor_offsets.at(target->tensors.front()).first;
-            size_t target_right = tensor_offsets.at(target->tensors.back()).first + get_gpu_aligned_size(target->tensors.back(), alignment);
+            //Traverse left and right from target->tensors until an empty space is found to determine target_left and target_right
+            const int target_left_start  = target_left_idx;
+            const int target_right_start = target_right_idx;
+            up.insert(target->tensors.begin(), target->tensors.end());
+            for (int i = target_left_start == 0 ? schedule.gpu_tensors_in_order.size() - 1 : target_left_start - 1;
+                i != target_left_start;
+                i = i == 0 ? schedule.gpu_tensors_in_order.size() - 1 : i - 1)
+            {
+                ggml_tensor * tensor = schedule.gpu_tensors_in_order[i];
+                if (tensor_offsets.count(tensor) == 0)
+                    break;
+                target_left_idx = i;
+                up.insert(tensor);
+            }
+
+            for (int i = target_right_start == schedule.gpu_tensors_in_order.size() - 1 ? 0 : target_right_start + 1;
+                i != target_right_start;
+                i = i == schedule.gpu_tensors_in_order.size() - 1 ? 0 : i + 1)
+            {
+                ggml_tensor * tensor = schedule.gpu_tensors_in_order[i];
+                if (tensor_offsets.count(tensor) == 0)
+                    break;
+                target_right_idx = i;
+                up.insert(tensor);
+            }
+
+            const size_t target_left  = tensor_offsets.at(schedule.gpu_tensors_in_order[target_left_idx]).first;
+            const size_t target_right = tensor_offsets.at(schedule.gpu_tensors_in_order[target_right_idx]).first + get_gpu_aligned_size(schedule.gpu_tensors_in_order[target_right_idx], alignment);
 
             //recursively solve the rest of the fit
             size_t extra_bytes_needed = 0;
             if (left_first)
             {
-                extra_bytes_needed = self(self, left, left_bound, target_left);
+                extra_bytes_needed = self(self, left, up, left_bound, target_left);
                 if (extra_bytes_needed)
                 {
                     handle_failure(extra_bytes_needed);
                     continue;
                 }
-                extra_bytes_needed = self(self, right, target_right, right_bound);
+                extra_bytes_needed = self(self, right, up, target_right, right_bound);
                 if (extra_bytes_needed)
                 {
                     handle_failure(extra_bytes_needed);
@@ -2475,13 +2599,13 @@ size_t parameter_offloader::generate_streaming_fit(offloader_schedule & schedule
             }
             else
             {
-                extra_bytes_needed = self(self, right, target_right, right_bound);
+                extra_bytes_needed = self(self, right, up, target_right, right_bound);
                 if (extra_bytes_needed)
                 {
                     handle_failure(extra_bytes_needed);
                     continue;
                 }
-                extra_bytes_needed = self(self, left, left_bound, target_left);
+                extra_bytes_needed = self(self, left, up, left_bound, target_left);
                 if (extra_bytes_needed)
                 {
                     handle_failure(extra_bytes_needed);
@@ -2494,18 +2618,45 @@ size_t parameter_offloader::generate_streaming_fit(offloader_schedule & schedule
         return smallest_conflict;
     };
 
+    LLAMA_LOG_INFO("%s analysis.node_pairs.size() == %d\n", __func__, node_groups_total); fflush(stderr);
+
     size_t bytes_needed;
-    while ((bytes_needed = fit_next_largest_node(fit_next_largest_node, analysis.node_pairs, 0, fit_size)) > 0)
+    while ((bytes_needed = fit_next_largest_node(fit_next_largest_node, analysis.node_pairs, {}, 0, fit_size)) > 0)
     {
         if (fit_size == streaming_fit_upper_bound)
-            throw std::runtime_error("parameter_offloader:: failed to find fit within upper bound");
+        {
+#ifdef LLAMA_DIAGNOSE_FIT
+            LLAMA_LOG_WARN("%s: failed fit at %zu bytes; last attempt needed %zu additional bytes\n", __func__, fit_size, bytes_needed);
+
+            std::vector<size_t> debug_offsets(schedule.gpu_tensors_in_order.size(), SIZE_MAX);
+
+            for (size_t i = 0; i < schedule.gpu_tensors_in_order.size(); ++i)
+            {
+                auto it = debug_tensor_offsets.find(schedule.gpu_tensors_in_order[i]);
+                if (it != debug_tensor_offsets.end())
+                    debug_offsets[i] = it->second;
+            }
+
+            print_tensor_order(schedule.gpu_tensors_in_order, debug_offsets, GGML_LOG_LEVEL_WARN);
+#endif
+            throw std::runtime_error(
+                "parameter_offloader: failed to find streaming fit; final attempted fit=" +
+                std::to_string(fit_size) + " bytes, additional bytes requested=" +
+                std::to_string(bytes_needed));
+        }
 
         tensor_offsets.clear();
         
         fit_size += bytes_needed;
         if (fit_size > streaming_fit_upper_bound)
             fit_size = streaming_fit_upper_bound;
+
+#ifdef LLAMA_DIAGNOSE_FIT
+        LLAMA_LOG_INFO("%s: fit increased to %zu\n", __func__, fit_size);
+#endif
     }
+
+    LLAMA_LOG_INFO("%s fit complete, now try nudging\n", __func__);
 
     //Dedup tensor addresses
 
@@ -2596,7 +2747,7 @@ size_t parameter_offloader::generate_streaming_fit(offloader_schedule & schedule
                     }
 
                     //Then see if any tensors that share a node-pair with that tensor also need a nudge
-                    auto nudge_node_pair_tensors = [&](auto&& self, ggml_tensor * root)
+                    auto nudge_node_pair_tensors = [&](ggml_tensor * root)
                     {
                         for (int node_idx : tensor_x_node_pairs[root])
                             for (ggml_tensor * tensor : analysis.node_pairs[node_idx].tensors)
@@ -2614,7 +2765,7 @@ size_t parameter_offloader::generate_streaming_fit(offloader_schedule & schedule
                     };
 
                     for (int j = 0; j < nudged_tensors.size(); ++j)
-                        nudge_node_pair_tensors(nudge_node_pair_tensors, nudged_tensors[j]);
+                        nudge_node_pair_tensors(nudged_tensors[j]);
                 };
 
                 nudge_tensor(nudge_tensor, dup_tensors[dup_idx], alignment * dup_idx);
@@ -2625,6 +2776,8 @@ size_t parameter_offloader::generate_streaming_fit(offloader_schedule & schedule
         tensor_x_iterator.erase(offset_x_tensor_ascending.begin()->second);
         offset_x_tensor_ascending.erase(offset_x_tensor_ascending.begin());
     }
+
+    LLAMA_LOG_INFO("%s nudging complete, now recompute fit\n", __func__);
 
     //recompute fit from final geometry
     for (const std::vector<ggml_tensor *> & tensors : cycles_x_tensors_in_order)
@@ -2643,6 +2796,8 @@ size_t parameter_offloader::generate_streaming_fit(offloader_schedule & schedule
         schedule.start_offset[i] = tensor_offsets.at(tensor).first;
         schedule.end_offset[i] = schedule.start_offset[i] + ggml_backend_buft_get_alloc_size(arena_buffer_type, gpu2cpu.at(tensor));
     }
+
+    LLAMA_LOG_INFO("%s final fit: %zu\n", __func__, fit_size);
 
     return fit_size;
 }
@@ -3667,6 +3822,35 @@ void parameter_offloader::print_snapshot(offloader_schedule & schedule, ggml_log
             end[i],
             schedule.ready_after[i] - i,
             name ? name : "(unnamed)");
+    }
+}
+
+void parameter_offloader::print_node_groups(const std::vector<node_group> & groups, const dense_graph_analysis & analysis, const offloader_schedule & schedule)
+{
+    for (size_t i = 0; i < groups.size(); ++i)
+    {
+        const node_group & group = groups[i];
+
+        std::string nodes, tensors;
+
+        for (ggml_tensor * node : group.nodes)
+        {
+            size_t idx = std::find(analysis.graph_nodes.begin(), analysis.graph_nodes.end(), node) - analysis.graph_nodes.begin();
+            if (!nodes.empty())
+                nodes += ",";
+            nodes += std::to_string(idx);
+        }
+
+        for (ggml_tensor * tensor : group.tensors)
+        {
+            size_t idx = std::find(schedule.gpu_tensors_in_order.begin(), schedule.gpu_tensors_in_order.end(), tensor) - schedule.gpu_tensors_in_order.begin();
+
+            if (!tensors.empty())
+                tensors += ",";
+            tensors += std::to_string(idx);
+        }
+
+        LLAMA_LOG_INFO("node_group %4zu  nodes: %-35s  tensors: %s\n", i, nodes.c_str(), tensors.c_str());
     }
 }
 

@@ -195,6 +195,7 @@ public:
     std::unordered_map<ggml_tensor*, uint64_t> gpu_hashes;
 
     void print_snapshot(offloader_schedule & schedule, ggml_log_level level = GGML_LOG_LEVEL_INFO);
+    void print_node_groups(const std::vector<node_group> & groups, const dense_graph_analysis & analysis, const offloader_schedule & schedule);
     void print_tensor_order(const std::vector<ggml_tensor *> & tensors, const std::vector<size_t> & offsets, ggml_log_level level = GGML_LOG_LEVEL_INFO);
 private:
     // Misc helper functions
