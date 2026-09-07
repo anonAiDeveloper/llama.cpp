@@ -1990,7 +1990,38 @@ void parameter_offloader::streaming_fit_calculate_bounds(dense_graph_analysis & 
         node_group pair = new_node_group(2);
         node_group triple = new_node_group(3);
 
-        analysis.node_pairs.push_back(std::move(pair));
+        //check for redundancy before adding node-pair
+        if (!analysis.node_pairs.empty())
+        {
+            node_group & previous = analysis.node_pairs.back();
+
+            bool pair_subset = true;
+            for (ggml_tensor * tensor : pair.tensors)
+                if (std::find(previous.tensors.begin(), previous.tensors.end(), tensor) == previous.tensors.end())
+                {
+                    pair_subset = false;
+                    break;
+                }
+
+            if (!pair_subset)
+            {
+                bool previous_subset = true;
+                for (ggml_tensor * tensor : previous.tensors)
+                    if (std::find(pair.tensors.begin(), pair.tensors.end(), tensor) == pair.tensors.end())
+                    {
+                        previous_subset = false;
+                        break;
+                    }
+
+                if (previous_subset)
+                    previous = std::move(pair);
+                else
+                    analysis.node_pairs.push_back(std::move(pair));
+            }
+        }
+        else
+            analysis.node_pairs.push_back(std::move(pair));
+
         node_triples.push_back(std::move(triple));
     }
     
@@ -3046,7 +3077,7 @@ bool parameter_offloader::swap_next_schedule(size_t streaming_fit)
 
         changed = true;
 
-        print_snapshot(schedule_current);
+        //print_snapshot(schedule_current);
     }
 
     // The new schedule is now completely published and schedule_mutex is free.
