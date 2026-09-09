@@ -2282,382 +2282,635 @@ size_t parameter_offloader::generate_streaming_fit(offloader_schedule & schedule
     size_t pos = 0;
 
     const int node_groups_total = analysis.node_pairs.size();
+    const int tensor_count = schedule.gpu_tensors_in_order.size();
 
     //Identify priority node groups, they are the ones tied for largest size
     size_t largest_size = 0;
     for (int i = 0; i < node_groups_total; ++i)
         largest_size = std::max(largest_size, analysis.node_pairs[i].bytes);
 
-    //size_t fit_size = analysis.lower_bound;
-    size_t fit_size = largest_size;         //dont use lower_bound, we're going to nudge fit_size up in the final step of fitting
-    
-    /*
-    * Fit recursively by valleys: anchor the largest constrained node-pair near the arena boundaries,
-    * then immediately solve the interval between placed constraints. Within each valley, place the
-    * largest remaining constraint, solve the smaller sub-valley first, and use available slack to move
-    * the new wall outward on failure. Try the alternate boundary configuration before rejecting the
-    * candidate arena size; increasing the size moves right-anchored constraints and opens fresh starts.
-    */
-
-    std::map<ggml_tensor *, std::pair<size_t, int>> tensor_offsets;     //key: tensor, value: size, cycle
-    std::vector<ggml_tensor *> placement_log;
 #ifdef LLAMA_DIAGNOSE_FIT
-    //fit_size = streaming_fit_upper_bound;         //just skip to max fit size so I can test it
-
-    std::map<ggml_tensor *, size_t> debug_tensor_offsets;
-    print_node_groups(analysis.node_pairs, analysis, schedule);
+    int largest_count = 0;
+    for (int i = 0; i < node_groups_total; ++i)
+        if (analysis.node_pairs[i].bytes == largest_size)
+            ++largest_count;
+    LLAMA_LOG_INFO("%s largest_size=%zu largest_count=%d\n", __func__, largest_size, largest_count);
 #endif
 
-    //return false if it fails to fit a node
-    auto fit_next_largest_node = [&](auto&& self, const std::vector<node_group> & groups, std::set<ggml_tensor *> up, const size_t left_bound, const size_t right_bound) -> size_t
+    size_t fit_size = largest_size;         //dont use lower_bound, we're going to nudge fit_size up in the final step of fitting
+
+    enum fit_place_mode
     {
-        if (groups.empty())
-            return 0;
+        FIT_PLACE_NONE,
+        FIT_PLACE_LEFT_ANCHOR,
+        FIT_PLACE_RIGHT_ANCHOR,
+        FIT_PLACE_LARGEST,
+        FIT_PLACE_LEFT,
+        FIT_PLACE_RIGHT,
+    };
 
-        size_t smallest_conflict = 0;
+    struct fit_graph_bound
+    {
+        int tensor_idx = -1;
+        bool tensor_end = false;
+        bool arena_end = false;
+    };
 
-        //Get the largest node_pair, leftmost breaks ties
-        std::vector<node_group>::const_iterator target = std::max_element(
-            groups.begin(), groups.end(),
-            [](const node_group& a, const node_group& b) { return a.bytes < b.bytes; });
+    struct fit_graph_node
+    {
+        int node_pair_idx = -1;
+        int parent_idx = -1;
+        int subtree_end = -1;
 
-        bool is_largest = target->bytes == largest_size;
+        fit_graph_bound left_bound;
+        fit_graph_bound right_bound;
 
-        std::vector<node_group> left(groups.begin(), target);
-        std::vector<node_group> right(target + 1, groups.end());
+        fit_place_mode place_mode = FIT_PLACE_NONE;
 
-        size_t left_bytes = 0, right_bytes = 0;
-        std::set<ggml_tensor *> left_tensors, right_tensors;
+        int largest_anchor_idx = -1;
 
-        for (const node_group & group : left)
-            left_tensors.insert(group.tensors.begin(), group.tensors.end());
+        std::vector<int> target_tensors;
+        std::vector<int> unplaced_tensors;
 
-        for (const node_group & group : right)
-            right_tensors.insert(group.tensors.begin(), group.tensors.end());
+        //These are already filtered for subtree membership and up, and stored in traversal order.
+        std::vector<size_t> left_bytes;
+        std::vector<size_t> right_bytes;
 
-        int target_left_idx  = schedule.gpu2index.at(target->tensors.front());
-        int target_right_idx = schedule.gpu2index.at(target->tensors.back());
-
-        pos = left_bound;
-        for (int i = 0; i < target_left_idx; ++i)
-        {
-            ggml_tensor * tensor = schedule.gpu_tensors_in_order[i];
-
-            if (left_tensors.count(tensor) == 0 || up.count(tensor))
-                continue;
-
-            size_t bytes = get_gpu_aligned_size(tensor, alignment);
-            if (pos + bytes > fit_size)
-            {
-                left_bytes += fit_size - pos;
-                pos = 0;
-            }
-            pos += bytes;
-            left_bytes += bytes;
-        }
-
-        pos = right_bound;
-        for (int i = (int)schedule.gpu_tensors_in_order.size() - 1; i > target_right_idx; --i)
-        {
-            ggml_tensor * tensor = schedule.gpu_tensors_in_order[i];
-
-            if (right_tensors.count(tensor) == 0 || up.count(tensor))
-                continue;
-
-            size_t bytes = get_gpu_aligned_size(tensor, alignment);
-            if (pos < bytes)
-            {
-                right_bytes += pos;
-                pos = fit_size;
-            }
-            pos -= bytes;
-            right_bytes += bytes;
-        }
-        //TODO: bytes isn't necessarily a measure of complexity, we could also count nodes or tensors
-        const bool left_first = left_bytes <= right_bytes;
-        //const bool left_first = left.count() <= right.count();
-
-        //some of this node-pair's tensors might already be placed, only place unplaced tensors
-        std::vector<ggml_tensor *> unplaced_tensors, placed_tensors;
-        for (ggml_tensor * tensor : target->tensors)
-            tensor_offsets.count(tensor) == 0 ?
-                unplaced_tensors.push_back(tensor)
-                : placed_tensors.push_back(tensor);
-
-        //largest node pairs only have a few different valid places they can fit
+        //Canonical, unrotated offsets for an unanchored largest node-pair.
         std::vector<size_t> lnp_offsets;
-        if (is_largest)
+
+        //Nodes whose complete recursive subtree finishes when this node succeeds.
+        std::vector<int> completed_nodes;
+
+        size_t candidate_count = 1;
+        size_t candidate_try = 0;
+        size_t active_candidate_idx = 0;
+        size_t rollback_pos = 0;
+
+        size_t preferred_lnp_offset_idx = 0;
+        bool preferred_lnp_offset_valid = false;
+    };
+
+    std::vector<size_t> fit_tensor_sizes(tensor_count);
+    for (int i = 0; i < tensor_count; ++i)
+        fit_tensor_sizes[i] = get_gpu_aligned_size(schedule.gpu_tensors_in_order[i], alignment);
+
+    std::vector<fit_graph_node> fit_graph;
+    fit_graph.reserve(node_groups_total);
+
+    //The prep pass simulates placement membership only. No addresses are assigned here.
+    std::vector<bool> prep_placed(tensor_count, 0);
+
+    //Precompute the recursive search into a deterministic flat fit graph so runtime fitting only deals with geometry and backtracking.
+    auto build_fit_graph = [&](auto&& self, int begin, int end, const std::vector<bool> & up, fit_graph_bound left_bound, fit_graph_bound right_bound, int parent_idx) -> void
+    {
+        if (begin >= end)
+            return;
+
+        //Get the largest node-pair, leftmost breaks ties
+        int target_idx = begin;
+        for (int i = begin + 1; i < end; ++i)
+            if (analysis.node_pairs[i].bytes > analysis.node_pairs[target_idx].bytes)
+                target_idx = i;
+
+        const node_group & target = analysis.node_pairs[target_idx];
+
+        const int left_count = target_idx - begin;
+        const int right_count = end - target_idx - 1;
+
+        //Use a deterministic smaller-side-first traversal so placement membership and valley bounds can be precomputed.
+        const bool left_first = left_count <= right_count;
+
+        const int fit_node_idx = fit_graph.size();
+        fit_graph.push_back(fit_graph_node());
+
+        fit_graph[fit_node_idx].node_pair_idx = target_idx;
+        fit_graph[fit_node_idx].parent_idx = parent_idx;
+        fit_graph[fit_node_idx].left_bound = left_bound;
+        fit_graph[fit_node_idx].right_bound = right_bound;
+
+        for (ggml_tensor * tensor : target.tensors)
+            fit_graph[fit_node_idx].target_tensors.push_back(schedule.gpu2index.at(tensor));
+
+        const int target_left_start = fit_graph[fit_node_idx].target_tensors.front();
+        const int target_right_start = fit_graph[fit_node_idx].target_tensors.back();
+
+        //Collect the tensors on each side of this target so their contribution to the valley walls can be compiled into byte walks.
+        std::vector<unsigned char> left_tensors(tensor_count, 0);
+        std::vector<unsigned char> right_tensors(tensor_count, 0);
+
+        for (int i = begin; i < target_idx; ++i)
+            for (ggml_tensor * tensor : analysis.node_pairs[i].tensors)
+                left_tensors[schedule.gpu2index.at(tensor)] = 1;
+
+        for (int i = target_idx + 1; i < end; ++i)
+            for (ggml_tensor * tensor : analysis.node_pairs[i].tensors)
+                right_tensors[schedule.gpu2index.at(tensor)] = 1;
+
+        //Precompute the aligned sizes that runtime will walk to locate each valley wall, excluding tensors already absorbed by an ancestor.
+        for (int i = 0; i < target_left_start; ++i)
+            if (left_tensors[i] && !up[i])
+                fit_graph[fit_node_idx].left_bytes.push_back(fit_tensor_sizes[i]);
+
+        for (int i = tensor_count - 1; i > target_right_start; --i)
+            if (right_tensors[i] && !up[i])
+                fit_graph[fit_node_idx].right_bytes.push_back(fit_tensor_sizes[i]);
+
+        int last_placed_target = -1;
+        for (int tensor_idx : fit_graph[fit_node_idx].target_tensors)
         {
-            pos = 0;
-            if (placed_tensors.empty())
+            if (prep_placed[tensor_idx])
+                last_placed_target = tensor_idx;
+            else
+                fit_graph[fit_node_idx].unplaced_tensors.push_back(tensor_idx);
+        }
+
+        //Shared tensors anchor this target to an existing placement; otherwise largest groups rotate while normal groups begin against the preferred valley wall.
+        if (fit_graph[fit_node_idx].unplaced_tensors.empty())
+            fit_graph[fit_node_idx].place_mode = FIT_PLACE_NONE;
+        else if (prep_placed[fit_graph[fit_node_idx].target_tensors.front()])
+            fit_graph[fit_node_idx].place_mode = FIT_PLACE_LEFT_ANCHOR;
+        else if (prep_placed[fit_graph[fit_node_idx].target_tensors.back()])
+            fit_graph[fit_node_idx].place_mode = FIT_PLACE_RIGHT_ANCHOR;
+        else if (target.bytes == largest_size)
+            fit_graph[fit_node_idx].place_mode = FIT_PLACE_LARGEST;
+        else
+            fit_graph[fit_node_idx].place_mode = left_first ? FIT_PLACE_LEFT : FIT_PLACE_RIGHT;
+
+        if (target.bytes == largest_size)
+        {
+            if (last_placed_target < 0)
             {
-                for (auto it = target->tensors.rbegin(); it != target->tensors.rend(); ++it)
+                //Every tensor boundary is a legal rotation of an unanchored largest node-pair.
+                size_t offset = 0;
+                for (auto it = fit_graph[fit_node_idx].target_tensors.rbegin(); it != fit_graph[fit_node_idx].target_tensors.rend(); ++it)
                 {
-                    lnp_offsets.push_back(pos);
-                    pos += get_gpu_aligned_size(*it, alignment);
+                    fit_graph[fit_node_idx].lnp_offsets.push_back(offset);
+                    offset += fit_tensor_sizes[*it];
                 }
 
-                pos = left_bound + left_bytes;
-                while (pos > fit_size)
-                    pos -= fit_size;
-
-                //rotate it so we try the tightest fit first
-                std::rotate(lnp_offsets.begin(), std::lower_bound(lnp_offsets.begin(), lnp_offsets.end(), pos), lnp_offsets.end());
+                fit_graph[fit_node_idx].candidate_count = fit_graph[fit_node_idx].lnp_offsets.size();
             }
-            else   //the end of the right-most already placed tensor
-                lnp_offsets.push_back(tensor_offsets[placed_tensors.back()].first + get_gpu_aligned_size(placed_tensors.back(), alignment));
+            else
+                fit_graph[fit_node_idx].largest_anchor_idx = last_placed_target;
+        }
+
+        //Simulate placement membership only; deterministic traversal makes this independent of the actual runtime offsets.
+        std::vector<bool> child_up = up;
+        for (int tensor_idx : fit_graph[fit_node_idx].target_tensors)
+        {
+            prep_placed[tensor_idx] = true;
+            child_up[tensor_idx] = true;
+        }
+
+        //Absorb contiguous tensors already placed around the target so child valleys can reference their outermost placed boundaries directly.
+        int target_left_idx = target_left_start;
+        int target_right_idx = target_right_start;
+
+        for (int i = target_left_start == 0 ? tensor_count - 1 : target_left_start - 1;
+            i != target_left_start;
+            i = i == 0 ? tensor_count - 1 : i - 1)
+        {
+            if (!prep_placed[i])
+                break;
+
+            target_left_idx = i;
+            child_up[i] = true;
+        }
+
+        for (int i = target_right_start == tensor_count - 1 ? 0 : target_right_start + 1;
+            i != target_right_start;
+            i = i == tensor_count - 1 ? 0 : i + 1)
+        {
+            if (!prep_placed[i])
+                break;
+
+            target_right_idx = i;
+            child_up[i] = true;
+        }
+
+        fit_graph_bound target_left_bound;
+        target_left_bound.tensor_idx = target_left_idx;
+
+        fit_graph_bound target_right_bound;
+        target_right_bound.tensor_idx = target_right_idx;
+        target_right_bound.tensor_end = true;
+
+        //Emit child searches directly into fit_graph in the same order runtime will execute them.
+        if (left_first)
+        {
+            self(self, begin,          target_idx, child_up, left_bound,         target_left_bound, fit_node_idx);
+            self(self, target_idx + 1, end,        child_up, target_right_bound, right_bound,       fit_node_idx);
         }
         else
         {
-            lnp_offsets.push_back(0);   //TODO: just put a dummy value here for now, but later we may want to explore alternative configurations for non-largest node pairs
+            self(self, target_idx + 1, end,        child_up, target_right_bound, right_bound,       fit_node_idx);
+            self(self, begin,          target_idx, child_up, left_bound,         target_left_bound, fit_node_idx);
         }
 
-        std::map<ggml_tensor *, size_t> tensor_offsets_temp;
+        fit_graph[fit_node_idx].subtree_end = fit_graph.size();
+        fit_graph[fit_graph[fit_node_idx].subtree_end - 1].completed_nodes.push_back(fit_node_idx);
+    };
 
-        for (size_t candidate_offset : lnp_offsets)
+    fit_graph_bound root_left_bound;
+    fit_graph_bound root_right_bound;
+    root_right_bound.arena_end = true;
+
+    build_fit_graph(build_fit_graph, 0, node_groups_total, std::vector<bool>(tensor_count, 0), root_left_bound, root_right_bound, -1);
+
+#ifdef LLAMA_DIAGNOSE_FIT
+    print_node_groups(analysis.node_pairs, analysis, schedule);
+    LLAMA_LOG_INFO("%s analysis.node_pairs.size() == %d fit_graph.size() == %zu\n", __func__, node_groups_total, fit_graph.size());
+    std::map<ggml_tensor *, size_t> debug_tensor_offsets;
+#endif
+
+    //The hot fitting path is indexed only. Convert back to tensor pointers after a complete fit.
+    std::vector<size_t> fit_offsets(tensor_count, SIZE_MAX);
+    std::vector<int> placement_log;
+
+    auto place_tensor_against_left = [&](size_t left_bound, int tensor_idx) -> size_t
+    {
+        size_t tensor_aligned_size = fit_tensor_sizes[tensor_idx];
+
+        if (left_bound + tensor_aligned_size > fit_size)
+            left_bound = 0;
+
+        fit_offsets[tensor_idx] = left_bound;
+        placement_log.push_back(tensor_idx);
+
+    #if LLAMA_DIAGNOSE_FIT > 1
+        ggml_tensor * tensor = schedule.gpu_tensors_in_order[tensor_idx];
+        debug_tensor_offsets[tensor] = left_bound;
+        const char * name = ggml_get_name(tensor);
+        LLAMA_LOG_INFO("%s: fit %-39s %5d %10zu %10zu\n", __func__, name ? name : "(unnamed)", tensor_idx, left_bound, left_bound + tensor_aligned_size);
+    #endif
+
+        return left_bound + tensor_aligned_size;
+    };
+
+    auto place_tensor_against_right = [&](size_t right_bound, int tensor_idx) -> size_t
+    {
+        size_t tensor_aligned_size = fit_tensor_sizes[tensor_idx];
+
+        if (right_bound < tensor_aligned_size)
+            right_bound = fit_size - tensor_aligned_size;
+        else
+            right_bound -= tensor_aligned_size;
+
+        fit_offsets[tensor_idx] = right_bound;
+        placement_log.push_back(tensor_idx);
+
+    #if LLAMA_DIAGNOSE_FIT > 1
+        ggml_tensor * tensor = schedule.gpu_tensors_in_order[tensor_idx];
+        debug_tensor_offsets[tensor] = right_bound;
+        const char * name = ggml_get_name(tensor);
+        LLAMA_LOG_INFO("%s: fit %-39s %5d %10zu %10zu\n", __func__, name ? name : "(unnamed)", tensor_idx, right_bound, right_bound + tensor_aligned_size);
+    #endif
+
+        return right_bound;
+    };
+
+    //Retry the prepared graph at increasing fit sizes until every node-pair can be placed without a COPY HALT conflict.
+    for (;;)
+    {
+        std::fill(fit_offsets.begin(), fit_offsets.end(), SIZE_MAX);
+        placement_log.clear();
+
+    #ifdef LLAMA_DIAGNOSE_FIT
+        size_t nodes_visited = 0;
+        size_t backtracks = 0;
+        int furthest_node = 0;
+    #endif
+
+        for (fit_graph_node & node : fit_graph)
         {
-            auto place_tensor_against_left = [&](size_t left_bound, ggml_tensor * tensor)
+            node.candidate_try = 0;
+            node.active_candidate_idx = 0;
+            node.rollback_pos = 0;
+        }
+
+        size_t smallest_conflict = 0;
+        int fit_idx = 0;
+        bool fit_failed = false;
+
+        //Walk the flat fit graph forward; exhausted candidates backtrack fit_idx to the nearest ancestor with another legal placement.
+        while (fit_idx < (int)fit_graph.size())
+        {
+            fit_graph_node & node = fit_graph[fit_idx];
+
+        #ifdef LLAMA_DIAGNOSE_FIT
+            ++nodes_visited;
+            furthest_node = std::max(furthest_node, fit_idx);
+        #endif
+
+            fit_place_mode place_mode = node.place_mode;
+
+            size_t left_bound = 0, right_bound = 0;
+            size_t left_total = 0, right_total = 0;
+            size_t left_fit_pos = 0, right_fit_pos = 0;
+
+            auto resolve_bound = [&](const fit_graph_bound & bound) -> size_t
             {
-                size_t tensor_aligned_size = get_gpu_aligned_size(tensor, alignment);
-                if (left_bound + tensor_aligned_size > fit_size)
-                    left_bound = 0;    //need to wrap around to the beginning
-                tensor_offsets_temp[tensor] = left_bound;
-#if LLAMA_DIAGNOSE_FIT > 1
-                debug_tensor_offsets[tensor] = left_bound;
-                const char * name = ggml_get_name(tensor);
-                LLAMA_LOG_INFO("%s: fit %-39s %5d %10zu %10zu\n", __func__, name ? name : "(unnamed)", schedule.gpu2index.at(tensor), left_bound, left_bound + tensor_aligned_size);
-#endif
-                return left_bound + tensor_aligned_size;
+                if (bound.tensor_idx < 0)
+                    return bound.arena_end ? fit_size : 0;
+
+                return fit_offsets[bound.tensor_idx] + (bound.tensor_end ? fit_tensor_sizes[bound.tensor_idx] : 0);
             };
-            auto place_tensor_against_right = [&](size_t right_bound, ggml_tensor * tensor)
+
+            //Replay the precomputed left-side sizes to locate the current left valley wall after wrapping around fit_size.
+            if (!node.lnp_offsets.empty() || place_mode == FIT_PLACE_LEFT || place_mode == FIT_PLACE_RIGHT)
             {
-                size_t tensor_aligned_size = get_gpu_aligned_size(tensor, alignment);
-                if (right_bound < tensor_aligned_size)
-                    right_bound = fit_size - tensor_aligned_size;    //need to wrap around to the end
+                left_bound = resolve_bound(node.left_bound);
+                pos = left_bound;
+
+                for (size_t bytes : node.left_bytes)
+                {
+                    if (pos + bytes > fit_size)
+                    {
+                        left_total += fit_size - pos;
+                        pos = 0;
+                    }
+
+                    pos += bytes;
+                    left_total += bytes;
+                }
+
+                left_fit_pos = left_bound + left_total;
+                while (left_fit_pos > fit_size)
+                    left_fit_pos -= fit_size;
+            }
+
+            //Normal valley placements also need the corresponding wall reached from the right.
+            if (place_mode == FIT_PLACE_LEFT || place_mode == FIT_PLACE_RIGHT)
+            {
+                right_bound = resolve_bound(node.right_bound);
+                pos = right_bound;
+
+                for (size_t bytes : node.right_bytes)
+                {
+                    if (pos < bytes)
+                    {
+                        right_total += pos;
+                        pos = fit_size;
+                    }
+
+                    pos -= bytes;
+                    right_total += bytes;
+                }
+
+                right_fit_pos = (right_bound + fit_size - right_total % fit_size) % fit_size;
+
+                //If the valley has slack, both wall-aligned placements are distinct legal candidates; otherwise searching the second direction is redundant.
+                size_t left_fit_end = left_fit_pos;
+                for (int tensor_idx : node.unplaced_tensors)
+                {
+                    size_t bytes = fit_tensor_sizes[tensor_idx];
+
+                    if (left_fit_end + bytes > fit_size)
+                        left_fit_end = 0;
+
+                    left_fit_end += bytes;
+                }
+
+                if (left_fit_end == fit_size)
+                    left_fit_end = 0;
+
+                node.candidate_count = left_fit_end != right_fit_pos ? 2 : 1;
+
+                if (node.candidate_try)
+                    place_mode = place_mode == FIT_PLACE_LEFT ? FIT_PLACE_RIGHT : FIT_PLACE_LEFT;
+            }
+
+            size_t candidate_idx = 0;
+            size_t candidate_offset = 0;
+
+            //Try the previously successful largest-node rotation first, otherwise begin with the rotation nearest the current left wall.
+            if (!node.lnp_offsets.empty())
+            {
+                size_t tight_idx = std::lower_bound(node.lnp_offsets.begin(), node.lnp_offsets.end(), left_fit_pos) - node.lnp_offsets.begin();
+                if (tight_idx == node.lnp_offsets.size())
+                    tight_idx = 0;
+
+                if (node.preferred_lnp_offset_valid && node.candidate_try == 0)
+                    candidate_idx = node.preferred_lnp_offset_idx;
                 else
-                    right_bound -= tensor_aligned_size;
-                tensor_offsets_temp[tensor] = right_bound;
-#if LLAMA_DIAGNOSE_FIT > 1
-                debug_tensor_offsets[tensor] = right_bound;
-                const char * name = ggml_get_name(tensor);
-                LLAMA_LOG_INFO("%s: fit %-39s %5d %10zu %10zu\n", __func__, name ? name : "(unnamed)", schedule.gpu2index.at(tensor), right_bound, right_bound + tensor_aligned_size);
-#endif
-                return right_bound;
-            };
+                {
+                    size_t wanted = node.candidate_try - (node.preferred_lnp_offset_valid ? 1 : 0);
+                    size_t found = 0;
 
-#if LLAMA_DIAGNOSE_FIT > 1
-            LLAMA_LOG_INFO("fit_next_largest_node %s %d %zu %zu %zu %zu %d  %d %d %d\n", left_first ? "left_first " : "right_first", left.size(), left_bound, left_bytes, right_bytes, right_bound, right.size(),
-                placed_tensors.size(), target->tensors.size(), unplaced_tensors.size());
-#endif
+                    for (size_t i = 0; i < node.lnp_offsets.size(); ++i)
+                    {
+                        size_t idx = (tight_idx + i) % node.lnp_offsets.size();
 
-            if (unplaced_tensors.empty())
+                        if (node.preferred_lnp_offset_valid && idx == node.preferred_lnp_offset_idx)
+                            continue;
+
+                        if (found++ == wanted)
+                        {
+                            candidate_idx = idx;
+                            break;
+                        }
+                    }
+                }
+
+                candidate_offset = node.lnp_offsets[candidate_idx];
+            }
+            else if (node.place_mode == FIT_PLACE_LARGEST && node.largest_anchor_idx >= 0)
+                candidate_offset = fit_offsets[node.largest_anchor_idx] + fit_tensor_sizes[node.largest_anchor_idx];
+
+            node.active_candidate_idx = candidate_idx;
+            //Remember where this candidate's placements begin so failure can undo them without rebuilding earlier state.
+            node.rollback_pos = placement_log.size();
+
+        #if LLAMA_DIAGNOSE_FIT > 1
+            LLAMA_LOG_INFO("%s: node %4d pair %4d mode %d candidate %zu/%zu offset %10zu bounds %10zu %10zu bytes %10zu %10zu\n",
+                __func__, fit_idx, node.node_pair_idx, (int)place_mode, node.candidate_try + 1, node.candidate_count, candidate_offset, left_bound, right_bound, left_total, right_total);
+        #endif
+
+            if (node.place_mode == FIT_PLACE_NONE)
             {
-#if LLAMA_DIAGNOSE_FIT > 2
-                LLAMA_LOG_INFO("fit_next_largest_node %-56s\n", "unplaced_tensors.empty()");
-                print_node_groups({*target}, analysis, schedule);
-#endif
                 //do nothing
             }
-            else if (placed_tensors.size() && placed_tensors[0] == target->tensors[0]) //leftmost tensor has been placed
+            else if (node.place_mode == FIT_PLACE_LEFT_ANCHOR)
             {
-#if LLAMA_DIAGNOSE_FIT > 2
-                LLAMA_LOG_INFO("fit_next_largest_node %-56s\n", "placed_tensors[0] == target->tensors[0]");
-#endif
-                pos = tensor_offsets.at(target->tensors[0]).first + get_gpu_aligned_size(target->tensors[0], alignment);
-                for (size_t i = 1; i < target->tensors.size(); ++i)
+                int first_idx = node.target_tensors.front();
+                pos = fit_offsets[first_idx] + fit_tensor_sizes[first_idx];
+
+                for (size_t i = 1; i < node.target_tensors.size(); ++i)
                 {
-                    ggml_tensor * tensor = target->tensors[i];
-                    if (tensor_offsets.count(tensor))
-                        pos = tensor_offsets.at(tensor).first + get_gpu_aligned_size(tensor, alignment);
+                    int tensor_idx = node.target_tensors[i];
+
+                    if (fit_offsets[tensor_idx] != SIZE_MAX)
+                        pos = fit_offsets[tensor_idx] + fit_tensor_sizes[tensor_idx];
                     else
-                        pos = place_tensor_against_left(pos, tensor);
+                        pos = place_tensor_against_left(pos, tensor_idx);
                 }
             }
-            else if (placed_tensors.size() && placed_tensors.back() == target->tensors.back()) //rightmost tensor has been placed
+            else if (node.place_mode == FIT_PLACE_RIGHT_ANCHOR)
             {
-#if LLAMA_DIAGNOSE_FIT > 2
-                LLAMA_LOG_INFO("fit_next_largest_node %-56s\n", "placed_tensors.back() == target->tensors.back()");
-#endif
-                pos = tensor_offsets.at(target->tensors.back()).first;
-                for (int i = (int)target->tensors.size() - 2; i >= 0; --i)
+                int last_idx = node.target_tensors.back();
+                pos = fit_offsets[last_idx];
+
+                for (int i = (int)node.target_tensors.size() - 2; i >= 0; --i)
                 {
-                    ggml_tensor * tensor = target->tensors[i];
-                    if (tensor_offsets.count(tensor))
-                        pos = tensor_offsets.at(tensor).first;
+                    int tensor_idx = node.target_tensors[i];
+
+                    if (fit_offsets[tensor_idx] != SIZE_MAX)
+                        pos = fit_offsets[tensor_idx];
                     else
-                        pos = place_tensor_against_right(pos, tensor);
+                        pos = place_tensor_against_right(pos, tensor_idx);
                 }
             }
-            else if (is_largest)
+            else if (node.place_mode == FIT_PLACE_LARGEST)
             {
-#if LLAMA_DIAGNOSE_FIT > 2
-                LLAMA_LOG_INFO("fit_next_largest_node %-56s %10zu\n", "is_largest", candidate_offset);
-#endif
                 pos = candidate_offset;
-                for (ggml_tensor * tensor : unplaced_tensors)
-                    pos = place_tensor_against_left(pos, tensor);
-            }
-            else if (left_first) //fit against left side
-            {
-#if LLAMA_DIAGNOSE_FIT > 2
-                LLAMA_LOG_INFO("fit_next_largest_node left_first\n");
-                //print_node_groups(left, analysis, schedule);
-#endif
-                pos = left_bound + left_bytes;
-                while (pos > fit_size)
-                    pos -= fit_size;
 
-                for (ggml_tensor * tensor : unplaced_tensors)
-                    pos = place_tensor_against_left(pos, tensor);
+                for (int tensor_idx : node.unplaced_tensors)
+                    pos = place_tensor_against_left(pos, tensor_idx);
             }
-            else    //fit against right side
+            else if (place_mode == FIT_PLACE_LEFT)
             {
-#if LLAMA_DIAGNOSE_FIT > 2
-                LLAMA_LOG_INFO("fit_next_largest_node right_first\n");
-                //print_node_groups(right, analysis, schedule);
-#endif
-                pos = (right_bound + fit_size - right_bytes % fit_size) % fit_size;
+                pos = left_fit_pos;
 
-                for (auto it = unplaced_tensors.rbegin(); it != unplaced_tensors.rend(); ++it)
+                for (int tensor_idx : node.unplaced_tensors)
+                    pos = place_tensor_against_left(pos, tensor_idx);
+            }
+            else
+            {
+                pos = right_fit_pos;
+
+                for (auto it = node.unplaced_tensors.rbegin(); it != node.unplaced_tensors.rend(); ++it)
                     pos = place_tensor_against_right(pos, *it);
             }
 
-            //tensor_offsets.insert(tensor_offsets_temp.begin(), tensor_offsets_temp.end());
-            size_t rollback_pos = placement_log.size();
-            for (const auto & entry : tensor_offsets_temp)
-                if (tensor_offsets.insert({ entry.first, { entry.second, -1 } }).second)
-                    placement_log.push_back(entry.first);
-
-            //All tensors are now placed, check that no COPY HALT occurs. This is easy, just check that no tensor in the node-pair conflicts with any other
+            //Check the completed node-pair for COPY HALT overlap and retain the amount of additional space needed to separate it.
             size_t conflict_size = 0;
-            for (int i = 0; i < target->tensors.size(); ++i)
-                for (int j = i + 1; j < target->tensors.size(); ++j)
+
+            for (int i = 0; i < (int)node.target_tensors.size(); ++i)
+                for (int j = i + 1; j < (int)node.target_tensors.size(); ++j)
                 {
-                    ggml_tensor * a = target->tensors[i], * b = target->tensors[j];
-                    size_t a1 = tensor_offsets.at(a).first, a2 = a1 + get_gpu_aligned_size(a, alignment);
-                    size_t b1 = tensor_offsets.at(b).first, b2 = b1 + get_gpu_aligned_size(b, alignment);
-                    //TODO: If somehow a very small tensor is entirely within a very large tensor, the conflict_size might not be meaningful
-                    //      conflict size would equal the entirety of the very small tensor, perhaps only 128 bytes.
-                    //      What might be more meaningful is the smallest nudge needed to resolve the conflict, for either tensor in the conflict.
+                    int a = node.target_tensors[i];
+                    int b = node.target_tensors[j];
+
+                    size_t a1 = fit_offsets[a], a2 = a1 + fit_tensor_sizes[a];
+                    size_t b1 = fit_offsets[b], b2 = b1 + fit_tensor_sizes[b];
+
                     if (ranges_overlap(a1, a2, b1, b2))
                     {
                         size_t overlap = std::min(a2, b2) - std::max(a1, b1);
                         conflict_size = std::max(conflict_size, overlap);
-#if LLAMA_DIAGNOSE_FIT > 1
-                        LLAMA_LOG_INFO("%s: conflict indexes %4d %4d  ranges %10zu %10zu  %10zu %10zu  overlap %10zu\n", __func__, schedule.gpu2index.at(a), schedule.gpu2index.at(b), a1, a2, b1, b2, overlap);
-#endif
+
+                    #if LLAMA_DIAGNOSE_FIT > 1
+                        LLAMA_LOG_INFO("%s: conflict indexes %4d %4d  ranges %10zu %10zu  %10zu %10zu  overlap %10zu\n", __func__, a, b, a1, a2, b1, b2, overlap);
+                    #endif
                     }
                 }
 
-            //if (unplaced_tensors.empty())
-            //    return conflict_size;
-
-            auto handle_failure = [&](size_t error_amount)
+            auto rollback_to = [&](size_t rollback_pos)
             {
-#if LLAMA_DIAGNOSE_FIT > 1
+            #if LLAMA_DIAGNOSE_FIT > 1
                 std::string undo_indexes;
                 for (size_t i = placement_log.size(); i > rollback_pos; --i)
                 {
                     if (!undo_indexes.empty())
                         undo_indexes += ",";
-                    undo_indexes += std::to_string(schedule.gpu2index.at(placement_log[i - 1]));
+                    undo_indexes += std::to_string(placement_log[i - 1]);
                 }
                 LLAMA_LOG_INFO("%s: undo indexes %s\n", __func__, undo_indexes.c_str());
-#endif
+            #endif
+
                 while (placement_log.size() > rollback_pos)
                 {
-#if LLAMA_DIAGNOSE_FIT > 1
-                    const char * name = ggml_get_name(placement_log.back());
+                    int tensor_idx = placement_log.back();
+
+                #if LLAMA_DIAGNOSE_FIT > 1
+                    const char * name = ggml_get_name(schedule.gpu_tensors_in_order[tensor_idx]);
                     LLAMA_LOG_INFO("%s: undo %s \n", __func__, name ? name : "(unnamed)");
-#endif
-                    tensor_offsets.erase(placement_log.back());
+                #endif
+
+                    fit_offsets[tensor_idx] = SIZE_MAX;
                     placement_log.pop_back();
                 }
-                smallest_conflict = smallest_conflict == 0 ? error_amount : std::min(smallest_conflict, error_amount);
             };
 
             if (conflict_size)
             {
-                handle_failure(conflict_size);
+                smallest_conflict = smallest_conflict == 0 ? conflict_size : std::min(smallest_conflict, conflict_size);
+
+                rollback_to(node.rollback_pos);
+
+                //Exhaust this node's legal placements before invalidating any ancestor choice.
+                ++node.candidate_try;
+                if (node.candidate_try < node.candidate_count)
+                    continue;
+
+                //No local placement works; backtrack through ancestors until one has another candidate.
+                int failed_idx = fit_idx;
+
+                for (;;)
+                {
+                    int parent_idx = fit_graph[failed_idx].parent_idx;
+
+                    if (parent_idx < 0)
+                    {
+                        fit_failed = true;
+                        break;
+                    }
+
+                #ifdef LLAMA_DIAGNOSE_FIT
+                    ++backtracks;
+                #endif
+
+                    fit_graph_node & parent = fit_graph[parent_idx];
+
+                    rollback_to(parent.rollback_pos);
+                    ++parent.candidate_try;
+
+                    //Changing an ancestor invalidates every choice below it, so reset the descendant candidate cursors before replaying the subtree.
+                    for (int i = parent_idx + 1; i < parent.subtree_end; ++i)
+                        fit_graph[i].candidate_try = 0;
+
+                    if (parent.candidate_try < parent.candidate_count)
+                    {
+                        fit_idx = parent_idx;
+                        break;
+                    }
+
+                    failed_idx = parent_idx;
+                }
+
+                if (fit_failed)
+                    break;
+
                 continue;
             }
 
-            //Traverse left and right from target->tensors until an empty space is found to determine target_left and target_right
-            const int target_left_start  = target_left_idx;
-            const int target_right_start = target_right_idx;
-            up.insert(target->tensors.begin(), target->tensors.end());
-            for (int i = target_left_start == 0 ? schedule.gpu_tensors_in_order.size() - 1 : target_left_start - 1;
-                i != target_left_start;
-                i = i == 0 ? schedule.gpu_tensors_in_order.size() - 1 : i - 1)
+            //Remember the largest-node rotation that completed its whole subtree so future retries try it first.
+            for (int completed_idx : node.completed_nodes)
             {
-                ggml_tensor * tensor = schedule.gpu_tensors_in_order[i];
-                if (tensor_offsets.count(tensor) == 0)
-                    break;
-                target_left_idx = i;
-                up.insert(tensor);
+                fit_graph_node & completed = fit_graph[completed_idx];
+
+                if (completed.lnp_offsets.size() > 1)
+                {
+                    completed.preferred_lnp_offset_idx = completed.active_candidate_idx;
+                    completed.preferred_lnp_offset_valid = true;
+                }
             }
 
-            for (int i = target_right_start == schedule.gpu_tensors_in_order.size() - 1 ? 0 : target_right_start + 1;
-                i != target_right_start;
-                i = i == schedule.gpu_tensors_in_order.size() - 1 ? 0 : i + 1)
-            {
-                ggml_tensor * tensor = schedule.gpu_tensors_in_order[i];
-                if (tensor_offsets.count(tensor) == 0)
-                    break;
-                target_right_idx = i;
-                up.insert(tensor);
-            }
-
-            const size_t target_left  = tensor_offsets.at(schedule.gpu_tensors_in_order[target_left_idx]).first;
-            const size_t target_right = tensor_offsets.at(schedule.gpu_tensors_in_order[target_right_idx]).first + get_gpu_aligned_size(schedule.gpu_tensors_in_order[target_right_idx], alignment);
-
-            //recursively solve the rest of the fit
-            size_t extra_bytes_needed = 0;
-            if (left_first)
-            {
-                extra_bytes_needed = self(self, left, up, left_bound, target_left);
-                if (extra_bytes_needed)
-                {
-                    handle_failure(extra_bytes_needed);
-                    continue;
-                }
-                extra_bytes_needed = self(self, right, up, target_right, right_bound);
-                if (extra_bytes_needed)
-                {
-                    handle_failure(extra_bytes_needed);
-                    continue;
-                }
-                return 0;
-            }
-            else
-            {
-                extra_bytes_needed = self(self, right, up, target_right, right_bound);
-                if (extra_bytes_needed)
-                {
-                    handle_failure(extra_bytes_needed);
-                    continue;
-                }
-                extra_bytes_needed = self(self, left, up, left_bound, target_left);
-                if (extra_bytes_needed)
-                {
-                    handle_failure(extra_bytes_needed);
-                    continue;
-                }
-                return 0;
-            }
+            ++fit_idx;
         }
 
-        return smallest_conflict;
-    };
+        if (!fit_failed)
+            break;
 
-    LLAMA_LOG_INFO("%s analysis.node_pairs.size() == %d\n", __func__, node_groups_total); fflush(stderr);
+        GGML_ASSERT(smallest_conflict > 0);
 
-    size_t bytes_needed;
-    while ((bytes_needed = fit_next_largest_node(fit_next_largest_node, analysis.node_pairs, {}, 0, fit_size)) > 0)
-    {
+        //The search exhausted every legal placement at this size, so grow by the smallest conflict encountered and try again.
+        const size_t bytes_needed = smallest_conflict;
+
         if (fit_size == streaming_fit_upper_bound)
         {
-#ifdef LLAMA_DIAGNOSE_FIT
+        #ifdef LLAMA_DIAGNOSE_FIT
             LLAMA_LOG_WARN("%s: failed fit at %zu bytes; last attempt needed %zu additional bytes\n", __func__, fit_size, bytes_needed);
 
             std::vector<size_t> debug_offsets(schedule.gpu_tensors_in_order.size(), SIZE_MAX);
@@ -2670,22 +2923,33 @@ size_t parameter_offloader::generate_streaming_fit(offloader_schedule & schedule
             }
 
             print_tensor_order(schedule.gpu_tensors_in_order, debug_offsets, GGML_LOG_LEVEL_WARN);
-#endif
+        #endif
+
             throw std::runtime_error(
                 "parameter_offloader: failed to find streaming fit; final attempted fit=" +
                 std::to_string(fit_size) + " bytes, additional bytes requested=" +
                 std::to_string(bytes_needed));
         }
 
-        tensor_offsets.clear();
-        
         fit_size += bytes_needed;
         if (fit_size > streaming_fit_upper_bound)
             fit_size = streaming_fit_upper_bound;
 
-#ifdef LLAMA_DIAGNOSE_FIT
-        LLAMA_LOG_INFO("%s: fit increased to %zu\n", __func__, fit_size);
-#endif
+    #ifdef LLAMA_DIAGNOSE_FIT
+        LLAMA_LOG_INFO("%s: fit increased to %zu  nodes=%zu backtracks=%zu furthest=%d/%zu\n", __func__, fit_size, nodes_visited, backtracks, furthest_node, fit_graph.size());
+    #endif
+    }
+
+    std::map<ggml_tensor *, std::pair<size_t, int>> tensor_offsets;     //key: tensor, value: size, cycle
+
+    for (int i = 0; i < tensor_count; ++i)
+    {
+        ggml_tensor * tensor = schedule.gpu_tensors_in_order[i];
+
+        if (fit_offsets[i] == SIZE_MAX)
+            LLAMA_LOG_ERROR("%s: missing tensor offset %d\n", __func__, i);
+
+        tensor_offsets[tensor] = { fit_offsets[i], -1 };
     }
 
     LLAMA_LOG_INFO("%s fit complete at %zu, now try nudging\n", __func__, fit_size);
@@ -2704,7 +2968,7 @@ size_t parameter_offloader::generate_streaming_fit(offloader_schedule & schedule
         std::stable_sort(it->second.begin(), it->second.end(), [&](int a, int b) {
             return analysis.node_pairs[a].bytes > analysis.node_pairs[b].bytes;
         });
-        
+
     int cycle = 0;
     size_t prev_offset = 0;
     for (ggml_tensor * tensor : schedule.gpu_tensors_in_order)
@@ -2878,7 +3142,7 @@ size_t parameter_offloader::generate_streaming_fit(offloader_schedule & schedule
 
         //at this point if nothing could move into that free address now, nothing ever will. Check the next one
         //TODO: can we intelligently skip ahead, rather than brute forcing each address?
-    }    
+    }   
 
     LLAMA_LOG_INFO("%s nudging complete, now recompute fit\n", __func__);
 
@@ -2904,7 +3168,7 @@ size_t parameter_offloader::generate_streaming_fit(offloader_schedule & schedule
     if (fit_size > streaming_fit_upper_bound)
     {
         LLAMA_LOG_ERROR("%s final fit is greater than upper bound\n", __func__);
-#ifdef LLAMA_DIAGNOSE_FIT
+    #ifdef LLAMA_DIAGNOSE_FIT
         std::vector<size_t> debug_offsets(schedule.gpu_tensors_in_order.size(), SIZE_MAX);
         for (size_t i = 0; i < schedule.gpu_tensors_in_order.size(); ++i)
         {
@@ -2913,7 +3177,7 @@ size_t parameter_offloader::generate_streaming_fit(offloader_schedule & schedule
                 debug_offsets[i] = it->second.first;
         }
         print_tensor_order(schedule.gpu_tensors_in_order, debug_offsets, GGML_LOG_LEVEL_WARN);
-#endif
+    #endif
     }
 
     return fit_size;
