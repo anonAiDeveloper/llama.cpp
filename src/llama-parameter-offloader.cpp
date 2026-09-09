@@ -37,7 +37,7 @@
 //#define LLAMA_LOG_COPIES 2
 
 //#define LLAMA_PRINT_WEIGHT_READS
-//#define LLAMA_DIAGNOSE_FIT
+//#define LLAMA_DIAGNOSE_FIT 1
 /////////////////////////////////////
 
 #ifndef GGML_USE_CUDA
@@ -2040,6 +2040,7 @@ void parameter_offloader::streaming_fit_calculate_bounds(dense_graph_analysis & 
         streaming_tensor_count += static_dense_set.find(tensor) == static_dense_set.end();
 
     streaming_fit_lower_bound = calculate_bound(analysis.node_pairs);
+    //Leave room for the worst case address dedupping scenario
     streaming_fit_upper_bound = std::max(streaming_fit_lower_bound, calculate_bound(node_triples)) + (streaming_tensor_count > 2 ? streaming_tensor_count - 2 : 0) * alignment;
 }
 
@@ -2068,7 +2069,7 @@ bool parameter_offloader::select_static_dense_tensors(const dense_graph_analysis
             ++ejected_count;
         }
 
-        LLAMA_LOG_INFO("%s: ejected %zu static dense tensors; static_bytes=%zu upper_bound=%zu\n", __func__, ejected_count, static_tensor_bytes, streaming_fit_upper_bound);
+        //LLAMA_LOG_INFO("%s: ejected %zu static dense tensors; static_bytes=%zu upper_bound=%zu\n", __func__, ejected_count, static_tensor_bytes, streaming_fit_upper_bound);
         return ejected_count != 0;
     }
 
@@ -2154,7 +2155,8 @@ bool parameter_offloader::select_static_dense_tensors(const dense_graph_analysis
     if (selected_count == 0)
         return false;
 
-    LLAMA_LOG_INFO("%s: selected %zu static dense tensors; static_bytes=%zu lower_bound=%zu upper_bound=%zu\n", __func__, selected_count, static_tensor_bytes, streaming_fit_lower_bound, streaming_fit_upper_bound);
+    //Because of the way upper bound is calculated this function ends up finding alot of 1 tensor additions, spamming the log
+    //LLAMA_LOG_INFO("%s: selected %zu static dense tensors; static_bytes=%zu lower_bound=%zu upper_bound=%zu\n", __func__, selected_count, static_tensor_bytes, streaming_fit_lower_bound, streaming_fit_upper_bound);
     return true;
 }
 
@@ -2420,7 +2422,7 @@ size_t parameter_offloader::generate_streaming_fit(offloader_schedule & schedule
                 if (left_bound + tensor_aligned_size > fit_size)
                     left_bound = 0;    //need to wrap around to the beginning
                 tensor_offsets_temp[tensor] = left_bound;
-#ifdef LLAMA_DIAGNOSE_FIT
+#if LLAMA_DIAGNOSE_FIT > 1
                 debug_tensor_offsets[tensor] = left_bound;
                 const char * name = ggml_get_name(tensor);
                 LLAMA_LOG_INFO("%s: fit %-39s %5d %10zu %10zu\n", __func__, name ? name : "(unnamed)", schedule.gpu2index.at(tensor), left_bound, left_bound + tensor_aligned_size);
@@ -2435,7 +2437,7 @@ size_t parameter_offloader::generate_streaming_fit(offloader_schedule & schedule
                 else
                     right_bound -= tensor_aligned_size;
                 tensor_offsets_temp[tensor] = right_bound;
-#ifdef LLAMA_DIAGNOSE_FIT
+#if LLAMA_DIAGNOSE_FIT > 1
                 debug_tensor_offsets[tensor] = right_bound;
                 const char * name = ggml_get_name(tensor);
                 LLAMA_LOG_INFO("%s: fit %-39s %5d %10zu %10zu\n", __func__, name ? name : "(unnamed)", schedule.gpu2index.at(tensor), right_bound, right_bound + tensor_aligned_size);
@@ -2443,14 +2445,14 @@ size_t parameter_offloader::generate_streaming_fit(offloader_schedule & schedule
                 return right_bound;
             };
 
-#ifdef LLAMA_DIAGNOSE_FIT
+#if LLAMA_DIAGNOSE_FIT > 1
             LLAMA_LOG_INFO("fit_next_largest_node %s %d %zu %zu %zu %zu %d  %d %d %d\n", left_first ? "left_first " : "right_first", left.size(), left_bound, left_bytes, right_bytes, right_bound, right.size(),
                 placed_tensors.size(), target->tensors.size(), unplaced_tensors.size());
 #endif
 
             if (unplaced_tensors.empty())
             {
-#ifdef LLAMA_DIAGNOSE_FIT
+#if LLAMA_DIAGNOSE_FIT > 2
                 LLAMA_LOG_INFO("fit_next_largest_node %-56s\n", "unplaced_tensors.empty()");
                 print_node_groups({*target}, analysis, schedule);
 #endif
@@ -2458,7 +2460,7 @@ size_t parameter_offloader::generate_streaming_fit(offloader_schedule & schedule
             }
             else if (placed_tensors.size() && placed_tensors[0] == target->tensors[0]) //leftmost tensor has been placed
             {
-#ifdef LLAMA_DIAGNOSE_FIT
+#if LLAMA_DIAGNOSE_FIT > 2
                 LLAMA_LOG_INFO("fit_next_largest_node %-56s\n", "placed_tensors[0] == target->tensors[0]");
 #endif
                 pos = tensor_offsets.at(target->tensors[0]).first + get_gpu_aligned_size(target->tensors[0], alignment);
@@ -2473,7 +2475,7 @@ size_t parameter_offloader::generate_streaming_fit(offloader_schedule & schedule
             }
             else if (placed_tensors.size() && placed_tensors.back() == target->tensors.back()) //rightmost tensor has been placed
             {
-#ifdef LLAMA_DIAGNOSE_FIT
+#if LLAMA_DIAGNOSE_FIT > 2
                 LLAMA_LOG_INFO("fit_next_largest_node %-56s\n", "placed_tensors.back() == target->tensors.back()");
 #endif
                 pos = tensor_offsets.at(target->tensors.back()).first;
@@ -2488,7 +2490,7 @@ size_t parameter_offloader::generate_streaming_fit(offloader_schedule & schedule
             }
             else if (is_largest)
             {
-#ifdef LLAMA_DIAGNOSE_FIT
+#if LLAMA_DIAGNOSE_FIT > 2
                 LLAMA_LOG_INFO("fit_next_largest_node %-56s %10zu\n", "is_largest", candidate_offset);
 #endif
                 pos = candidate_offset;
@@ -2497,7 +2499,7 @@ size_t parameter_offloader::generate_streaming_fit(offloader_schedule & schedule
             }
             else if (left_first) //fit against left side
             {
-#ifdef LLAMA_DIAGNOSE_FIT
+#if LLAMA_DIAGNOSE_FIT > 2
                 LLAMA_LOG_INFO("fit_next_largest_node left_first\n");
                 //print_node_groups(left, analysis, schedule);
 #endif
@@ -2510,7 +2512,7 @@ size_t parameter_offloader::generate_streaming_fit(offloader_schedule & schedule
             }
             else    //fit against right side
             {
-#ifdef LLAMA_DIAGNOSE_FIT
+#if LLAMA_DIAGNOSE_FIT > 2
                 LLAMA_LOG_INFO("fit_next_largest_node right_first\n");
                 //print_node_groups(right, analysis, schedule);
 #endif
@@ -2541,7 +2543,7 @@ size_t parameter_offloader::generate_streaming_fit(offloader_schedule & schedule
                     {
                         size_t overlap = std::min(a2, b2) - std::max(a1, b1);
                         conflict_size = std::max(conflict_size, overlap);
-#ifdef LLAMA_DIAGNOSE_FIT
+#if LLAMA_DIAGNOSE_FIT > 1
                         LLAMA_LOG_INFO("%s: conflict indexes %4d %4d  ranges %10zu %10zu  %10zu %10zu  overlap %10zu\n", __func__, schedule.gpu2index.at(a), schedule.gpu2index.at(b), a1, a2, b1, b2, overlap);
 #endif
                     }
@@ -2552,7 +2554,7 @@ size_t parameter_offloader::generate_streaming_fit(offloader_schedule & schedule
 
             auto handle_failure = [&](size_t error_amount)
             {
-#ifdef LLAMA_DIAGNOSE_FIT
+#if LLAMA_DIAGNOSE_FIT > 1
                 std::string undo_indexes;
                 for (size_t i = placement_log.size(); i > rollback_pos; --i)
                 {
@@ -2564,7 +2566,7 @@ size_t parameter_offloader::generate_streaming_fit(offloader_schedule & schedule
 #endif
                 while (placement_log.size() > rollback_pos)
                 {
-#ifdef LLAMA_DIAGNOSE_FIT
+#if LLAMA_DIAGNOSE_FIT > 1
                     const char * name = ggml_get_name(placement_log.back());
                     LLAMA_LOG_INFO("%s: undo %s \n", __func__, name ? name : "(unnamed)");
 #endif
