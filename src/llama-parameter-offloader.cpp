@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <thread>
 #include <condition_variable>
+#include <deque>
 #include <mutex>
 #include <math.h>       /* isfinite */
 #include <unordered_map>
@@ -1518,14 +1519,96 @@ void parameter_offloader::stream_worker()
 {
     LLAMA_LOG_INFO("%s started\n", __func__);
 
+    struct pending_copy {
+        long long ordinal;
+        uint64_t generation;
+        ggml_cuda_copy_event * ev;
+    };
+
+    // One persistent completion worker replaces one detached std::thread per copy.
+    // The queue is FIFO because copied ordinals must be published in submission order.
+    std::deque<pending_copy> completion_queue;
+    std::mutex completion_mu;
+    std::condition_variable completion_cv;
+    bool completion_stop = false;
+
+    std::thread completion_thread([&] {
+        for (;;)
+        {
+            pending_copy item{};
+
+            {
+                std::unique_lock<std::mutex> lk(completion_mu);
+                completion_cv.wait(lk, [&] {
+                    return completion_stop || !completion_queue.empty();
+                });
+
+                if (completion_queue.empty()) {
+                    GGML_ASSERT(completion_stop);
+                    return;
+                }
+
+                item = completion_queue.front();
+                completion_queue.pop_front();
+            }
+
+            if (item.ev) {
+                ggml_cuda_copy_event_wait(item.ev);
+                ggml_cuda_copy_event_destroy(item.ev);
+            }
+
+            // swap_next_schedule() waits for copy_publishers_in_flight == 0 before
+            // advancing schedule_generation, so a normal completion still belongs
+            // to the generation under which it was submitted.
+            if (!stop_stream.load(std::memory_order_acquire) &&
+                schedule_generation.load(std::memory_order_acquire) == item.generation)
+            {
+                const long long previous = tensor_idx_copied_ordinal.load(std::memory_order_acquire);
+                GGML_ASSERT(previous == item.ordinal - 1);
+                tensor_idx_copied_ordinal.store(item.ordinal, std::memory_order_release);
+
+            #ifdef LLAMA_LOG_COPIES
+                LLAMA_LOG_INFO("[C.%lld]", item.ordinal);
+            #endif
+            }
+
+            copy_publishers_in_flight.fetch_sub(1, std::memory_order_acq_rel);
+            node_cv_.notify_all();
+        }
+    });
+
+    auto stop_completion_worker = [&] {
+        {
+            std::lock_guard<std::mutex> lk(completion_mu);
+            completion_stop = true;
+        }
+        completion_cv.notify_one();
+
+        if (completion_thread.joinable())
+            completion_thread.join();
+    };
+
+    auto enqueue_completion = [&](long long ordinal, uint64_t generation, ggml_cuda_copy_event * ev) {
+        // Publish the queue entry and in-flight count under the same mutex so the
+        // completion worker cannot retire the entry before the count is visible.
+        {
+            std::lock_guard<std::mutex> lk(completion_mu);
+            completion_queue.push_back(pending_copy{ ordinal, generation, ev });
+            copy_publishers_in_flight.fetch_add(1, std::memory_order_acq_rel);
+        }
+        completion_cv.notify_one();
+    };
+
     long long submitted_ordinal = tensor_idx_copied_ordinal.load(std::memory_order_acquire);
     uint64_t submitted_generation = schedule_generation.load(std::memory_order_acquire);
-    const int max_in_flight_copies = 8;
+    const int max_in_flight_copies = 2;
 
     for (;;)
     {
-        if (stop_stream.load(std::memory_order_acquire))
+        if (stop_stream.load(std::memory_order_acquire)) {
+            stop_completion_worker();
             return;
+        }
 
         // Give a pending schedule swap priority over new copy submissions.
         if (schedule_swap_requested.load(std::memory_order_acquire))
@@ -1537,8 +1620,11 @@ void parameter_offloader::stream_worker()
                     !schedule_swap_requested.load(std::memory_order_acquire);
             });
 
-            if (stop_stream.load(std::memory_order_acquire))
+            if (stop_stream.load(std::memory_order_acquire)) {
+                lk.unlock();
+                stop_completion_worker();
                 return;
+            }
 
             continue;
         }
@@ -1572,8 +1658,11 @@ void parameter_offloader::stream_worker()
                         schedule_generation.load(std::memory_order_acquire) != empty_generation;
                 });
 
-                if (stop_stream.load(std::memory_order_acquire))
+                if (stop_stream.load(std::memory_order_acquire)) {
+                    lk.unlock();
+                    stop_completion_worker();
                     return;
+                }
 
                 continue;
             }
@@ -1628,22 +1717,7 @@ void parameter_offloader::stream_worker()
                 ggml_cuda_copy_event * ev = upload_weight_auto(w_cpu, w_gpu);
 
                 submitted_ordinal = ordinal;
-
-                copy_publishers_in_flight.fetch_add(1, std::memory_order_acq_rel);
-
-                if (ev) {
-                    std::thread([this, ordinal, generation, ev] {
-                        publish_copy_when_ready(ordinal, generation, ev);
-                        copy_publishers_in_flight.fetch_sub(1, std::memory_order_acq_rel);
-                        node_cv_.notify_all();
-                    }).detach();
-                } else {
-                    std::thread([this, ordinal, generation] {
-                        publish_copy_now(ordinal, generation);
-                        copy_publishers_in_flight.fetch_sub(1, std::memory_order_acq_rel);
-                        node_cv_.notify_all();
-                    }).detach();
-                }
+                enqueue_completion(ordinal, generation, ev);
             }
         }
 
@@ -1657,8 +1731,11 @@ void parameter_offloader::stream_worker()
                     (throttled && copy_publishers_in_flight.load(std::memory_order_acquire) < max_in_flight_copies);
             });
 
-            if (stop_stream.load(std::memory_order_acquire))
+            if (stop_stream.load(std::memory_order_acquire)) {
+                lk.unlock();
+                stop_completion_worker();
                 return;
+            }
 
             continue;
         }
@@ -4178,6 +4255,7 @@ int32_t llama_offloader_moe_residency_cb(
         return -1;
     }
 
+    return 1;
     //return -1; //use this to force 100% cpu rate
 
     return po->debug_cache_moe_expert(block_id, expert_id);
