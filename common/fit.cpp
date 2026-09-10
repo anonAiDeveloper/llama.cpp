@@ -922,7 +922,11 @@ enum common_params_fit_status common_fit_parameter_offloader(
             throw std::runtime_error("parameter-offloader device is not part of the model device set");
 
         const llama_device_memory_data & dmd = dmds[device_id];
-        const int64_t projected_non_model = (int64_t)dmd.mb.context + (int64_t)dmd.mb.compute;
+
+        // TODO: Runtime compute buffers can grow beyond the size projected during context initialization.
+        // Remove this 50% allowance if upstream fixes ggml-org/llama.cpp issue #22601.
+        const int64_t projected_compute = (int64_t)dmd.mb.compute * 3 / 2;
+        const int64_t projected_non_model = (int64_t)dmd.mb.context + projected_compute;
         const int64_t available = dmd.free - projected_non_model - (int64_t)margin;
 
         if (available <= 0)
@@ -943,8 +947,8 @@ enum common_params_fit_status common_fit_parameter_offloader(
         mparams->tensor_buft_overrides = source_weight_overrides;
 
         constexpr int64_t MiB = 1024 * 1024;
-        LOG_TRC("%s: device=%s free=%" PRId64 " MiB projected_context=%zu MiB projected_compute=%zu MiB margin=%zu MiB arena=%zu MiB\n",
-            __func__, ggml_backend_dev_name(device), dmd.free/MiB, dmd.mb.context/(size_t)MiB, dmd.mb.compute/(size_t)MiB, margin/(size_t)MiB, selected/(size_t)MiB);
+        LOG_TRC("%s: device=%s free=%" PRId64 " MiB projected_context=%zu MiB projected_compute=%" PRId64 " MiB margin=%zu MiB arena=%zu MiB\n",
+            __func__, ggml_backend_dev_name(device), dmd.free/MiB, dmd.mb.context/(size_t)MiB, projected_compute/MiB, margin/(size_t)MiB, selected/(size_t)MiB);
     } catch (const common_params_fit_exception & e) {
         LOG_WRN("%s: failed to fit parameter-offloader arena: %s\n", __func__, e.what());
         status = COMMON_PARAMS_FIT_STATUS_FAILURE;

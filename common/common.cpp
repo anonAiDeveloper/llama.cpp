@@ -69,7 +69,7 @@
 
 //TODO: Replace these development-only macros with CLI parameters after the arena fit policy is validated.
 #ifndef PARAMETER_OFFLOADER_VRAM_MARGIN_MIB
-#define PARAMETER_OFFLOADER_VRAM_MARGIN_MIB 200
+#define PARAMETER_OFFLOADER_VRAM_MARGIN_MIB 500
 #endif
 
 #ifndef PARAMETER_OFFLOADER_VRAM_MAX_MIB
