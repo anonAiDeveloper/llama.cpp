@@ -676,6 +676,7 @@ struct llama_model {
     bool has_tensor_overrides() const;
 
     const struct ggml_tensor * get_tensor(const char * name) const;
+    void unmap_tensor_data(const std::vector<ggml_tensor *> & tensors);
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;

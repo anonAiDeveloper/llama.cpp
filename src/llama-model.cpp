@@ -2025,6 +2025,132 @@ const ggml_tensor * llama_model::get_tensor(const char * name) const {
     return it->second;
 }
 
+void llama_model::unmap_tensor_data(const std::vector<ggml_tensor *> & tensors)
+{
+    if (tensors.empty() || pimpl->mappings.empty())
+        return;
+
+    // Tensor metadata remains valid; only the mmap-backed payload is released.
+    std::unordered_set<ggml_tensor *> unmap_set(tensors.begin(), tensors.end());
+
+    auto merge_ranges = [](std::vector<std::pair<size_t, size_t>> & ranges)
+    {
+        if (ranges.empty())
+            return;
+
+        std::sort(ranges.begin(), ranges.end());
+
+        size_t out = 0;
+        for (size_t i = 1; i < ranges.size(); ++i)
+        {
+            if (ranges[i].first <= ranges[out].second)
+                ranges[out].second = std::max(ranges[out].second, ranges[i].second);
+            else
+                ranges[++out] = ranges[i];
+        }
+
+        ranges.resize(out + 1);
+    };
+
+    for (const auto & mapping : pimpl->mappings)
+    {
+        const char * mapping_base = (const char *) mapping->addr();
+        const char * mapping_end  = mapping_base + mapping->size();
+
+        std::vector<std::pair<size_t, size_t>> unmap_ranges;
+        std::vector<std::pair<size_t, size_t>> keep_ranges;
+        std::unordered_set<ggml_tensor *> seen;
+
+        // Split tensors in this mapping into disposable and retained ranges.
+        for (const auto & kv : tensors_by_name)
+        {
+            ggml_tensor * tensor = kv.second;
+
+            if (!tensor || !tensor->data || !seen.insert(tensor).second)
+                continue;
+
+            const char * tensor_data = (const char *) tensor->data;
+
+            if (tensor_data < mapping_base || tensor_data >= mapping_end)
+                continue;
+
+            const size_t first = (size_t)(tensor_data - mapping_base);
+            const size_t last  = first + ggml_nbytes(tensor);
+
+            GGML_ASSERT(last <= mapping->size());
+
+            if (unmap_set.count(tensor))
+                unmap_ranges.push_back({ first, last });
+            else
+                keep_ranges.push_back({ first, last });
+        }
+
+        merge_ranges(unmap_ranges);
+        merge_ranges(keep_ranges);
+
+        // Remove retained tensor ranges from the regions being unmapped.
+        std::vector<std::pair<size_t, size_t>> safe_ranges;
+        size_t keep_idx = 0;
+
+        for (const auto & range : unmap_ranges)
+        {
+            size_t first = range.first;
+
+            while (keep_idx < keep_ranges.size() && keep_ranges[keep_idx].second <= first)
+                ++keep_idx;
+
+            size_t j = keep_idx;
+            while (j < keep_ranges.size() && keep_ranges[j].first < range.second)
+            {
+                if (keep_ranges[j].first > first)
+                    safe_ranges.push_back({ first, std::min(range.second, keep_ranges[j].first) });
+
+                first = std::max(first, keep_ranges[j].second);
+
+                if (first >= range.second)
+                    break;
+
+                ++j;
+            }
+
+            if (first < range.second)
+                safe_ranges.push_back({ first, range.second });
+        }
+
+        if (safe_ranges.empty())
+            continue;
+
+        // Coalesce across unused padding so complete mmap pages can be reclaimed.
+        std::vector<std::pair<size_t, size_t>> coalesced;
+        coalesced.push_back(safe_ranges[0]);
+
+        size_t protected_idx = 0;
+
+        for (size_t i = 1; i < safe_ranges.size(); ++i)
+        {
+            const size_t gap_first = coalesced.back().second;
+            const size_t gap_last  = safe_ranges[i].first;
+
+            while (protected_idx < keep_ranges.size() && keep_ranges[protected_idx].second <= gap_first)
+                ++protected_idx;
+
+            const bool protected_gap =
+                protected_idx < keep_ranges.size() &&
+                keep_ranges[protected_idx].first < gap_last &&
+                keep_ranges[protected_idx].second > gap_first;
+
+            if (!protected_gap)
+                coalesced.back().second = safe_ranges[i].second;
+            else
+                coalesced.push_back(safe_ranges[i]);
+        }
+
+        // unmap_fragment() handles page alignment and mmap bookkeeping.
+        for (const auto & range : coalesced)
+            mapping->unmap_fragment(range.first, range.second);
+    }
+}
+
 float llama_model::get_rope_freq_base (const llama_cparams & cparams, int il) const {
     return hparams.is_swa(il) ? hparams.rope_freq_base_train_swa : cparams.rope_freq_base;
 }

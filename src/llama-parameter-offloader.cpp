@@ -17,8 +17,8 @@
 #include <cstring>
 #include <stdexcept>
 
-// TODO: Investigate Page-Locked Host Memory for host_packed_ upload buffers.
-//Explanation: CPU tensors are not currently pinned. Pinning them speeds up cpu->gpu copies but also requires some VRAM overheard
+//OFFLOADER_CUDA_PIN_MEMORY controls whether cpu memory is pinned or not
+#define OFFLOADER_CUDA_PIN_MEMORY
 
 /////////////////////////////////////
 //   DEBUGGING SWITCHES
@@ -428,10 +428,34 @@ bool parameter_offloader::transform_cpu_tensor_to_device_layout(ggml_tensor * w_
     if (dev_bytes > arena_dense_size)
         throw std::runtime_error("parameter_offloader: tensor device layout does not fit inside dense arena scratch space");
 
+#ifdef OFFLOADER_CUDA_PIN_MEMORY
+    // Allocate permanent pinned host RAM sized like the device allocation so later H2D copies can DMA directly.
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(arena_buffer_type);
+    GGML_ASSERT(dev);
+
+    ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(dev);
+    if (!host_buft)
+        throw std::runtime_error("parameter_offloader: device does not provide a pinned host buffer type");
+#else
     // Allocate a host RAM buffer sized like the device allocation so we can memcpy the whole region later.
     ggml_backend_buffer_type_t host_buft = ggml_backend_cpu_buffer_type(); // use pinned-host type if you have one
+#endif
+
     ggml_backend_buffer_t host_buf = ggml_backend_buft_alloc_buffer(host_buft, dev_bytes);
+
+#ifdef OFFLOADER_CUDA_PIN_MEMORY
+    //CUDA host allocation can silently fall back to an ordinary CPU buffer. Do not allow that here.
+    if (!host_buf || ggml_backend_buffer_get_type(host_buf) != host_buft)
+    {
+        if (host_buf)
+            ggml_backend_buffer_free(host_buf);
+
+        throw std::runtime_error("parameter_offloader: failed to allocate pinned host buffer");
+    }
+#else
     GGML_ASSERT(host_buf);
+#endif
+
     uint8_t * host_base = (uint8_t *) ggml_backend_buffer_get_base(host_buf);
 
     ggml_init_params tmp_ip{ 64*1024, nullptr, true };
@@ -863,6 +887,13 @@ void parameter_offloader::init(ggml_backend_buffer_t arena, llama_context_params
     LLAMA_LOG_INFO("host-packing: %zu/%zu weights packed on host\n",
                 packed, collected_order.size());
 
+#ifdef OFFLOADER_CUDA_PIN_MEMORY
+    GGML_ASSERT(packed == collected_order.size());
+
+    //The packed pinned buffers are now the permanent dense-weight source; release their original GGUF mappings.
+    model->unmap_tensor_data(collected_order);
+#endif
+
     // Build the model-slot index once, then patch each mirrored tensor through direct lookup.
     build_model_ref_lookup();
 
@@ -935,6 +966,7 @@ void parameter_offloader::start()
         ggml_cuda_copy_event_destroy(ev);
     }
 
+    const size_t tensor_count = schedule_current.gpu_tensors_in_order.size();
     tensor_idx_copied_ordinal.store((long long)tensor_count, std::memory_order_release);
 #else
     start_streamer();                         // begin background H2D streaming
@@ -1449,7 +1481,7 @@ void parameter_offloader::publish_copy_when_ready(long long ordinal, uint64_t ge
     tensor_idx_copied_ordinal.store(ordinal, std::memory_order_release);
 
     #ifdef LLAMA_LOG_COPIES
-        LLAMA_LOG_INFO("[C.%d]", ordinal);
+        LLAMA_LOG_INFO("[C.%lld]", ordinal);
     #endif
 
     lk.unlock();
@@ -1475,7 +1507,7 @@ void parameter_offloader::publish_copy_now(long long ordinal, uint64_t generatio
     tensor_idx_copied_ordinal.store(ordinal, std::memory_order_release);
 
     #ifdef LLAMA_LOG_COPIES
-        LLAMA_LOG_INFO("[C.%d]", ordinal);
+        LLAMA_LOG_INFO("[C.%lld]", ordinal);
     #endif
 
     lk.unlock();
