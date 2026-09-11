@@ -1051,8 +1051,7 @@ bool parameter_offloader::node_reads_tracked_weight(ggml_tensor * t, int * out_i
     return true;
 }
 
-// Ask-phase: only opt in for nodes that read any tracked weight.
-// Keeps batching intact for other nodes.
+// Ask-phase: only opt in for nodes that read a streamed weight. build_graph_runtime_metadata() precompiles this membership so the hot path does not rescan node->src[].
 bool parameter_offloader::wants_observe(ggml_tensor * node)
 {
     if (schedule_current.gpu_tensors_in_order.empty())
@@ -1130,7 +1129,10 @@ bool parameter_offloader::wants_observe(ggml_tensor * node)
     //finite_check_node(node, true);
 #endif
 #endif /* #ifdef LLAMA_CHECK_NODES */
-    return node_reads_tracked_weight(node, /*out_idx*/ nullptr);
+    if (!model_i->node_may_read_dense_weight(node))
+        return false;
+
+    return graph_analysis_current.next_required_tensor_idx.find(node) != graph_analysis_current.next_required_tensor_idx.end();
 }
 
 // Called after an observed node executes; advance all schedule positions released by this node and wait for the next required streamed tensor if COPY has not reached it yet.
@@ -1139,14 +1141,23 @@ bool parameter_offloader::on_eval_tensor(ggml_tensor * node)
     if (schedule_current.gpu_tensors_in_order.empty())
         return false;
 
-    int idx = -1;
-    if (!node_reads_tracked_weight(node, &idx))
-        return false;  //should this be a return true?
+    // Do cheap op-type rejection before consulting precomputed graph metadata.
+    if (!model_i->node_may_read_dense_weight(node))
+        return false;
 
-    // for readable logs
+    // Runtime dependency membership and the next-copy requirement were compiled with the graph, so do not rescan node->src[] after execution.
+    const auto runtime_it = graph_analysis_current.next_required_tensor_idx.find(node);
+    if (runtime_it == graph_analysis_current.next_required_tensor_idx.end())
+        return false;
+
+    const int next_required_idx = runtime_it->second; // -1 means observe/release only; no copy wait after this node
     const int tensor_count = (int)schedule_current.gpu_tensors_in_order.size();
-    //if (idx == tensor_count - 1)
-    //    LLAMA_LOG_INFO("%s got to idx %d\n", __func__, idx);
+
+#if defined(LLAMA_LOG_READS) || defined(LLAMA_CHECK_WEIGHTS)
+    // Diagnostics may still recover the old "furthest weight read" index; this is deliberately outside the production hot path.
+    int idx = -1;
+    (void) node_reads_tracked_weight(node, &idx);
+#endif
 
     long long used_ordinal = tensor_idx_used_ordinal.load(std::memory_order_relaxed);
     bool gate_advanced = false;
@@ -1173,11 +1184,8 @@ bool parameter_offloader::on_eval_tensor(ggml_tensor * node)
     LLAMA_LOG_INFO("[R.%d]", idx);
 #endif
 
-    // Find the first newly-required streamed tensor that COPY must reach before compute advances past this node.
-    auto read_next_it = graph_analysis_current.next_required_tensor_idx.find(node);
-    
-    // Convert that schedule index to its monotonic COPY ordinal for the current traversal of the ring.
-    const long long needed_copy_ordinal = read_next_it != graph_analysis_current.next_required_tensor_idx.end() ? advance_ordinal_to_idx(used_ordinal, read_next_it->second, tensor_count) : -1;
+    // Convert the precompiled next-tensor requirement to its monotonic COPY ordinal for this traversal.
+    const long long needed_copy_ordinal = next_required_idx >= 0 ? advance_ordinal_to_idx(used_ordinal, next_required_idx, tensor_count) : -1;
 
 #if defined(LLAMA_DIAGNOSE_COPY)
     long long copied_ordinal = tensor_idx_copied_ordinal.load(std::memory_order_relaxed);
@@ -1220,7 +1228,7 @@ bool parameter_offloader::on_eval_tensor(ggml_tensor * node)
 #endif /* defined(LLAMA_DIAGNOSE_COPY) */
     
     // Wait only when this node has a next-tensor COPY requirement.
-    if (read_next_it != graph_analysis_current.next_required_tensor_idx.end())
+    if (next_required_idx >= 0)
     {
         long long cur_copied_ordinal = tensor_idx_copied_ordinal.load(std::memory_order_acquire);
 
@@ -2314,6 +2322,9 @@ void parameter_offloader::build_graph_runtime_metadata(dense_graph_analysis & an
         if (!node_reads_streamed_weight)
             continue;
 
+        // Compile streamed-read membership for wants_observe()/on_eval_tensor(). -1 means observe/release only; a later new streamed read overwrites the previous node's value below.
+        analysis.next_required_tensor_idx.emplace(node, -1);
+
         if (first_read_idx < 0 && node_first_read_idx >= 0)
             first_read_idx = node_first_read_idx;
 
@@ -3390,7 +3401,7 @@ bool parameter_offloader::swap_next_schedule(size_t streaming_fit)
         if (!graph_analysis_current.release_node_by_tensor.empty())
         {
             auto it = graph_analysis_current.next_required_tensor_idx.find(graph_analysis_current.release_node_by_tensor.back());
-            if (it != graph_analysis_current.next_required_tensor_idx.end())
+            if (it != graph_analysis_current.next_required_tensor_idx.end() && it->second >= 0)
                 startup_copy_idx = it->second;
         }
 
@@ -4255,7 +4266,6 @@ int32_t llama_offloader_moe_residency_cb(
         return -1;
     }
 
-    return 1;
     //return -1; //use this to force 100% cpu rate
 
     return po->debug_cache_moe_expert(block_id, expert_id);

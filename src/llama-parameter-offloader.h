@@ -116,7 +116,7 @@ public:
         std::vector<ggml_tensor *> graph_nodes;                         // Graph nodes that read one or more managed dense tensors, in graph order.
         std::vector<std::vector<ggml_tensor *>> graph_nodes_tensors;    // Managed dense tensors read by each corresponding entry in read_nodes. Read order must be kept intact
         std::vector<ggml_tensor *> release_node_by_tensor;              // For each streamed schedule index, the graph node whose completion releases that index and every preceding unreleased index.
-        std::unordered_map<ggml_tensor *, int> next_required_tensor_idx;// Graph node -> first newly-read streamed tensor index that COPY must reach before compute advances.
+        std::unordered_map<ggml_tensor *, int> next_required_tensor_idx;// Streamed-read graph node -> next newly-required streamed tensor index COPY must reach; -1 means observe/release only.
         std::vector<node_group> node_pairs;                             // Adjacent pairs of nodes (duplicates are collapsed), filtering away static tensors
         bool dense_fits_arena = false;                                  // True when all managed dense tensors for this graph fit in the dense arena simultaneously.
     };
