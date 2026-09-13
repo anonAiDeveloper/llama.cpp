@@ -3692,46 +3692,51 @@ bool llama_offloader_graph_cb(ggml_backend_sched_t sched, struct ggml_cgraph * g
     const uint64_t graph_hash = po->analyze_dense_graph(sched, graph, po->graph_analysis_next);
     const bool dense_fits_arena = po->graph_analysis_next.dense_fits_arena;
 
-    std::unordered_set<ggml_tensor *> newly_deprioritized;
-
-    // Deprioritize tensors that are actually static now but are omitted from the incoming graph.
-    for (ggml_tensor * w_gpu : po->static_dense_order_current)
-    {
-        if (po->graph_analysis_next.gpu2index.find(w_gpu) != po->graph_analysis_next.gpu2index.end())
-            continue;
-
-        if (po->deprioritized_dense_set.insert(w_gpu).second)
-            newly_deprioritized.insert(w_gpu);
-    }
-
-    // Invalidate only cached layouts that made a newly deprioritized tensor static.
-    if (!newly_deprioritized.empty())
-    {
-        for (auto it = po->dense_graph_cache.begin(); it != po->dense_graph_cache.end(); )
-        {
-            bool invalidate = false;
-
-            for (ggml_tensor * w_gpu : it->second.static_dense_order)
-            {
-                if (newly_deprioritized.find(w_gpu) == newly_deprioritized.end())
-                    continue;
-
-                invalidate = true;
-                break;
-            }
-
-            if (invalidate)
-                it = po->dense_graph_cache.erase(it);
-            else
-                ++it;
-        }
-    }
-
     auto cache_it = po->dense_graph_cache.find(graph_hash);
     size_t streaming_fit = 0;
 
+    // True if this is a newly seen graph
     if (cache_it == po->dense_graph_cache.end())
     {
+        if (po->first_graph_created)
+        {
+            bool invalidate_cache = false;
+
+            // Tensors present in the first graph but absent from this graph.
+            // If newly deprioritized, every previously cached graph included them and its placement is stale.
+            for (ggml_tensor * w_gpu : po->first_graph_dense_set)
+            {
+                if (po->graph_analysis_next.gpu2index.find(w_gpu) != po->graph_analysis_next.gpu2index.end())
+                    continue;
+
+                if (po->deprioritized_dense_set.insert(w_gpu).second)
+                    invalidate_cache = true;
+            }
+
+            // Tensors present in this graph but absent from the first graph.
+            // A newly inserted tensor cannot exist in an older cached graph, otherwise it would already be deprioritized.
+            for (ggml_tensor * w_gpu : po->graph_analysis_next.gpu_tensors_in_order)
+            {
+                if (po->first_graph_dense_set.find(w_gpu) != po->first_graph_dense_set.end())
+                    continue;
+
+                po->deprioritized_dense_set.insert(w_gpu);
+            }
+
+            // Invalidate the ENTIRE cache. I don't think its possible for one entry to be valid when any other is invalid.
+            if (invalidate_cache)
+                po->dense_graph_cache.clear();
+        }
+        else
+        {
+            po->first_graph_dense_set.reserve(po->graph_analysis_next.gpu_tensors_in_order.size());
+
+            for (ggml_tensor * w_gpu : po->graph_analysis_next.gpu_tensors_in_order)
+                po->first_graph_dense_set.insert(w_gpu);
+
+            po->first_graph_created = true;
+        }
+
         // A new graph gets its own static/streamed partition.
         po->static_dense_order.clear();
         po->static_dense_set.clear();
