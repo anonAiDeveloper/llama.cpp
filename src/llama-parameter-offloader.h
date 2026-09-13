@@ -50,7 +50,7 @@ public:
     // Init and destructor functions
     bool ready = false;
 
-    std::vector<ggml_tensor*> collected_order;      // CPU weights in first-use order
+    std::vector<ggml_tensor*> collected_order;      // CPU weights managed by the offloader, excluding CPU-pattern matches
 
     // Arena + twin-context
     llama_model*                model;
@@ -67,7 +67,7 @@ public:
     size_t                      arena_stream_size  = 0;         // dense streaming region size
     size_t                      arena_alignment = 0;            // required byte alignment for arena placement
 
-    void init(ggml_backend_buffer_t arena, llama_context_params params, ggml_context * ctx_twins);
+    void init(ggml_backend_buffer_t arena, llama_context_params params, ggml_context * ctx_twins, const std::vector<std::string> & cpu_patterns);
     parameter_offloader(llama_model * model);
     ~parameter_offloader();
 
@@ -194,7 +194,8 @@ public:
     //map the gpu tensors to hashes recorded at init, to ensure data integrity
     std::unordered_map<ggml_tensor*, uint64_t> gpu_hashes;
 
-    void print_snapshot(offloader_schedule & schedule, ggml_log_level level = GGML_LOG_LEVEL_INFO);
+    void print_streaming_snapshot(offloader_schedule & schedule, ggml_log_level level = GGML_LOG_LEVEL_INFO);
+    void print_static_snapshot(ggml_log_level level = GGML_LOG_LEVEL_INFO);
     void print_node_groups(const std::vector<node_group> & groups, const dense_graph_analysis & analysis, const offloader_schedule & schedule);
     void print_tensor_order(const std::vector<ggml_tensor *> & tensors, const std::vector<size_t> & offsets, ggml_log_level level = GGML_LOG_LEVEL_INFO);
 private:
@@ -204,7 +205,7 @@ private:
     inline ggml_cuda_copy_event * upload_weight_auto(ggml_tensor *w_cpu, ggml_tensor *w_gpu);
 
     // Init and destructor functions
-    void seed_all_weights_from_model();
+    void seed_all_weights_from_model(const std::vector<std::string> & cpu_patterns);
 
     // Index every model tensor pointer slot once so CPU->GPU patching can use direct lookup.
     void build_model_ref_lookup();

@@ -855,6 +855,7 @@ enum common_params_fit_status common_fit_parameter_offloader(
         size_t * arena_size,
         size_t margin,
         size_t max_arena_size,
+        const std::vector<std::string> & cpu_patterns,
         ggml_log_level log_level) {
     const int64_t t0_us = llama_time_us();
     common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
@@ -870,15 +871,11 @@ enum common_params_fit_status common_fit_parameter_offloader(
         llama_model_params mparams_probe = *mparams;
         llama_context_params cparams_probe = *cparams;
 
-        //TODO: Apply the future CPU-computed-layer policy to this probe so it can reclaim GPU context/compute headroom instead of assuming all managed layers run on GPU.
-        // Probe the GPU-side context/compute footprint as though all ordinary layers were GPU-computed, but do not count their model-weight bytes toward the final reservation.
+        // Probe the GPU-side context/compute footprint with ordinary layers GPU-assigned while applying the requested CPU tensor placement below.
         mparams_probe.n_gpu_layers = INT32_MAX;
 
-        // Preserve any existing tensor placement overrides in the probe, then add the
-        // parameter-offloader-specific placement for routed MoE expert banks. The real
-        // offloader leaves these authoritative expert tensors CPU-backed, so the fit
-        // graph must see the same placement or it substantially underestimates CUDA
-        // compute-buffer requirements.
+        // Preserve any existing tensor placement overrides in the probe, then add the user-requested CPU tensor patterns and the
+        // parameter-offloader-specific placement for routed MoE expert banks so the probe sees the same CPU-backed tensors as the real model.
         std::vector<llama_model_tensor_buft_override> probe_tensor_buft_overrides;
 
         if (mparams->tensor_buft_overrides) {
@@ -887,6 +884,13 @@ enum common_params_fit_status common_fit_parameter_offloader(
                  ++override) {
                 probe_tensor_buft_overrides.push_back(*override);
             }
+        }
+
+        for (const std::string & pattern : cpu_patterns) {
+            probe_tensor_buft_overrides.push_back({
+                pattern.c_str(),
+                ggml_backend_cpu_buffer_type(),
+            });
         }
 
         probe_tensor_buft_overrides.push_back({

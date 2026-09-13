@@ -2,6 +2,7 @@
 
 #include "ggml.h"
 #include "llama.h"
+#include <string>
 
 #include <vector>
 
@@ -36,6 +37,7 @@ common_params_fit_status common_fit_parameter_offloader(
                              size_t * arena_size,
                              size_t   margin,
                              size_t   max_arena_size,
+     const std::vector<std::string> & cpu_patterns,
                      ggml_log_level   log_level);
 
 // print estimated memory to stdout

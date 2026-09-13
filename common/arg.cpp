@@ -750,7 +750,7 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
                 throw std::invalid_argument(string_format("error: invalid argument: %s", arg.c_str()));
             }
             if (!seen_args.insert(arg).second) {
-                const bool skip = (arg == "--spec-type");
+                const bool skip = (arg == "--spec-type" || arg == "--param-offload-cpu");
 
                 if (!skip) {
                     LOG_WRN("DEPRECATED: argument '%s' specified multiple times, use comma-separated values instead (only last value will be used)\n", arg.c_str());
@@ -2631,6 +2631,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             parse_tensor_buffer_overrides(value, params.tensor_buft_overrides);
         }
     ).set_env("LLAMA_ARG_OVERRIDE_TENSOR"));
+    add_opt(common_arg(
+        {"--param-offload-cpu"}, "REGEX",
+        "keep tensors matching REGEX on CPU instead of managing them with the parameter offloader; may be specified multiple times",
+        [](common_params & params, const std::string & value) {
+            params.param_offload_cpu.push_back(value);
+        }
+    ));
+    add_opt(common_arg(
+        {"--param-offload-vram-margin"}, "MIB",
+        string_format("VRAM margin to reserve outside the parameter-offloader arena (default: %zu MiB)", params.param_offload_vram_margin / (1024ull * 1024ull)),
+        [](common_params & params, const std::string & value) {
+            params.param_offload_vram_margin = std::stoull(value) * 1024ull * 1024ull;
+        }
+    ));
     add_opt(common_arg(
         {"-cmoe", "--cpu-moe"},
         "keep all Mixture of Experts (MoE) weights in the CPU",

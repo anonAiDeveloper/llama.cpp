@@ -11,6 +11,7 @@
 #include <thread>
 #include <condition_variable>
 #include <deque>
+#include <regex>
 #include <mutex>
 #include <math.h>       /* isfinite */
 #include <unordered_map>
@@ -356,10 +357,37 @@ void parameter_offloader::attach_arena(ggml_backend_buffer_t arena)
 }
 
 // Call this *before* transform/upload, i.e. at the top of parameter_offloader::init()
-// Guarantees collected_order contains *all* host-backed model weights
-void parameter_offloader::seed_all_weights_from_model()
+// Guarantees collected_order contains all managed host-backed model weights not excluded by cpu_patterns
+void parameter_offloader::seed_all_weights_from_model(const std::vector<std::string> & cpu_patterns)
 {
     collected_order.clear();
+
+    std::vector<std::regex> cpu_regexes;
+    cpu_regexes.reserve(cpu_patterns.size());
+    for (const std::string & pattern : cpu_patterns)
+        cpu_regexes.emplace_back(pattern);
+
+    std::unordered_set<ggml_tensor *> cpu_excluded;
+    if (!cpu_regexes.empty())
+    {
+        cpu_excluded.reserve(model->tensors_by_name.size());
+
+        for (const auto & kv : model->tensors_by_name)
+        {
+            ggml_tensor * t = kv.second;
+            if (!t)
+                continue;
+
+            for (const std::regex & pattern : cpu_regexes)
+            {
+                if (std::regex_search(kv.first, pattern))
+                {
+                    cpu_excluded.insert(t);
+                    break;
+                }
+            }
+        }
+    }
 
     // Gather (name,tensor) to get a deterministic ordering (lexicographic by name)
     std::vector<std::pair<std::string, ggml_tensor *>> named;
@@ -373,6 +401,9 @@ void parameter_offloader::seed_all_weights_from_model()
             continue; // only real host weights
         // Only keep actual weights you intend to manage (you already populated cpu_weight_set)
         if (cpu_weight_set.find(t) == cpu_weight_set.end())
+            continue;
+
+        if (cpu_excluded.find(t) != cpu_excluded.end())
             continue;
 
         if (!model_i->weight_supported(kv.first))
@@ -868,7 +899,7 @@ ggml_tensor * parameter_offloader::init_cpu_tensor_to_arena(ggml_tensor * w_cpu,
     return w_gpu;
 }
 
-void parameter_offloader::init(ggml_backend_buffer_t arena, llama_context_params cparams, ggml_context * ctx_twins)
+void parameter_offloader::init(ggml_backend_buffer_t arena, llama_context_params cparams, ggml_context * ctx_twins, const std::vector<std::string> & cpu_patterns)
 {
     attach_arena(arena);
 
@@ -882,17 +913,17 @@ void parameter_offloader::init(ggml_backend_buffer_t arena, llama_context_params
     gpu2cpu.reserve(4096);
     cpu2gpu.reserve(4096);
 
-    seed_all_weights_from_model();
+    seed_all_weights_from_model(cpu_patterns);
 
     const size_t packed = transform_all_cpu_weights_to_device_layout();
-    LLAMA_LOG_INFO("host-packing: %zu/%zu weights packed on host\n",
-                packed, collected_order.size());
+    LLAMA_LOG_INFO("host-packing: %zu/%zu weights packed on host\n", packed, collected_order.size());
 
 #ifdef OFFLOADER_CUDA_PIN_MEMORY
     GGML_ASSERT(packed == collected_order.size());
 
     //The packed pinned buffers are now the permanent dense-weight source; release their original GGUF mappings.
-    model->unmap_tensor_data(collected_order);
+    model->unmap_tensor_data(collected_order);       //TODO: This sometimes causes a hard to reproduce SIGBUS crash, keep an eye on this
+                                                     //      However, a reboot made this begin working again. Hard to say if this is responsible for SIGBUS or not
 #endif
 
     // Build the model-slot index once, then patch each mirrored tensor through direct lookup.
@@ -920,8 +951,6 @@ void parameter_offloader::init(ggml_backend_buffer_t arena, llama_context_params
 
     ready = true;
     LLAMA_LOG_INFO("%s ready\n", __func__);
-
-    //print_snapshot(schedule_current);
 
     // Optional log
     size_t peak = 0;
@@ -3463,7 +3492,8 @@ bool parameter_offloader::swap_next_schedule(size_t streaming_fit)
 
         changed = true;
 
-        //print_snapshot(schedule_current);
+        //print_streaming_snapshot(schedule_current);
+        //print_static_snapshot();
     }
 
     // The new schedule is now completely published and schedule_mutex is free.
@@ -4274,7 +4304,7 @@ int32_t llama_offloader_moe_residency_cb(
 /////////////////////////////////////
 //   DIAGNOSTICS
 /////////////////////////////////////
-void parameter_offloader::print_snapshot(offloader_schedule & schedule, ggml_log_level level)
+void parameter_offloader::print_streaming_snapshot(offloader_schedule & schedule, ggml_log_level level)
 {
     size_t tensor_count = schedule.gpu_tensors_in_order.size();
 
@@ -4325,6 +4355,35 @@ void parameter_offloader::print_snapshot(offloader_schedule & schedule, ggml_log
             start[i],
             end[i],
             schedule.ready_after[i] - i,
+            name ? name : "(unnamed)");
+    }
+}
+
+void parameter_offloader::print_static_snapshot(ggml_log_level level)
+{
+    const size_t tensor_count = static_dense_order_current.size();
+
+    for (size_t i = 0; i < tensor_count; ++i)
+    {
+        ggml_tensor * w_gpu = static_dense_order_current[i];
+        GGML_ASSERT(w_gpu && w_gpu->data);
+
+        ggml_tensor * w_cpu = gpu2cpu.at(w_gpu);
+
+        const size_t off   = (size_t)((char *)w_gpu->data - arena_base);
+        const size_t bytes = ggml_backend_buft_get_alloc_size(arena_buffer_type, w_cpu);
+        const size_t end   = off + bytes;
+
+        GGML_ASSERT(end <= arena_dense_size);
+
+        const char * name = ggml_get_name(w_gpu);
+
+        llama_log_internal(level, "%s %4zu %10zu %10zu %10zu %s\n",
+            __func__,
+            i,
+            off,
+            end,
+            bytes,
             name ? name : "(unnamed)");
     }
 }

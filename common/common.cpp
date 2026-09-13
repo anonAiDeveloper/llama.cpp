@@ -67,11 +67,7 @@
 #pragma warning(disable: 4244 4267) // possible loss of data
 #endif
 
-//TODO: Replace these development-only macros with CLI parameters after the arena fit policy is validated.
-#ifndef PARAMETER_OFFLOADER_VRAM_MARGIN_MIB
-#define PARAMETER_OFFLOADER_VRAM_MARGIN_MIB 500
-#endif
-
+//TODO: Replace this development-only macro with a CLI parameter after the arena fit policy is validated.
 #ifndef PARAMETER_OFFLOADER_VRAM_MAX_MIB
 #define PARAMETER_OFFLOADER_VRAM_MAX_MIB 0
 #endif
@@ -1262,8 +1258,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
         if (cuda_dev) {
             const size_t MiB = 1024ull * 1024ull;
-            //TODO: Replace the fixed margin with separate runtime headroom and measured maximum temporary device-packing scratch.
-            const size_t margin = (size_t)PARAMETER_OFFLOADER_VRAM_MARGIN_MIB * MiB;
+            //TODO: Replace the single margin with separate runtime headroom and measured maximum temporary device-packing scratch.
+            const size_t margin = params.param_offload_vram_margin;
             const size_t max_arena_size = PARAMETER_OFFLOADER_VRAM_MAX_MIB == 0 ? 0 : (size_t)PARAMETER_OFFLOADER_VRAM_MAX_MIB * MiB;
             size_t arena_bytes = 0;
 
@@ -1277,6 +1273,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                 &arena_bytes,
                 margin,
                 max_arena_size,
+                params.param_offload_cpu,
                 params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
 
             if (fit_status != COMMON_PARAMS_FIT_STATUS_SUCCESS)
@@ -1504,7 +1501,7 @@ void common_init_result::init_parameter_offloader(common_params & params) {
 
     auto cparams = common_context_params_to_llama(params);
 
-    pimpl->param_offloader->init(arena, cparams, ggml_init(twins));
+    pimpl->param_offloader->init(arena, cparams, ggml_init(twins), params.param_offload_cpu);
     pimpl->param_offloader_arena = nullptr;
 
 #else
