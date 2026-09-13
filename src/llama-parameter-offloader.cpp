@@ -111,6 +111,7 @@ static inline bool offloader_name_ends(const std::string & name, const char * su
 static bool parameter_offloader_deepseek2_weight_supported(const std::string & name)
 {
     return
+        //name == "token_embd.weight"                         || // Input token embedding table; GET_ROWS selects only rows for current token IDs
         offloader_name_ends(name, ".attn_norm.weight")      || // RMSNorm scale before attention block; 1D vector applied to residual stream before Q/K/V work
         offloader_name_ends(name, ".attn_q_a.weight")       || // First low-rank Q projection: hidden -> q_lora_rank before q_a_norm/q_b
         offloader_name_ends(name, ".attn_q_a_norm.weight")  || // RMSNorm scale on low-rank Q activation between q_a and q_b; 1D vector
@@ -133,17 +134,16 @@ static bool parameter_offloader_deepseek2_weight_supported(const std::string & n
         offloader_name_ends(name, ".ffn_gate_shexp.weight") || // Shared expert FFN gate projection; always used, not routed by top-k
         offloader_name_ends(name, ".ffn_up_shexp.weight")   || // Shared expert FFN up projection; always used, not routed by top-k
         offloader_name_ends(name, ".ffn_down_shexp.weight") || // Shared expert FFN down projection; always used, not routed by top-k
-        name == "token_embd.weight"                         ||
-        name == "output_norm.weight"                        ||   // Final RMSNorm scale before logits
-        name == "output.weight";                                 // LM head / output projection from hidden state to vocabulary logits
+        name == "output_norm.weight"                        || // Final RMSNorm scale before logits
+        name == "output.weight";                               // LM head / output projection from hidden state to vocabulary logits
 }
 
 //GPT-OSS weights. These all fit within 4GB, and yes thats the 120B parameter model. This leads to odd behavior where copies no longer need to wait on reads.
 static bool parameter_offloader_gpt_oss_weight_supported(const std::string & name)
 {
     return
-        name == "token_embd.weight"                              ||   // Input embedding table
-        name == "output_norm.weight"                             ||   // Final RMSNorm scale
+        //name == "token_embd.weight"                              ||   // Input token embedding table; GET_ROWS selects only rows for current token IDs
+        name == "output_norm.weight"                             ||   // Final RMSNorm scale before logits
         offloader_name_ends(name, ".attn_norm.weight")          ||   // RMSNorm scale before attention
         offloader_name_ends(name, ".post_attention_norm.weight")||   // RMSNorm scale before MoE
         offloader_name_ends(name, ".attn_qkv.weight")           ||   // Optional fused Q/K/V projection
@@ -154,14 +154,14 @@ static bool parameter_offloader_gpt_oss_weight_supported(const std::string & nam
         offloader_name_ends(name, ".attn_q.bias")               ||   // Optional Q bias
         offloader_name_ends(name, ".attn_k.bias")               ||   // Optional K bias
         offloader_name_ends(name, ".attn_v.bias")               ||   // Optional V bias
-        offloader_name_ends(name, ".attn_output.weight")        ||   // Attention output projection
+        offloader_name_ends(name, ".attn_output.weight")        ||   // Attention output projection back to model hidden size
         offloader_name_ends(name, ".attn_output.bias")          ||   // Attention output bias
-        offloader_name_ends(name, ".attn_sinks.weight")         ||   // Attention sinks
-        offloader_name_ends(name, ".ffn_gate_inp.weight")       ||   // MoE router/gating projection
-        offloader_name_ends(name, ".ffn_gate_inp.bias")         ||   // MoE router/gating bias
-        //offloader_name_ends(name, ".ffn_gate_exps.weight")     || // SPARSE: routed expert gate matrices
-        //offloader_name_ends(name, ".ffn_down_exps.weight")     || // SPARSE: routed expert down matrices
-        //offloader_name_ends(name, ".ffn_up_exps.weight")       || // SPARSE: routed expert up matrices
+        offloader_name_ends(name, ".attn_sinks.weight")         ||   // Per-head attention sink parameters; 1D vector over attention heads
+        offloader_name_ends(name, ".ffn_gate_inp.weight")       ||   // MoE router/gating projection: hidden -> expert scores
+        offloader_name_ends(name, ".ffn_gate_inp.bias")         ||   // MoE router/gating bias; one value per expert
+        //offloader_name_ends(name, ".ffn_gate_exps.weight")     || // SPARSE: Routed MoE expert-bank gate matrices; packed per expert
+        //offloader_name_ends(name, ".ffn_down_exps.weight")     || // SPARSE: Routed MoE expert-bank down matrices; packed per expert
+        //offloader_name_ends(name, ".ffn_up_exps.weight")       || // SPARSE: Routed MoE expert-bank up matrices; packed per expert
         //offloader_name_ends(name, ".ffn_gate_exps.bias")       || // SPARSE: routed expert gate biases
         //offloader_name_ends(name, ".ffn_down_exps.bias")       || // SPARSE: routed expert down biases
         //offloader_name_ends(name, ".ffn_up_exps.bias")         || // SPARSE: routed expert up biases
@@ -171,24 +171,24 @@ static bool parameter_offloader_gpt_oss_weight_supported(const std::string & nam
         //offloader_name_ends(name, ".ffn_gate_exps.input_scale")|| // SPARSE: routed expert gate input scales
         //offloader_name_ends(name, ".ffn_down_exps.input_scale")|| // SPARSE: routed expert down input scales
         //offloader_name_ends(name, ".ffn_up_exps.input_scale")  || // SPARSE: routed expert up input scales
-        name == "output.weight";                                      // LM head / output projection
+        name == "output.weight";                                      // LM head / output projection from hidden state to vocabulary logits
 }
 
 // DeepSeek V4 weights
 static bool parameter_offloader_deepseek4_weight_supported(const std::string & name)
 {
     return
-        name == "token_embd.weight"                                ||   // Token embedding
+        //name == "token_embd.weight"                                ||   // Input token embedding table; GET_ROWS selects only rows for current token IDs
         offloader_name_ends(name, ".hc_attn_fn.weight")            ||   // Hyperconnection projection before attention
         offloader_name_ends(name, ".hc_attn_base.weight")          ||   // HC attention base stores pre[hc], post[hc], and comb[hc*hc] affine biases.
         offloader_name_ends(name, ".hc_attn_scale.weight")         ||   // HC attention scale stores separate pre, post, and comb affine scales.
-        offloader_name_ends(name, ".attn_norm.weight")             ||   // Attention RMSNorm
-        offloader_name_ends(name, ".attn_sinks.weight")            ||   // Attention sinks
-        offloader_name_ends(name, ".attn_q_a.weight")              ||   // First low-rank Q projection
-        offloader_name_ends(name, ".attn_q_a_norm.weight")         ||   // Low-rank Q RMSNorm
-        offloader_name_ends(name, ".attn_q_b.weight")              ||   // Second low-rank Q projection
+        offloader_name_ends(name, ".attn_norm.weight")             ||   // RMSNorm scale before attention; 1D vector over hidden size
+        offloader_name_ends(name, ".attn_sinks.weight")            ||   // Per-head attention sink parameters; 1D vector over attention heads
+        offloader_name_ends(name, ".attn_q_a.weight")              ||   // First low-rank Q projection: hidden -> q_lora_rank before q_a_norm/q_b
+        offloader_name_ends(name, ".attn_q_a_norm.weight")         ||   // RMSNorm scale on low-rank Q activation between q_a and q_b; 1D vector
+        offloader_name_ends(name, ".attn_q_b.weight")              ||   // Second low-rank Q projection: q_lora_rank -> full per-head Q
         offloader_name_ends(name, ".attn_kv.weight")               ||   // Shared attention KV projection
-        offloader_name_ends(name, ".attn_kv_a_norm.weight")        ||   // Compressed KV RMSNorm
+        offloader_name_ends(name, ".attn_kv_a_norm.weight")        ||   // RMSNorm scale on projected KV activation before RoPE; 1D vector over attention-head width
         offloader_name_ends(name, ".attn_compressor_kv.weight")    ||   // Compressed-attention KV projection
         offloader_name_ends(name, ".attn_compressor_gate.weight")  ||   // Compressed-attention score projection
         offloader_name_ends(name, ".attn_compressor_ape.weight")   ||   // Compressed-attention positional table
@@ -204,21 +204,21 @@ static bool parameter_offloader_deepseek4_weight_supported(const std::string & n
         offloader_name_ends(name, ".hc_ffn_fn.weight")             ||   // Hyperconnection projection before FFN
         offloader_name_ends(name, ".hc_ffn_base.weight")           ||   // HC FFN base stores pre[hc], post[hc], and comb[hc*hc] affine biases.
         offloader_name_ends(name, ".hc_ffn_scale.weight")          ||   // HC FFN scale stores separate pre, post, and comb affine scales.
-        offloader_name_ends(name, ".ffn_norm.weight")              ||   // FFN RMSNorm
-        offloader_name_ends(name, ".ffn_gate_inp.weight")          ||   // Dense MoE router projection
+        offloader_name_ends(name, ".ffn_norm.weight")              ||   // RMSNorm scale before FFN/MoE block; 1D vector over hidden size
+        offloader_name_ends(name, ".ffn_gate_inp.weight")          ||   // Dense MoE router/gating projection: hidden -> expert scores
         offloader_name_ends(name, ".ffn_gate_tid2eid.weight")      ||   // Hash-router token-to-expert table
-        offloader_name_ends(name, ".exp_probs_b.bias")             ||   // MoE expert-probability bias
-        //offloader_name_ends(name, ".ffn_gate_exps.weight")       ||   // SPARSE
-        //offloader_name_ends(name, ".ffn_down_exps.weight")       ||   // SPARSE
-        //offloader_name_ends(name, ".ffn_up_exps.weight")         ||   // SPARSE
-        offloader_name_ends(name, ".ffn_gate_shexp.weight")        ||   // Shared expert gate projection
-        offloader_name_ends(name, ".ffn_up_shexp.weight")          ||   // Shared expert up projection
-        offloader_name_ends(name, ".ffn_down_shexp.weight")        ||   // Shared expert down projection
+        offloader_name_ends(name, ".exp_probs_b.bias")             ||   // MoE expert-score/probability bias; 1D vector over experts
+        //offloader_name_ends(name, ".ffn_gate_exps.weight")       ||   // SPARSE: Routed MoE expert-bank gate matrices; packed per expert
+        //offloader_name_ends(name, ".ffn_down_exps.weight")       ||   // SPARSE: Routed MoE expert-bank down matrices; packed per expert
+        //offloader_name_ends(name, ".ffn_up_exps.weight")         ||   // SPARSE: Routed MoE expert-bank up matrices; packed per expert
+        offloader_name_ends(name, ".ffn_gate_shexp.weight")        ||   // Shared expert FFN gate projection; not routed by top-k
+        offloader_name_ends(name, ".ffn_up_shexp.weight")          ||   // Shared expert FFN up projection; not routed by top-k
+        offloader_name_ends(name, ".ffn_down_shexp.weight")        ||   // Shared expert FFN down projection; not routed by top-k
         name == "output_hc_fn.weight"                              ||   // Final hyperconnection projection
         name == "output_hc_scale.weight"                           ||   // Final hyperconnection scale
         name == "output_hc_base.weight"                            ||   // Final hyperconnection base
-        name == "output_norm.weight"                               ||   // Final RMSNorm
-        name == "output.weight";                                        // LM head
+        name == "output_norm.weight"                               ||   // Final RMSNorm scale before logits
+        name == "output.weight";                                        // LM head / output projection from hidden state to vocabulary logits
 }
 
 //Op filters to speed up graph walking. Each model only checks ops that can directly read one of its enabled dense weights.
