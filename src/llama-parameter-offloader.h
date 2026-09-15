@@ -43,7 +43,7 @@ public:
 
 
     std::unordered_set<ggml_tensor*> cpu_weight_set; // CPU weight ptrs
-    std::unordered_set<ggml_tensor*> gpu_weight_set; // GPU weight ptrs
+    //std::unordered_set<ggml_tensor*> gpu_weight_set; // GPU weight ptrs
 
     void copy_host_to_arena_with_transform(ggml_tensor * src_host, ggml_tensor * dst_arena);
 
@@ -82,6 +82,16 @@ public:
 
         std::vector<size_t> start_offset; // arena start offset for each scheduled GPU tensor
         std::vector<size_t> end_offset;   // arena end offset for each scheduled GPU tensor
+
+        void clear()
+        {
+            ready_after.clear();
+            cpu_tensors_in_order.clear();
+            gpu_tensors_in_order.clear();
+            gpu2index.clear();
+            start_offset.clear();
+            end_offset.clear();
+        }
     };
 
     std::atomic<bool> schedule_swap_requested { false };
@@ -119,6 +129,19 @@ public:
         std::unordered_map<ggml_tensor *, int> next_required_tensor_idx;// Streamed-read graph node -> next newly-required streamed tensor index COPY must reach; -1 means observe/release only.
         std::vector<node_group> node_pairs;                             // Adjacent pairs of nodes (duplicates are collapsed), filtering away static tensors
         bool dense_fits_arena = false;                                  // True when all managed dense tensors for this graph fit in the dense arena simultaneously.
+
+        void clear()
+        {
+            hash = 0;
+            gpu_tensors_in_order.clear();
+            gpu2index.clear();
+            graph_nodes.clear();
+            graph_nodes_tensors.clear();
+            release_node_by_tensor.clear();
+            next_required_tensor_idx.clear();
+            node_pairs.clear();
+            dense_fits_arena = false;
+        }
     };
 
     struct dense_graph_cache_entry
@@ -128,13 +151,6 @@ public:
         std::vector<int> release_node_ordinal_by_tensor;                // For each streamed schedule index, managed-read node ordinal whose completion releases that index; -1 means no release node.
         std::vector<int> next_required_tensor_idx_by_node_ordinal;      // For each managed-read node ordinal, next streamed tensor index required after that node; -2 means not observed and -1 means observe/release only.
         size_t streaming_fit = 0;                                       // Solved streaming arena extent for this cached graph.
-    };
-
-    struct streaming_fit_lifetime_analysis
-    {
-        std::vector<std::vector<int>> managed_node_reads;               // Streamed schedule indices read at each managed streamed read position.
-        std::vector<size_t> tensor_bytes;                               // Device allocation size of each streamed tensor, indexed by streamed schedule index.
-        std::vector<std::vector<int>> resident_tensor_indices;          // Streamed tensors that must coexist at each read position, including prefetch and monotonic-release lifetimes.
     };
 
     dense_graph_analysis graph_analysis_current;  // active graph read/release metadata used by runtime
@@ -171,13 +187,6 @@ public:
 
     // Build current-graph runtime release and next-copy metadata for the finalized streamed schedule.
     void build_graph_runtime_metadata(dense_graph_analysis & analysis, const offloader_schedule & schedule, dense_graph_cache_entry & cache_entry);
-
-    // Build fitter-only streamed lifetimes and resident sets used to derive physical coexistence constraints.
-    void build_streaming_fit_lifetimes(
-        const std::vector<ggml_tensor *> & gpu_tensors_in_order,
-        const std::unordered_map<ggml_tensor *, int> & gpu2index,
-        const dense_graph_analysis & analysis,
-        streaming_fit_lifetime_analysis & fit_analysis) const;
 
     // Find and store a valid no-halt physical placement for every tensor in the finalized streamed schedule.
     size_t generate_streaming_fit(offloader_schedule & schedule, const dense_graph_analysis & analysis);
