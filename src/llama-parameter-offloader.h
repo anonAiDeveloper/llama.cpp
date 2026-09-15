@@ -26,7 +26,7 @@ public:
     // Misc helper functions
     struct parameter_offloader_model_i {
         bool (*weight_supported)(const std::string & name);
-        bool (*node_may_read_dense_weight)(const ggml_tensor * node);
+        void (*configure_dense_read_ops)(bool * dense_read_ops);
     };
 
     size_t get_gpu_aligned_size(ggml_tensor * tensor, size_t alignment);
@@ -58,6 +58,12 @@ public:
     ggml_backend_buffer_t       arena           = nullptr; // offloader CUDA arena buffer
     ggml_context*               ctx_gpu_twins   = nullptr; // no-alloc ctx for duplicated GPU tensors
     bool                        owns_arena      = false;
+    
+    bool dense_read_ops[GGML_OP_COUNT] = {}; // Per-model op lookup configured during init; true when the op can directly read an enabled dense weight.
+    inline bool node_may_read_dense_weight(const ggml_tensor * node) const
+    {
+        return node && dense_read_ops[node->op];
+    }
 
     // Cached placement info
     ggml_backend_buffer_type_t  arena_buffer_type  = nullptr;   // backend type for arena allocation sizing/layout

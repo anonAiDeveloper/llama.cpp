@@ -222,77 +222,53 @@ static bool parameter_offloader_deepseek4_weight_supported(const std::string & n
         name == "output.weight";                                        // LM head / output projection from hidden state to vocabulary logits
 }
 
-//Op filters to speed up graph walking. Each model only checks ops that can directly read one of its enabled dense weights.
-static bool parameter_offloader_deepseek2_node_may_read_dense_weight(const ggml_tensor * node)
+//Op filters to speed up graph walking. Each model configures the ops that can directly read one of its enabled dense weights.
+static void parameter_offloader_deepseek2_node_may_read_dense_weight(bool * dense_read_ops)
 {
-    if (!node)
-        return false;
-
-    switch (node->op) {
-        case GGML_OP_GET_ROWS:       // token_embd.weight;
-        case GGML_OP_MUL:            // attn/output/FFN/Q/KV norm weights; currently disabled
-        case GGML_OP_MUL_MAT:        // Q/KV/attention output, dense/shared FFN, router, and output weights
-        case GGML_OP_ADD:            // exp_probs_b.bias; currently disabled
-        //case GGML_OP_MUL_MAT_ID:   // routed MoE expert banks; sparse and handled separately
-            return true;
-        default:
-            return false;
-    }
+    dense_read_ops[GGML_OP_GET_ROWS] = true;       // token_embd.weight;
+    dense_read_ops[GGML_OP_MUL]      = true;       // attn/output/FFN/Q/KV norm weights; currently disabled
+    dense_read_ops[GGML_OP_MUL_MAT]  = true;       // Q/KV/attention output, dense/shared FFN, router, and output weights
+    dense_read_ops[GGML_OP_ADD]      = true;       // exp_probs_b.bias; currently disabled
+    //dense_read_ops[GGML_OP_MUL_MAT_ID] = true;   // routed MoE expert banks; sparse and handled separately
 }
 
-static bool parameter_offloader_gpt_oss_node_may_read_dense_weight(const ggml_tensor * node)
+static void parameter_offloader_gpt_oss_node_may_read_dense_weight(bool * dense_read_ops)
 {
-    if (!node)
-        return false;
-
-    switch (node->op) {
-        case GGML_OP_GET_ROWS:       // token_embd.weight
-        case GGML_OP_MUL:            // attention/post-attention/output norm weights
-        case GGML_OP_MUL_MAT:        // QKV, attention output, router, and output weights
-        case GGML_OP_ADD:            // QKV, attention-output, and router biases
-        case GGML_OP_SOFT_MAX:       // attn_sinks.weight on the non-flash attention path
-        case GGML_OP_FLASH_ATTN_EXT: // attn_sinks.weight on the flash-attention path
-        //case GGML_OP_MUL_MAT_ID:   // routed expert gate/up/down weights; sparse and handled separately
-        //case GGML_OP_ADD_ID:       // routed expert gate/up/down biases; sparse and handled separately
-            return true;
-        default:
-            return false;
-    }
+    dense_read_ops[GGML_OP_GET_ROWS]       = true; // token_embd.weight
+    dense_read_ops[GGML_OP_MUL]            = true; // attention/post-attention/output norm weights
+    dense_read_ops[GGML_OP_MUL_MAT]        = true; // QKV, attention output, router, and output weights
+    dense_read_ops[GGML_OP_ADD]            = true; // QKV, attention-output, and router biases
+    dense_read_ops[GGML_OP_SOFT_MAX]       = true; // attn_sinks.weight on the non-flash attention path
+    dense_read_ops[GGML_OP_FLASH_ATTN_EXT] = true; // attn_sinks.weight on the flash-attention path
+    //dense_read_ops[GGML_OP_MUL_MAT_ID] = true;   // routed expert gate/up/down weights; sparse and handled separately
+    //dense_read_ops[GGML_OP_ADD_ID] = true;       // routed expert gate/up/down biases; sparse and handled separately
 }
 
-static bool parameter_offloader_deepseek4_node_may_read_dense_weight(const ggml_tensor * node)
+static void parameter_offloader_deepseek4_node_may_read_dense_weight(bool * dense_read_ops)
 {
-    if (!node)
-        return false;
-
-    switch (node->op) {
-        case GGML_OP_GET_ROWS:       // token embedding, compressor/indexer APE, hash-router table
-        case GGML_OP_MUL:            // norm weights and final HC scale
-        case GGML_OP_MUL_MAT:        // HC, attention, compressor/indexer, FFN, router, output
-        case GGML_OP_ADD:            // expert-probability bias and final HC base
-        case GGML_OP_SOFT_MAX:       // attn_sinks on non-flash attention
-        case GGML_OP_FLASH_ATTN_EXT: // attn_sinks on flash attention
-        //case GGML_OP_MUL_MAT_ID:   // routed expert banks; SPARSE
-        case GGML_OP_DSV4_HC_COMB:   // per-layer HC base/scale
-            return true;
-        default:
-            return false;
-    }
+    dense_read_ops[GGML_OP_GET_ROWS]       = true; // token embedding, compressor/indexer APE, hash-router table
+    dense_read_ops[GGML_OP_MUL]            = true; // norm weights and final HC scale
+    dense_read_ops[GGML_OP_MUL_MAT]        = true; // HC, attention, compressor/indexer, FFN, router, output
+    dense_read_ops[GGML_OP_ADD]            = true; // expert-probability bias and final HC base
+    dense_read_ops[GGML_OP_SOFT_MAX]       = true; // attn_sinks on non-flash attention
+    dense_read_ops[GGML_OP_FLASH_ATTN_EXT] = true; // attn_sinks on flash attention
+    //dense_read_ops[GGML_OP_MUL_MAT_ID]   = true; // routed expert banks; SPARSE
+    dense_read_ops[GGML_OP_DSV4_HC_COMB]   = true; // per-layer HC base/scale
 }
 
 static const parameter_offloader::parameter_offloader_model_i parameter_offloader_deepseek2_i = {
     /*weight_supported*/            parameter_offloader_deepseek2_weight_supported,
-    /*node_may_read_dense_weight*/ parameter_offloader_deepseek2_node_may_read_dense_weight,
+    /*configure_dense_read_ops*/    parameter_offloader_deepseek2_node_may_read_dense_weight,
 };
 
 static const parameter_offloader::parameter_offloader_model_i parameter_offloader_gpt_oss_i = {
     /*weight_supported*/            parameter_offloader_gpt_oss_weight_supported,
-    /*node_may_read_dense_weight*/ parameter_offloader_gpt_oss_node_may_read_dense_weight,
+    /*configure_dense_read_ops*/    parameter_offloader_gpt_oss_node_may_read_dense_weight,
 };
 
 static const parameter_offloader::parameter_offloader_model_i parameter_offloader_deepseek4_i = {
     /*weight_supported*/            parameter_offloader_deepseek4_weight_supported,
-    /*node_may_read_dense_weight*/ parameter_offloader_deepseek4_node_may_read_dense_weight,
+    /*configure_dense_read_ops*/    parameter_offloader_deepseek4_node_may_read_dense_weight,
 };
 
 /////////////////////////////////////
@@ -903,6 +879,9 @@ void parameter_offloader::init(ggml_backend_buffer_t arena, llama_context_params
 {
     attach_arena(arena);
 
+    std::fill(dense_read_ops, dense_read_ops + GGML_OP_COUNT, false);
+    model_i->configure_dense_read_ops(dense_read_ops);
+
     GGML_ASSERT(ctx_gpu_twins == nullptr);
     GGML_ASSERT(!cparams.moe_expert_prefetch || ctx_moe_cache != nullptr);
 
@@ -1028,7 +1007,7 @@ void parameter_offloader::stop_streamer_join() {
 // furthest tracked weight used by the node in the active schedule.
 bool parameter_offloader::node_reads_tracked_weight(ggml_tensor * t, int * out_idx = nullptr)
 {
-    if (!model_i->node_may_read_dense_weight(t))
+    if (!node_may_read_dense_weight(t))
         return false;
 
     int best_idx = -1;
@@ -1158,7 +1137,7 @@ bool parameter_offloader::wants_observe(ggml_tensor * node)
     //finite_check_node(node, true);
 #endif
 #endif /* #ifdef LLAMA_CHECK_NODES */
-    if (!model_i->node_may_read_dense_weight(node))
+    if (!node_may_read_dense_weight(node))
         return false;
 
     return graph_analysis_current.next_required_tensor_idx.find(node) != graph_analysis_current.next_required_tensor_idx.end();
@@ -1171,7 +1150,7 @@ bool parameter_offloader::on_eval_tensor(ggml_tensor * node)
         return false;
 
     // Do cheap op-type rejection before consulting precomputed graph metadata.
-    if (!model_i->node_may_read_dense_weight(node))
+    if (!node_may_read_dense_weight(node))
         return false;
 
     // Runtime dependency membership and the next-copy requirement were compiled with the graph, so do not rescan node->src[] after execution.
@@ -1833,7 +1812,7 @@ uint64_t parameter_offloader::hash_dense_graph(ggml_backend_sched_t sched, const
 
     // Hash one managed dense-read node without building graph-analysis state.
     auto hash_node_weights = [&](ggml_tensor * node) {
-        if (!model_i->node_may_read_dense_weight(node))
+        if (!node_may_read_dense_weight(node))
             return false;
 
         ggml_tensor * graph_nodes_tensors[GGML_MAX_SRC];
@@ -1884,8 +1863,6 @@ uint64_t parameter_offloader::hash_dense_graph(ggml_backend_sched_t sched, const
 
         for (size_t i = 0; i < graph_nodes_tensor_count; ++i)
             hash_value((uint64_t)(uintptr_t)graph_nodes_tensors[i]);
-
-        hash_value(UINT64_MAX);
 
         ++graph_node_count;
         return true;
