@@ -42,7 +42,20 @@ static bool parameter_offloader_deepseek2_weight_supported(const std::string & n
         name == "output.weight";                               // LM head / output projection from hidden state to vocabulary logits
 }
 
-//GPT-OSS weights. These all fit within 4GB, and yes thats the 120B parameter model. This leads to odd behavior where copies no longer need to wait on reads.
+static const std::vector<std::string> parameter_offloader_deepseek2_cpu_weight_patterns = {
+    R"(^token_embd\.weight$)",
+    R"(\.ffn_(down|gate|up)_exps\.weight$)",
+};
+
+static const std::vector<std::string> parameter_offloader_deepseek2_gpu_weight_patterns = {
+    R"(\.attn_(norm|q_a|q_a_norm|q_b|k_b|kv_a_mqa|kv_a_norm|v_b|kv_b|output)\.weight$)",
+    R"(\.ffn_(norm|gate|up|down|gate_inp|gate_shexp|up_shexp|down_shexp)\.weight$)",
+    R"(\.exp_probs_b\.bias$)",
+    R"(^output_norm\.weight$)",
+    R"(^output\.weight$)",
+};
+
+//GPT-OSS weights
 static bool parameter_offloader_gpt_oss_weight_supported(const std::string & name)
 {
     return
@@ -77,6 +90,18 @@ static bool parameter_offloader_gpt_oss_weight_supported(const std::string & nam
         //offloader_name_ends(name, ".ffn_up_exps.input_scale")  || // SPARSE: routed expert up input scales
         name == "output.weight";                                      // LM head / output projection from hidden state to vocabulary logits
 }
+
+static const std::vector<std::string> parameter_offloader_gpt_oss_cpu_weight_patterns = {
+    R"(^token_embd\.weight$)",
+    R"(\.ffn_(gate|down|up)_exps\.(weight|bias|scale|input_scale)$)",
+};
+
+static const std::vector<std::string> parameter_offloader_gpt_oss_gpu_weight_patterns = {
+    R"(^output_norm\.weight$)",
+    R"(\.(attn_norm|post_attention_norm|attn_sinks)\.weight$)",
+    R"(\.(attn_qkv|attn_q|attn_k|attn_v|attn_output|ffn_gate_inp)\.(weight|bias)$)",
+    R"(^output\.weight$)",
+};
 
 // DeepSeek V4 weights
 static bool parameter_offloader_deepseek4_weight_supported(const std::string & name)
@@ -125,6 +150,17 @@ static bool parameter_offloader_deepseek4_weight_supported(const std::string & n
         name == "output.weight";                                        // LM head / output projection from hidden state to vocabulary logits
 }
 
+static const std::vector<std::string> parameter_offloader_deepseek4_cpu_weight_patterns = {
+    R"(^token_embd\.weight$)",
+    R"(\.ffn_(gate|down|up)_exps\.weight$)",
+};
+
+static const std::vector<std::string> parameter_offloader_deepseek4_gpu_weight_patterns = {
+    R"(\.(hc_attn_fn|hc_attn_base|hc_attn_scale|attn_norm|attn_sinks|attn_q_a|attn_q_a_norm|attn_q_b|attn_kv|attn_kv_a_norm|attn_compressor_kv|attn_compressor_gate|attn_compressor_ape|attn_compressor_norm|indexer_compressor_kv|indexer_compressor_gate|indexer_compressor_ape|indexer_compressor_norm|indexer\.attn_q_b|indexer\.proj|attn_output_a|attn_output_b|hc_ffn_fn|hc_ffn_base|hc_ffn_scale|ffn_norm|ffn_gate_inp|ffn_gate_tid2eid|ffn_gate_shexp|ffn_up_shexp|ffn_down_shexp)\.weight$)",
+    R"(\.exp_probs_b\.bias$)",
+    R"(^output(_hc_fn|_hc_scale|_hc_base|_norm)?\.weight$)",
+};
+
 //Op filters to speed up graph walking. Each model configures the ops that can directly read one of its enabled dense weights.
 static void parameter_offloader_deepseek2_node_may_read_dense_weight(bool * dense_read_ops)
 {
@@ -160,17 +196,20 @@ static void parameter_offloader_deepseek4_node_may_read_dense_weight(bool * dens
 }
 
 extern parameter_offloader_model_i parameter_offloader_deepseek2_i = {
-    /*weight_supported*/            parameter_offloader_deepseek2_weight_supported,
+    /*cpu_weight_patterns*/         parameter_offloader_deepseek2_cpu_weight_patterns,
+    /*gpu_weight_patterns*/         parameter_offloader_deepseek2_gpu_weight_patterns,
     /*configure_dense_read_ops*/    parameter_offloader_deepseek2_node_may_read_dense_weight,
 };
 
 extern parameter_offloader_model_i parameter_offloader_gpt_oss_i = {
-    /*weight_supported*/            parameter_offloader_gpt_oss_weight_supported,
+    /*cpu_weight_patterns*/         parameter_offloader_gpt_oss_cpu_weight_patterns,
+    /*gpu_weight_patterns*/         parameter_offloader_gpt_oss_gpu_weight_patterns,
     /*configure_dense_read_ops*/    parameter_offloader_gpt_oss_node_may_read_dense_weight,
 };
 
 extern parameter_offloader_model_i parameter_offloader_deepseek4_i = {
-    /*weight_supported*/            parameter_offloader_deepseek4_weight_supported,
+    /*cpu_weight_patterns*/         parameter_offloader_deepseek4_cpu_weight_patterns,
+    /*gpu_weight_patterns*/         parameter_offloader_deepseek4_gpu_weight_patterns,
     /*configure_dense_read_ops*/    parameter_offloader_deepseek4_node_may_read_dense_weight,
 };
 

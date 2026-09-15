@@ -1,10 +1,12 @@
 #pragma once
 
 #include <string>
+#include <vector>
 #include "llama-model.h"
 
 struct parameter_offloader_model_i {
-    bool (*weight_supported)(const std::string & name);
+    std::vector<std::string> cpu_weight_patterns;
+    std::vector<std::string> gpu_weight_patterns;
     void (*configure_dense_read_ops)(bool * dense_read_ops);
 };
 

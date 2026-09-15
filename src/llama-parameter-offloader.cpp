@@ -99,6 +99,16 @@ static inline long long advance_ordinal_to_idx(long long ordinal, int idx, int t
     return ordinal + d;
 }
 
+static inline bool offloader_regex_matches_any(const std::string & name, const std::vector<std::regex> & patterns)
+{
+    for (const std::regex & pattern : patterns) {
+        if (std::regex_search(name, pattern))
+            return true;
+    }
+
+    return false;
+}
+
 /////////////////////////////////////
 //   INITIALIZATION
 /////////////////////////////////////
@@ -151,6 +161,16 @@ void parameter_offloader::seed_all_weights_from_model(const std::vector<std::str
 {
     collected_order.clear();
 
+    std::vector<std::regex> model_cpu_weight_regexes;
+    model_cpu_weight_regexes.reserve(model_i->cpu_weight_patterns.size());
+    for (const std::string & pattern : model_i->cpu_weight_patterns)
+        model_cpu_weight_regexes.emplace_back(pattern);
+
+    std::vector<std::regex> model_gpu_weight_regexes;
+    model_gpu_weight_regexes.reserve(model_i->gpu_weight_patterns.size());
+    for (const std::string & pattern : model_i->gpu_weight_patterns)
+        model_gpu_weight_regexes.emplace_back(pattern);
+
     std::vector<std::regex> cpu_regexes;
     cpu_regexes.reserve(cpu_patterns.size());
     for (const std::string & pattern : cpu_patterns)
@@ -192,14 +212,23 @@ void parameter_offloader::seed_all_weights_from_model(const std::vector<std::str
         if (cpu_weight_set.find(t) == cpu_weight_set.end())
             continue;
 
-        if (cpu_excluded.find(t) != cpu_excluded.end())
+        const bool model_cpu = offloader_regex_matches_any(kv.first, model_cpu_weight_regexes);
+        const bool model_gpu = offloader_regex_matches_any(kv.first, model_gpu_weight_regexes);
+
+        if (model_cpu && model_gpu)
+            throw std::runtime_error("parameter_offloader: weight matches both model CPU and GPU patterns: " + kv.first);
+
+        if (!model_cpu && !model_gpu)
+            throw std::runtime_error("parameter_offloader: weight is not classified by model CPU or GPU patterns: " + kv.first);
+
+        if (model_cpu)
             continue;
 
-        if (!model_i->weight_supported(kv.first))
-        {
-            LLAMA_LOG_INFO("%s: rejecting %s\n", __func__, kv.first.c_str());
+        // User-supplied CPU patterns override a model GPU classification, but are
+        // intentionally applied after model classification so they cannot hide a
+        // missing or overlapping model pattern.
+        if (cpu_excluded.find(t) != cpu_excluded.end())
             continue;
-        }
 
         named.emplace_back(kv.first, t);
     }
