@@ -125,6 +125,9 @@ public:
     {
         std::vector<ggml_tensor *> static_dense_order;                  // Static dense tensor membership/order selected for this cached graph.
         offloader_schedule schedule;                                    // Final streamed tensor order, arena placement, and copy gates for this cached graph.
+        std::vector<int> release_node_ordinal_by_tensor;                // For each streamed schedule index, managed-read node ordinal whose completion releases that index; -1 means no release node.
+        std::vector<int> next_required_tensor_idx_by_node_ordinal;      // For each managed-read node ordinal, next streamed tensor index required after that node; -2 means not observed and -1 means observe/release only.
+        size_t streaming_fit = 0;                                       // Solved streaming arena extent for this cached graph.
     };
 
     struct streaming_fit_lifetime_analysis
@@ -150,8 +153,11 @@ public:
     std::unordered_set<ggml_tensor *> first_graph_dense_set; // Managed dense tensors present in the first observed graph; persistent baseline used to detect graph-dependent tensor membership.
     bool first_graph_created = false;                        // True once first_graph_dense_set has been initialized for this offloader instance.
 
+    // Hash managed dense-weight reads for this graph without building graph-analysis state.
+    uint64_t hash_dense_graph(ggml_backend_sched_t sched, const ggml_cgraph * graph, std::vector<ggml_tensor *> & graph_nodes) const;
+
     // Analyze managed dense-weight reads for this graph and build the graph-specific read structure/hash.
-    uint64_t analyze_dense_graph(ggml_backend_sched_t sched, const ggml_cgraph * graph, dense_graph_analysis & analysis);
+    void analyze_dense_graph(dense_graph_analysis & analysis);
 
     // Calculate the current streamed lower/upper arena-size bounds from graph reads and static membership.
     void streaming_fit_calculate_bounds(dense_graph_analysis & analysis);
@@ -164,7 +170,7 @@ public:
     void build_next_schedule(offloader_schedule & schedule, dense_graph_analysis & analysis);
 
     // Build current-graph runtime release and next-copy metadata for the finalized streamed schedule.
-    void build_graph_runtime_metadata(dense_graph_analysis & analysis, const offloader_schedule & schedule);
+    void build_graph_runtime_metadata(dense_graph_analysis & analysis, const offloader_schedule & schedule, dense_graph_cache_entry & cache_entry);
 
     // Build fitter-only streamed lifetimes and resident sets used to derive physical coexistence constraints.
     void build_streaming_fit_lifetimes(
