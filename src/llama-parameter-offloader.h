@@ -2,6 +2,8 @@
 
 #include "llama-model.h"
 
+#include "llama-parameter-offloader-model.h"
+
 #include "ggml-cuda.h"
 #include "ggml-cuda-arena.h"
 
@@ -24,10 +26,6 @@ struct parameter_offloader
 {
 public:
     // Misc helper functions
-    struct parameter_offloader_model_i {
-        bool (*weight_supported)(const std::string & name);
-        void (*configure_dense_read_ops)(bool * dense_read_ops);
-    };
 
     size_t get_gpu_aligned_size(ggml_tensor * tensor, size_t alignment);
 
