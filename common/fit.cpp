@@ -4,7 +4,9 @@
 
 #include "../src/llama-ext.h"
 #ifndef DISABLE_OFFLOADER
+#include "../src/llama-arch.h"
 #include "../src/llama-parameter-offloader.h"
+#include "gguf.h"
 #endif
 
 #include <array>
@@ -847,6 +849,37 @@ enum common_params_fit_status common_fit_params(
     return status;
 }
 
+
+#ifndef DISABLE_OFFLOADER
+static llm_arch common_parameter_offloader_get_model_arch(const char * path_model) {
+    const gguf_init_params params = {
+        /*.no_alloc = */ true,
+        /*.ctx      = */ nullptr,
+    };
+
+    std::unique_ptr<gguf_context, decltype(&gguf_free)> metadata(
+        gguf_init_from_file(path_model, params), gguf_free);
+
+    if (!metadata)
+        throw std::runtime_error("failed to read model GGUF metadata while selecting parameter-offloader model policy");
+
+    const int64_t key = gguf_find_key(metadata.get(), "general.architecture");
+    if (key < 0)
+        throw std::runtime_error("model GGUF is missing general.architecture");
+
+    if (gguf_get_kv_type(metadata.get(), key) != GGUF_TYPE_STRING)
+        throw std::runtime_error("model GGUF general.architecture is not a string");
+
+    const std::string arch_name = gguf_get_val_str(metadata.get(), key);
+    const llm_arch arch = llm_arch_from_string(arch_name);
+
+    if (arch == LLM_ARCH_UNKNOWN)
+        throw std::runtime_error("unknown model architecture: " + arch_name);
+
+    return arch;
+}
+#endif
+
 enum common_params_fit_status common_fit_parameter_offloader(
         const char * path_model,
         llama_model_params * mparams,
@@ -870,38 +903,48 @@ enum common_params_fit_status common_fit_parameter_offloader(
     try {
         llama_model_params mparams_probe = *mparams;
         llama_context_params cparams_probe = *cparams;
+        const bool moe_expert_prefetch = cparams->moe_expert_prefetch;
 
-        // Probe the GPU-side context/compute footprint with ordinary layers GPU-assigned while applying the requested CPU tensor placement below.
+        // Probe the GPU-side context/compute footprint using the execution placement intended by the parameter offloader.
         mparams_probe.n_gpu_layers = INT32_MAX;
 
-        // Preserve any existing tensor placement overrides in the probe, then add the user-requested CPU tensor patterns and the
-        // parameter-offloader-specific placement for routed MoE expert banks so the probe sees the same CPU-backed tensors as the real model.
         std::vector<llama_model_tensor_buft_override> probe_tensor_buft_overrides;
+        ggml_backend_buffer_type_t cpu_buft = ggml_backend_cpu_buffer_type();
+        ggml_backend_buffer_type_t gpu_buft = ggml_backend_dev_buffer_type(device);
 
-        if (mparams->tensor_buft_overrides) {
-            for (const llama_model_tensor_buft_override * override = mparams->tensor_buft_overrides;
-                 override->pattern != nullptr || override->buft != nullptr;
-                 ++override) {
-                probe_tensor_buft_overrides.push_back(*override);
-            }
-        }
+        if (!gpu_buft)
+            throw std::runtime_error("parameter-offloader device has no default buffer type");
 
+        // --param-offload-cpu is an explicit user override and always wins.
         for (const std::string & pattern : cpu_patterns) {
-            probe_tensor_buft_overrides.push_back({
-                pattern.c_str(),
-                ggml_backend_cpu_buffer_type(),
-            });
+            probe_tensor_buft_overrides.push_back({pattern.c_str(), cpu_buft});
         }
 
-        probe_tensor_buft_overrides.push_back({
-            "blk\\.\\d+\\.ffn_(up|down|gate_up|gate)_(ch|)exps",
-            ggml_backend_cpu_buffer_type(),
-        });
-        probe_tensor_buft_overrides.push_back({nullptr, nullptr});
+        if (moe_expert_prefetch) {
+            // With the MoE cache enabled, fit as though every non-user-excluded model weight is GPU-resident.
+            probe_tensor_buft_overrides.push_back({".*", gpu_buft});
+        } else {
+#ifndef DISABLE_OFFLOADER
+            const llm_arch arch = common_parameter_offloader_get_model_arch(path_model);
+            const parameter_offloader_model_i * model_i = parameter_offloader_get_model_i(arch);
 
+            for (const std::string & pattern : model_i->cpu_weight_patterns) {
+                probe_tensor_buft_overrides.push_back({pattern.c_str(), cpu_buft});
+            }
+
+            for (const std::string & pattern : model_i->gpu_weight_patterns) {
+                probe_tensor_buft_overrides.push_back({pattern.c_str(), gpu_buft});
+            }
+#else
+            throw std::runtime_error("parameter-offloader fit requires parameter offloader support");
+#endif
+        }
+
+        probe_tensor_buft_overrides.push_back({nullptr, nullptr});
         mparams_probe.tensor_buft_overrides = probe_tensor_buft_overrides.data();
 
-        // The MoE cache is carved out of the final arena, which does not exist yet during this probe.
+        // The arena does not exist yet, so do not instantiate the MoE cache during the sizing probe.
+        // The requested prefetch mode has already been reflected in tensor placement above.
         cparams_probe.moe_expert_prefetch = false;
 
         //TODO: Generalize this probe together with parameter_offloader before supporting multiple accelerator devices; the current arena targets one CUDA device.

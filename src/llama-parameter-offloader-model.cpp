@@ -213,20 +213,24 @@ extern parameter_offloader_model_i parameter_offloader_deepseek4_i = {
     /*configure_dense_read_ops*/    parameter_offloader_deepseek4_node_may_read_dense_weight,
 };
 
-parameter_offloader_model_i * parameter_offloader_get_model_i(llama_model  * model)
+parameter_offloader_model_i * parameter_offloader_get_model_i(llm_arch arch)
 {
-    switch (model->arch)
-    {
+    switch (arch) {
         case LLM_ARCH_DEEPSEEK2:
             return &parameter_offloader_deepseek2_i;
-            break;
+
         case LLM_ARCH_OPENAI_MOE:
             return &parameter_offloader_gpt_oss_i;
-            break;
+
         case LLM_ARCH_DEEPSEEK4:
             return &parameter_offloader_deepseek4_i;
-            break;
+
         default:
-            throw std::runtime_error("parameter_offloader: unsupported model architecture");
+            throw std::runtime_error(
+                "parameter_offloader: unsupported model architecture");
     }
+}
+parameter_offloader_model_i * parameter_offloader_get_model_i(llama_model * model)
+{
+    return parameter_offloader_get_model_i(model->arch);
 }

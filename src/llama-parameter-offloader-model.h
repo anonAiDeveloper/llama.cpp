@@ -14,4 +14,5 @@ extern parameter_offloader_model_i parameter_offloader_deepseek2_i;
 extern parameter_offloader_model_i parameter_offloader_gpt_oss_i;
 extern parameter_offloader_model_i parameter_offloader_deepseek4_i;
 
-parameter_offloader_model_i * parameter_offloader_get_model_i(llama_model  * model);
+parameter_offloader_model_i * parameter_offloader_get_model_i(llm_arch arch);
+parameter_offloader_model_i * parameter_offloader_get_model_i(llama_model * model);
