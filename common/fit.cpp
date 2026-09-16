@@ -3,17 +3,18 @@
 #include "log.h"
 
 #include "../src/llama-ext.h"
-#ifndef DISABLE_OFFLOADER
+#include "../src/llama-context.h"
+#include "../src/llama-memory.h"
 #include "../src/llama-arch.h"
 #include "../src/llama-parameter-offloader.h"
 #include "gguf.h"
-#endif
 
 #include <array>
 #include <cassert>
 #include <stdexcept>
 #include <cinttypes>
 #include <memory>
+#include <map>
 #include <set>
 #include <string>
 #include <vector>
@@ -32,6 +33,94 @@ class common_params_fit_exception : public std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+static std::map<ggml_backend_buffer_type_t, size_t> common_probe_compute_buffers(llama_context * ctx) {
+    if (!ctx)
+        throw std::runtime_error("compute buffer probe received a null context");
+
+    ggml_backend_sched_t sched = ctx->get_sched();
+    if (!sched)
+        throw std::runtime_error("compute buffer probe received a context without a scheduler");
+
+    const int n_backends = ggml_backend_sched_get_n_backends(sched);
+    if (n_backends <= 0)
+        throw std::runtime_error("compute buffer probe found no scheduler backends");
+
+    llama_memory_context_ptr mctx;
+    if (llama_memory_t memory = ctx->get_memory()) {
+        mctx = memory->init_full();
+        if (!mctx)
+            throw std::runtime_error("compute buffer probe failed to initialize the full memory context");
+    }
+
+    const llama_cparams & cparams = ctx->get_cparams();
+    const uint32_t n_tokens_max = std::min(cparams.n_ctx, cparams.n_ubatch);
+    if (n_tokens_max == 0)
+        throw std::runtime_error("compute buffer probe has no valid ubatch token count");
+
+    const uint32_t n_seqs_max = cparams.n_seq_max;
+    if (n_seqs_max == 0)
+        throw std::runtime_error("compute buffer probe has no valid sequence count");
+
+    std::vector<size_t> max_sizes((size_t)n_backends, 0);
+    std::vector<size_t> sizes((size_t)n_backends, 0);
+    size_t probe_count = 0;
+
+    auto probe = [&](uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs) {
+        std::fill(sizes.begin(), sizes.end(), 0);
+
+        if (!ctx->graph_reserve(n_tokens, n_seqs, n_outputs, mctx.get(), true, sizes.data()))
+            throw std::runtime_error("compute buffer probe failed to reserve a graph shape");
+
+        for (int i = 0; i < n_backends; ++i)
+            max_sizes[(size_t)i] = std::max(max_sizes[(size_t)i], sizes[(size_t)i]);
+
+        ++probe_count;
+    };
+
+    for (uint32_t n_seqs = 1; n_seqs <= n_seqs_max; ++n_seqs) {
+        // graph_reserve() rounds n_tokens up to a multiple of n_seqs. Enumerate
+        // those rounded equal-sequence widths, including the final width which can
+        // exceed n_tokens_max by up to n_seqs - 1. This also covers TG with more
+        // active sequences than n_ubatch (one token per sequence).
+        const uint32_t n_seq_tokens_max = 1 + (n_tokens_max - 1) / n_seqs;
+
+        for (uint32_t n_seq_tokens = 1; n_seq_tokens <= n_seq_tokens_max; ++n_seq_tokens) {
+            const uint32_t n_tokens = n_seq_tokens * n_seqs;
+
+            // One output per sequence is the TG-style reserve shape used by
+            // llama_context::sched_reserve(). The maximum-output PP shape is
+            // bounded by the configured logical ubatch width rather than any
+            // token padding introduced solely to make the reserve batch equal.
+            const uint32_t n_outputs_tg = n_seqs;
+            const uint32_t n_outputs_pp = std::min(std::min(n_tokens, n_tokens_max), cparams.n_outputs_max);
+
+            probe(n_tokens, n_seqs, n_outputs_tg);
+            if (n_outputs_pp != n_outputs_tg)
+                probe(n_tokens, n_seqs, n_outputs_pp);
+        }
+    }
+
+    std::map<ggml_backend_buffer_type_t, size_t> result;
+    for (int i = 0; i < n_backends; ++i) {
+        ggml_backend_t backend = ggml_backend_sched_get_backend(sched, i);
+        if (!backend)
+            continue;
+
+        ggml_backend_buffer_type_t buft = ggml_backend_sched_get_buffer_type(sched, backend);
+        if (!buft)
+            continue;
+
+        result[buft] += max_sizes[(size_t)i];
+    }
+
+    LOG_TRC("%s: measured %zu graph shapes for worst-case compute buffers\n", __func__, probe_count);
+    for (const auto & [buft, size] : result) {
+        LOG_TRC("%s: %s worst-case compute buffer = %.2f MiB\n", __func__, ggml_backend_buft_name(buft), size / 1024.0 / 1024.0);
+    }
+
+    return result;
+}
+
 static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         const char * path_model,
         const llama_model_params * mparams,
@@ -41,7 +130,8 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         uint32_t & hp_ngl,
         uint32_t & hp_n_ctx_train,
         uint32_t & hp_n_expert,
-        ggml_log_level log_level) {
+        ggml_log_level log_level,
+        bool probe_compute_buffers = false) {
     struct user_data_t {
         struct {
             ggml_log_callback callback;
@@ -69,7 +159,6 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         throw std::runtime_error("failed to load model");
     }
 
-#ifndef DISABLE_OFFLOADER
     std::unique_ptr<parameter_offloader> fit_offloader;
 
     if (cparams->moe_expert_prefetch) {
@@ -84,19 +173,10 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
             param_offloader_arena,
             parameter_offloader::MOE_CACHE_SLOT_COUNT);
     }
-#else
-    if (cparams->moe_expert_prefetch) {
-        llama_model_free(model);
-        llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
-        throw std::runtime_error("MoE expert prefetch requires parameter offloader support");
-    }
-#endif
 
     llama_context * ctx = llama_init_from_model(model, *cparams);
     if (ctx == nullptr) {
-#ifndef DISABLE_OFFLOADER
         fit_offloader.reset();
-#endif
         llama_model_free(model);
         llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
         throw std::runtime_error("failed to create llama_context from model");
@@ -106,6 +186,20 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     std::vector<llama_device_memory_data> ret(nd + 1);
 
     llama_memory_breakdown memory_breakdown = llama_get_memory_breakdown(ctx);
+
+    if (probe_compute_buffers) {
+        try {
+            const auto compute_max = common_probe_compute_buffers(ctx);
+            for (const auto & [buft, size] : compute_max)
+                memory_breakdown[buft].compute = std::max(memory_breakdown[buft].compute, size);
+        } catch (...) {
+            llama_free(ctx);
+            fit_offloader.reset();
+            llama_model_free(model);
+            llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
+            throw;
+        }
+    }
 
     for (const auto & [buft, mb] : memory_breakdown) {
         if (ggml_backend_buft_is_host(buft)) {
@@ -176,9 +270,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     common_memory_breakdown_print(ctx);
 
     llama_free(ctx);
-#ifndef DISABLE_OFFLOADER
     fit_offloader.reset();
-#endif
     llama_model_free(model);
     llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
 
@@ -850,7 +942,6 @@ enum common_params_fit_status common_fit_params(
 }
 
 
-#ifndef DISABLE_OFFLOADER
 static llm_arch common_parameter_offloader_get_model_arch(const char * path_model) {
     const gguf_init_params params = {
         /*.no_alloc = */ true,
@@ -878,7 +969,6 @@ static llm_arch common_parameter_offloader_get_model_arch(const char * path_mode
 
     return arch;
 }
-#endif
 
 enum common_params_fit_status common_fit_parameter_offloader(
         const char * path_model,
@@ -924,7 +1014,6 @@ enum common_params_fit_status common_fit_parameter_offloader(
             // With the MoE cache enabled, fit as though every non-user-excluded model weight is GPU-resident.
             probe_tensor_buft_overrides.push_back({".*", gpu_buft});
         } else {
-#ifndef DISABLE_OFFLOADER
             const llm_arch arch = common_parameter_offloader_get_model_arch(path_model);
             const parameter_offloader_model_i * model_i = parameter_offloader_get_model_i(arch);
 
@@ -935,9 +1024,6 @@ enum common_params_fit_status common_fit_parameter_offloader(
             for (const std::string & pattern : model_i->gpu_weight_patterns) {
                 probe_tensor_buft_overrides.push_back({pattern.c_str(), gpu_buft});
             }
-#else
-            throw std::runtime_error("parameter-offloader fit requires parameter offloader support");
-#endif
         }
 
         probe_tensor_buft_overrides.push_back({nullptr, nullptr});
@@ -954,7 +1040,7 @@ enum common_params_fit_status common_fit_parameter_offloader(
         uint32_t hp_n_expert = 0;
 
         const std::vector<llama_device_memory_data> dmds = common_get_device_memory_data_impl(
-            path_model, &mparams_probe, &cparams_probe, nullptr, devs, hp_ngl, hp_n_ctx_train, hp_n_expert, log_level);
+            path_model, &mparams_probe, &cparams_probe, nullptr, devs, hp_ngl, hp_n_ctx_train, hp_n_expert, log_level, true);
 
         size_t device_id = devs.size();
 
@@ -970,9 +1056,11 @@ enum common_params_fit_status common_fit_parameter_offloader(
 
         const llama_device_memory_data & dmd = dmds[device_id];
 
-        // TODO: Runtime compute buffers can grow beyond the size projected during context initialization.
-        // Remove this 50% allowance if upstream fixes ggml-org/llama.cpp issue #22601.
-        const int64_t projected_compute = (int64_t)dmd.mb.compute * 3 / 2;
+        // The parameter-offloader probe measures additional runtime ubatch graph shapes with
+        // ggml_backend_sched_reserve_size(), so dmd.mb.compute already reflects the largest
+        // compute reservation observed by the shape probe. Keep the user margin as the
+        // remaining headroom instead of applying a blanket percentage multiplier.
+        const int64_t projected_compute = (int64_t)dmd.mb.compute;
         const int64_t projected_non_model = (int64_t)dmd.mb.context + projected_compute;
         const int64_t available = dmd.free - projected_non_model - (int64_t)margin;
 
