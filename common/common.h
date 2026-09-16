@@ -469,6 +469,9 @@ struct common_params {
 
     // offload params
     std::vector<ggml_backend_dev_t> devices; // devices to use for offloading
+    bool param_offload = false; // enable the parameter offloader
+    bool param_offload_fit = true; // automatically fit the parameter-offloader arena to available VRAM
+    size_t param_offload_vram = 0; // fixed parameter-offloader arena size when param_offload_fit is false
     std::vector<std::string> param_offload_cpu; // tensor-name regexes to keep on CPU instead of managing with the parameter offloader
     size_t param_offload_vram_margin = 256ull * 1024ull * 1024ull; // VRAM reserved outside the parameter-offloader arena
 

@@ -31,6 +31,7 @@
 #include <filesystem>
 #include <fstream>
 #include <list>
+#include <limits>
 #include <regex>
 #include <set>
 #include <string>
@@ -808,6 +809,34 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         if (has_arg({"-lm", "--load-mode"}) &&
             has_arg({"--mlock", "--mmap", "--no-mmap", "-dio", "--direct-io", "-ndio", "--no-direct-io"})) {
             LOG_WRN("DEPRECATED: `--load-mode` and `--mlock`/`--mmap`/`--direct-io` should not be combined; only the last flag on the command line will take effect\n");
+        }
+
+        auto has_arg_or_env = [&](std::initializer_list<const char *> names) {
+            if (has_arg(names)) {
+                return true;
+            }
+
+            return std::any_of(ctx_arg.options.begin(), ctx_arg.options.end(), [&](const common_arg & opt) {
+                const bool matches = std::any_of(names.begin(), names.end(), [&](const char * name) {
+                    return std::find(opt.args.begin(), opt.args.end(), std::string(name)) != opt.args.end() ||
+                           std::find(opt.args_neg.begin(), opt.args_neg.end(), std::string(name)) != opt.args_neg.end();
+                });
+                return matches && opt.has_value_from_env();
+            });
+        };
+
+        const bool param_offload_fixed_vram = has_arg({"--param-offload-vram"});
+        const bool param_offload_cpu = has_arg({"--param-offload-cpu"});
+        const bool param_offload_margin = has_arg({"--param-offload-vram-margin"});
+        const bool param_offload_moe_prefetch = has_arg_or_env({"--moe-expert-prefetch", "--no-moe-expert-prefetch"});
+
+        if (!params.param_offload &&
+            (param_offload_fixed_vram || param_offload_cpu || param_offload_margin || param_offload_moe_prefetch)) {
+            throw std::invalid_argument("parameter-offloader options require --param-offload");
+        }
+
+        if (param_offload_fixed_vram && param_offload_margin) {
+            throw std::invalid_argument("--param-offload-vram conflicts with --param-offload-vram-margin");
         }
     };
 
@@ -2631,6 +2660,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             parse_tensor_buffer_overrides(value, params.tensor_buft_overrides);
         }
     ).set_env("LLAMA_ARG_OVERRIDE_TENSOR"));
+    add_opt(common_arg(
+        {"--param-offload"},
+        "enable the parameter offloader (default: disabled)",
+        [](common_params & params) {
+            params.param_offload = true;
+        }
+    ));
+    add_opt(common_arg(
+        {"--param-offload-vram"}, "MIB",
+        "disable automatic parameter-offloader VRAM fitting and allocate exactly MIB MiB for the parameter-offloader arena",
+        [](common_params & params, const std::string & value) {
+            constexpr size_t MiB = 1024ull * 1024ull;
+            const unsigned long long mib = std::stoull(value);
+            if (mib == 0 || mib > std::numeric_limits<size_t>::max() / MiB) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.param_offload_fit = false;
+            params.param_offload_vram = (size_t)mib * MiB;
+        }
+    ));
     add_opt(common_arg(
         {"--param-offload-cpu"}, "REGEX",
         "keep tensors matching REGEX on CPU instead of managing them with the parameter offloader; may be specified multiple times",

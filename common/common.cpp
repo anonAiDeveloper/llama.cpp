@@ -72,14 +72,12 @@
 #define PARAMETER_OFFLOADER_VRAM_MAX_MIB 0
 #endif
 
-#ifndef DISABLE_OFFLOADER
 // parameter_offloader keeps canonical model weights in host memory. Managed
 // tensors are exposed to the graph through GPU twins backed by the arena.
 static const llama_model_tensor_buft_override parameter_offloader_source_weight_overrides[] = {
     {".*", ggml_backend_cpu_buffer_type()},
     {nullptr, nullptr},
 };
-#endif
 
 common_time_meas::common_time_meas(int64_t & t_acc, bool disable) : t_start_us(disable ? -1 : ggml_time_us()), t_acc(t_acc) {}
 
@@ -1249,19 +1247,24 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
-    bool parameter_offloader_fit_active = false;
+    bool parameter_offloader_active = false;
 
-#ifndef DISABLE_OFFLOADER
-    if (!model_only) {
+    if (!model_only && params.param_offload) {
         //TODO: Today this only supports CUDA. Given how simple ggml-cuda-arena.cu is I dont think it'd be too hard to support other types of device?
         ggml_backend_dev_t cuda_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
 
-        if (cuda_dev) {
-            const size_t MiB = 1024ull * 1024ull;
+        if (!cuda_dev) {
+            COM_ERR("%s", "parameter offloader requires a GPU device\n");
+            return;
+        }
+
+        const size_t MiB = 1024ull * 1024ull;
+        size_t arena_bytes = 0;
+
+        if (params.param_offload_fit) {
             //TODO: Replace the single margin with separate runtime headroom and measured maximum temporary device-packing scratch.
             const size_t margin = params.param_offload_vram_margin;
             const size_t max_arena_size = PARAMETER_OFFLOADER_VRAM_MAX_MIB == 0 ? 0 : (size_t)PARAMETER_OFFLOADER_VRAM_MAX_MIB * MiB;
-            size_t arena_bytes = 0;
 
             COM_TRC("%s", "fitting parameter-offloader arena to device memory ...\n");
 
@@ -1278,27 +1281,29 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
             if (fit_status != COMMON_PARAMS_FIT_STATUS_SUCCESS)
                 return;
-
-            pimpl->param_offloader_arena = ggml_cuda_arena_create_on(cuda_dev, arena_bytes, 0);
-
-            if (!pimpl->param_offloader_arena) {
-                COM_ERR("%s: failed to allocate %zu MiB parameter-offloader arena\n", __func__, arena_bytes / MiB);
-                return;
-            }
-
-            parameter_offloader_fit_active = true;
-            COM_INF("%s: parameter-offloader arena = %zu MiB; reserved free VRAM = %zu MiB\n", __func__, arena_bytes / MiB, margin / MiB);
+        } else {
+            arena_bytes = params.param_offload_vram;
         }
 
-        if (!pimpl->param_offloader_arena && cparams.moe_expert_prefetch) {
-            COM_ERR("%s: MoE expert prefetch requires a parameter offloader arena\n", __func__);
+        pimpl->param_offloader_arena = ggml_cuda_arena_create_on(cuda_dev, arena_bytes, 0);
+
+        if (!pimpl->param_offloader_arena) {
+            COM_ERR("%s: failed to allocate %zu MiB parameter-offloader arena\n", __func__, arena_bytes / MiB);
             return;
         }
-    }
-#endif
 
-    //TODO: When parameter_offloader_fit_active is true, reuse only the stock context-size reduction stage instead of bypassing --fit entirely.
-    if (params.fit_params && !parameter_offloader_fit_active) {
+        parameter_offloader_active = true;
+
+        if (params.param_offload_fit) {
+            COM_INF("%s: parameter-offloader arena = %zu MiB; reserved free VRAM = %zu MiB\n",
+                __func__, arena_bytes / MiB, params.param_offload_vram_margin / MiB);
+        } else {
+            COM_INF("%s: parameter-offloader arena = %zu MiB (fixed)\n", __func__, arena_bytes / MiB);
+        }
+    }
+
+    //TODO: When parameter_offloader_active is true, reuse only the stock context-size reduction stage instead of bypassing --fit entirely.
+    if (params.fit_params && !parameter_offloader_active) {
         COM_TRC("%s", "fitting params to device memory ...\n");
         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
         common_fit_params(params.model.path.c_str(), &mparams, &cparams,
@@ -1310,8 +1315,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
     }
 
-#ifndef DISABLE_OFFLOADER
-    if (parameter_offloader_fit_active) {
+    if (parameter_offloader_active) {
         // The parameter offloader does not use the canonical model buffer for
         // GPU transfers:
         //
@@ -1341,7 +1345,6 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         mparams.n_gpu_layers = INT32_MAX;
         mparams.tensor_buft_overrides = parameter_offloader_source_weight_overrides;
     }
-#endif
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
     if (model == NULL) {
@@ -1422,26 +1425,26 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         cparams.n_samplers = pimpl->samplers_seq_config.size();
     }
 
-#ifndef DISABLE_OFFLOADER
-    pimpl->param_offloader.reset(new parameter_offloader(model));
+    if (parameter_offloader_active) {
+        pimpl->param_offloader.reset(new parameter_offloader(model));
 
-    if (cparams.moe_expert_prefetch) {
-        pimpl->param_offloader->init_moe_cache(
-            pimpl->param_offloader_arena,
-            parameter_offloader::MOE_CACHE_SLOT_COUNT);
+        if (cparams.moe_expert_prefetch) {
+            pimpl->param_offloader->init_moe_cache(
+                pimpl->param_offloader_arena,
+                parameter_offloader::MOE_CACHE_SLOT_COUNT);
+        }
+
+        init_parameter_offloader(params);
+
+        cparams.cb_eval = llama_offloader_eval_cb;
+        cparams.cb_eval_user_data = pimpl->param_offloader.get();
+
+        cparams.cb_graph = llama_offloader_graph_cb;
+        cparams.cb_graph_user_data = pimpl->param_offloader.get();
+
+        cparams.cb_moe_residency = llama_offloader_moe_residency_cb;
+        cparams.cb_moe_residency_user_data = pimpl->param_offloader.get();
     }
-
-    init_parameter_offloader(params);
-
-    cparams.cb_eval = llama_offloader_eval_cb;
-    cparams.cb_eval_user_data = pimpl->param_offloader.get();
-
-    cparams.cb_graph = llama_offloader_graph_cb;
-    cparams.cb_graph_user_data = pimpl->param_offloader.get();
-
-    cparams.cb_moe_residency = llama_offloader_moe_residency_cb;
-    cparams.cb_moe_residency_user_data = pimpl->param_offloader.get();
-#endif
     
     llama_context * lctx = llama_init_from_model(model, cparams);
     if (lctx == NULL) {
@@ -1451,7 +1454,9 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
     pimpl->context.reset(lctx);
 
-    pimpl->param_offloader->start();
+    if (parameter_offloader_active) {
+        pimpl->param_offloader->start();
+    }
 }
 
 llama_model * common_init_result::model() {
@@ -1480,7 +1485,6 @@ std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
 }
 
 void common_init_result::init_parameter_offloader(common_params & params) {
-#ifndef DISABLE_OFFLOADER
     if (!pimpl->param_offloader) {
         return;
     }
@@ -1503,10 +1507,6 @@ void common_init_result::init_parameter_offloader(common_params & params) {
 
     pimpl->param_offloader->init(arena, cparams, ggml_init(twins), params.param_offload_cpu);
     pimpl->param_offloader_arena = nullptr;
-
-#else
-    (void) params;
-#endif
 }
 
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
