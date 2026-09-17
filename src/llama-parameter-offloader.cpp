@@ -3480,7 +3480,7 @@ bool llama_offloader_graph_cb(ggml_backend_sched_t sched, struct ggml_cgraph * g
         return true;
 
     //If we managed to fit every tensor then there is no more work to do, tensors will always fit, no need to check the graph again
-    if (po->schedule_current.gpu_tensors_in_order.empty() && po->static_dense_order_current.size() == po->gpu_weight_set.size())
+    if (po->schedule_current.gpu_tensors_in_order.empty() && po->static_dense_order_current.size() == po->gpu2cpu.size())
         return true;
 
 #ifdef LLAMA_PRINT_WEIGHT_READS
