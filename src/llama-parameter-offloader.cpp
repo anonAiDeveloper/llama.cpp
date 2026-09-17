@@ -2229,7 +2229,7 @@ size_t parameter_offloader::generate_streaming_fit(offloader_schedule & schedule
     const int node_groups_total = analysis.node_pairs.size();
     const int tensor_count = schedule.gpu_tensors_in_order.size();
 
-    //Identify priority node groups, they are the ones tied for largest size
+    //The largest node-pair defines the minimum possible streaming fit size.
     size_t largest_size = 0;
     for (int i = 0; i < node_groups_total; ++i)
         largest_size = std::max(largest_size, analysis.node_pairs[i].bytes);
@@ -2247,9 +2247,8 @@ size_t parameter_offloader::generate_streaming_fit(offloader_schedule & schedule
     enum fit_place_mode
     {
         FIT_PLACE_NONE,
-        FIT_PLACE_LEFT_ANCHOR,
-        FIT_PLACE_RIGHT_ANCHOR,
-        FIT_PLACE_LARGEST,
+        FIT_PLACE_ANCHORED,
+        FIT_PLACE_LARGE,
         FIT_PLACE_LEFT,
         FIT_PLACE_RIGHT,
     };
@@ -2259,6 +2258,14 @@ size_t parameter_offloader::generate_streaming_fit(offloader_schedule & schedule
         int tensor_idx = -1;
         bool tensor_end = false;
         bool arena_end = false;
+    };
+
+    struct fit_tensor_span
+    {
+        int begin = 0;
+        int end = 0;
+        int left_anchor_idx = -1;
+        int right_anchor_idx = -1;
     };
 
     struct fit_graph_node
@@ -2272,17 +2279,19 @@ size_t parameter_offloader::generate_streaming_fit(offloader_schedule & schedule
 
         fit_place_mode place_mode = FIT_PLACE_NONE;
 
-        int largest_anchor_idx = -1;
-
         std::vector<int> target_tensors;
         std::vector<int> unplaced_tensors;
+        std::vector<fit_tensor_span> anchored_spans;
 
         //These are already filtered for subtree membership and up, and stored in traversal order.
         std::vector<size_t> left_bytes;
         std::vector<size_t> right_bytes;
 
-        //Canonical, unrotated offsets for an unanchored largest node-pair.
+        //Canonical zero-slack offsets for an unanchored LARGE node-pair. Runtime adds the current slack to wrapped rotations.
         std::vector<size_t> lnp_offsets;
+
+        size_t target_bytes = 0;
+        size_t largest_tensor_bytes = 0;
 
         //Nodes whose complete recursive subtree finishes when this node succeeds.
         std::vector<int> completed_nodes;
@@ -2292,8 +2301,9 @@ size_t parameter_offloader::generate_streaming_fit(offloader_schedule & schedule
         size_t active_candidate_idx = 0;
         size_t rollback_pos = 0;
 
-        size_t preferred_lnp_offset_idx = 0;
-        bool preferred_lnp_offset_valid = false;
+        size_t preferred_large_offset_idx = 0;
+        bool preferred_large_offset_valid = false;
+        bool active_large_candidate = false;
     };
 
     std::vector<size_t> fit_tensor_sizes(tensor_count);
@@ -2361,43 +2371,51 @@ size_t parameter_offloader::generate_streaming_fit(offloader_schedule & schedule
             if (right_tensors[i] && !up[i])
                 fit_graph[fit_node_idx].right_bytes.push_back(fit_tensor_sizes[i]);
 
-        int last_placed_target = -1;
-        for (int tensor_idx : fit_graph[fit_node_idx].target_tensors)
+        fit_graph[fit_node_idx].target_bytes = target.bytes;
+
+        int span_begin = 0;
+        int left_anchor_idx = -1;
+        bool has_anchor = false;
+
+        for (int i = 0; i < (int)fit_graph[fit_node_idx].target_tensors.size(); ++i)
         {
+            int tensor_idx = fit_graph[fit_node_idx].target_tensors[i];
+            fit_graph[fit_node_idx].largest_tensor_bytes = std::max(fit_graph[fit_node_idx].largest_tensor_bytes, fit_tensor_sizes[tensor_idx]);
+
             if (prep_placed[tensor_idx])
-                last_placed_target = tensor_idx;
+            {
+                has_anchor = true;
+
+                if (span_begin < i)
+                    fit_graph[fit_node_idx].anchored_spans.push_back({ span_begin, i, left_anchor_idx, tensor_idx });
+
+                left_anchor_idx = tensor_idx;
+                span_begin = i + 1;
+            }
             else
                 fit_graph[fit_node_idx].unplaced_tensors.push_back(tensor_idx);
         }
 
-        //Shared tensors anchor this target to an existing placement; otherwise largest groups rotate while normal groups begin against the preferred valley wall.
+        if (has_anchor && span_begin < (int)fit_graph[fit_node_idx].target_tensors.size())
+            fit_graph[fit_node_idx].anchored_spans.push_back({ span_begin, (int)fit_graph[fit_node_idx].target_tensors.size(), left_anchor_idx, -1 });
+
+        //Placement membership is fixed by graph construction. Shared tensors divide the target into anchored spans; otherwise begin against the preferred valley wall.
         if (fit_graph[fit_node_idx].unplaced_tensors.empty())
             fit_graph[fit_node_idx].place_mode = FIT_PLACE_NONE;
-        else if (prep_placed[fit_graph[fit_node_idx].target_tensors.front()])
-            fit_graph[fit_node_idx].place_mode = FIT_PLACE_LEFT_ANCHOR;
-        else if (prep_placed[fit_graph[fit_node_idx].target_tensors.back()])
-            fit_graph[fit_node_idx].place_mode = FIT_PLACE_RIGHT_ANCHOR;
-        else if (target.bytes == largest_size)
-            fit_graph[fit_node_idx].place_mode = FIT_PLACE_LARGEST;
+        else if (has_anchor)
+            fit_graph[fit_node_idx].place_mode = FIT_PLACE_ANCHORED;
         else
             fit_graph[fit_node_idx].place_mode = left_first ? FIT_PLACE_LEFT : FIT_PLACE_RIGHT;
 
-        if (target.bytes == largest_size)
+        //A node-pair is LARGE when its arena slack is smaller than its largest tensor. Since fit_size only grows, only targets LARGE at the minimum fit can ever need rotations.
+        if (!has_anchor && largest_size - target.bytes < fit_graph[fit_node_idx].largest_tensor_bytes)
         {
-            if (last_placed_target < 0)
+            size_t offset = 0;
+            for (auto it = fit_graph[fit_node_idx].target_tensors.rbegin(); it != fit_graph[fit_node_idx].target_tensors.rend(); ++it)
             {
-                //Every tensor boundary is a legal rotation of an unanchored largest node-pair.
-                size_t offset = 0;
-                for (auto it = fit_graph[fit_node_idx].target_tensors.rbegin(); it != fit_graph[fit_node_idx].target_tensors.rend(); ++it)
-                {
-                    fit_graph[fit_node_idx].lnp_offsets.push_back(offset);
-                    offset += fit_tensor_sizes[*it];
-                }
-
-                fit_graph[fit_node_idx].candidate_count = fit_graph[fit_node_idx].lnp_offsets.size();
+                fit_graph[fit_node_idx].lnp_offsets.push_back(offset);
+                offset += fit_tensor_sizes[*it];
             }
-            else
-                fit_graph[fit_node_idx].largest_anchor_idx = last_placed_target;
         }
 
         //Simulate placement membership only; deterministic traversal makes this independent of the actual runtime offsets.
@@ -2483,11 +2501,13 @@ size_t parameter_offloader::generate_streaming_fit(offloader_schedule & schedule
         fit_offsets[tensor_idx] = left_bound;
         placement_log.push_back(tensor_idx);
 
-    #if LLAMA_DIAGNOSE_FIT > 1
+    #if LLAMA_DIAGNOSE_FIT
         ggml_tensor * tensor = schedule.gpu_tensors_in_order[tensor_idx];
         debug_tensor_offsets[tensor] = left_bound;
+    #if LLAMA_DIAGNOSE_FIT > 1
         const char * name = ggml_get_name(tensor);
         LLAMA_LOG_INFO("%s: fit %-39s %5d %10zu %10zu\n", __func__, name ? name : "(unnamed)", tensor_idx, left_bound, left_bound + tensor_aligned_size);
+    #endif
     #endif
 
         return left_bound + tensor_aligned_size;
@@ -2505,11 +2525,13 @@ size_t parameter_offloader::generate_streaming_fit(offloader_schedule & schedule
         fit_offsets[tensor_idx] = right_bound;
         placement_log.push_back(tensor_idx);
 
-    #if LLAMA_DIAGNOSE_FIT > 1
+    #if LLAMA_DIAGNOSE_FIT
         ggml_tensor * tensor = schedule.gpu_tensors_in_order[tensor_idx];
         debug_tensor_offsets[tensor] = right_bound;
+    #if LLAMA_DIAGNOSE_FIT > 1
         const char * name = ggml_get_name(tensor);
         LLAMA_LOG_INFO("%s: fit %-39s %5d %10zu %10zu\n", __func__, name ? name : "(unnamed)", tensor_idx, right_bound, right_bound + tensor_aligned_size);
+    #endif
     #endif
 
         return right_bound;
@@ -2529,9 +2551,11 @@ size_t parameter_offloader::generate_streaming_fit(offloader_schedule & schedule
 
         for (fit_graph_node & node : fit_graph)
         {
+            node.candidate_count = 1;
             node.candidate_try = 0;
             node.active_candidate_idx = 0;
             node.rollback_pos = 0;
+            node.active_large_candidate = false;
         }
 
         size_t smallest_conflict = 0;
@@ -2549,6 +2573,16 @@ size_t parameter_offloader::generate_streaming_fit(offloader_schedule & schedule
         #endif
 
             fit_place_mode place_mode = node.place_mode;
+            size_t large_slack = 0;
+
+            if ((place_mode == FIT_PLACE_LEFT || place_mode == FIT_PLACE_RIGHT) && !node.lnp_offsets.empty())
+            {
+                GGML_ASSERT(fit_size >= node.target_bytes);
+                large_slack = fit_size - node.target_bytes;
+
+                if (large_slack < node.largest_tensor_bytes)
+                    place_mode = FIT_PLACE_LARGE;
+            }
 
             size_t left_bound = 0, right_bound = 0;
             size_t left_total = 0, right_total = 0;
@@ -2563,7 +2597,7 @@ size_t parameter_offloader::generate_streaming_fit(offloader_schedule & schedule
             };
 
             //Replay the precomputed left-side sizes to locate the current left valley wall after wrapping around fit_size.
-            if (!node.lnp_offsets.empty() || place_mode == FIT_PLACE_LEFT || place_mode == FIT_PLACE_RIGHT)
+            if (place_mode == FIT_PLACE_LARGE || place_mode == FIT_PLACE_LEFT || place_mode == FIT_PLACE_RIGHT)
             {
                 left_bound = resolve_bound(node.left_bound);
                 pos = left_bound;
@@ -2629,25 +2663,33 @@ size_t parameter_offloader::generate_streaming_fit(offloader_schedule & schedule
             size_t candidate_idx = 0;
             size_t candidate_offset = 0;
 
-            //Try the previously successful largest-node rotation first, otherwise begin with the rotation nearest the current left wall.
-            if (!node.lnp_offsets.empty())
+            //LARGE targets place their slack at a tensor boundary so no individual arena wrap can self-overlap the node-pair.
+            if (place_mode == FIT_PLACE_LARGE)
             {
-                size_t tight_idx = std::lower_bound(node.lnp_offsets.begin(), node.lnp_offsets.end(), left_fit_pos) - node.lnp_offsets.begin();
-                if (tight_idx == node.lnp_offsets.size())
-                    tight_idx = 0;
+                node.candidate_count = node.lnp_offsets.size();
 
-                if (node.preferred_lnp_offset_valid && node.candidate_try == 0)
-                    candidate_idx = node.preferred_lnp_offset_idx;
+                size_t tight_idx = 0;
+                if (left_fit_pos != 0 && node.lnp_offsets.size() > 1)
+                {
+                    size_t wanted_offset = left_fit_pos > large_slack ? left_fit_pos - large_slack : 0;
+                    auto it = std::lower_bound(node.lnp_offsets.begin() + 1, node.lnp_offsets.end(), wanted_offset);
+
+                    if (it != node.lnp_offsets.end())
+                        tight_idx = it - node.lnp_offsets.begin();
+                }
+
+                if (node.preferred_large_offset_valid && node.candidate_try == 0)
+                    candidate_idx = node.preferred_large_offset_idx;
                 else
                 {
-                    size_t wanted = node.candidate_try - (node.preferred_lnp_offset_valid ? 1 : 0);
+                    size_t wanted = node.candidate_try - (node.preferred_large_offset_valid ? 1 : 0);
                     size_t found = 0;
 
                     for (size_t i = 0; i < node.lnp_offsets.size(); ++i)
                     {
                         size_t idx = (tight_idx + i) % node.lnp_offsets.size();
 
-                        if (node.preferred_lnp_offset_valid && idx == node.preferred_lnp_offset_idx)
+                        if (node.preferred_large_offset_valid && idx == node.preferred_large_offset_idx)
                             continue;
 
                         if (found++ == wanted)
@@ -2658,12 +2700,11 @@ size_t parameter_offloader::generate_streaming_fit(offloader_schedule & schedule
                     }
                 }
 
-                candidate_offset = node.lnp_offsets[candidate_idx];
+                candidate_offset = node.lnp_offsets[candidate_idx] + (candidate_idx ? large_slack : 0);
             }
-            else if (node.place_mode == FIT_PLACE_LARGEST && node.largest_anchor_idx >= 0)
-                candidate_offset = fit_offsets[node.largest_anchor_idx] + fit_tensor_sizes[node.largest_anchor_idx];
 
             node.active_candidate_idx = candidate_idx;
+            node.active_large_candidate = place_mode == FIT_PLACE_LARGE;
             //Remember where this candidate's placements begin so failure can undo them without rebuilding earlier state.
             node.rollback_pos = placement_log.size();
 
@@ -2672,41 +2713,32 @@ size_t parameter_offloader::generate_streaming_fit(offloader_schedule & schedule
                 __func__, fit_idx, node.node_pair_idx, (int)place_mode, node.candidate_try + 1, node.candidate_count, candidate_offset, left_bound, right_bound, left_total, right_total);
         #endif
 
-            if (node.place_mode == FIT_PLACE_NONE)
+            if (place_mode == FIT_PLACE_NONE)
             {
                 //do nothing
             }
-            else if (node.place_mode == FIT_PLACE_LEFT_ANCHOR)
+            else if (place_mode == FIT_PLACE_ANCHORED)
             {
-                int first_idx = node.target_tensors.front();
-                pos = fit_offsets[first_idx] + fit_tensor_sizes[first_idx];
-
-                for (size_t i = 1; i < node.target_tensors.size(); ++i)
+                for (const fit_tensor_span & span : node.anchored_spans)
                 {
-                    int tensor_idx = node.target_tensors[i];
+                    if (span.left_anchor_idx >= 0)
+                    {
+                        pos = fit_offsets[span.left_anchor_idx] + fit_tensor_sizes[span.left_anchor_idx];
 
-                    if (fit_offsets[tensor_idx] != SIZE_MAX)
-                        pos = fit_offsets[tensor_idx] + fit_tensor_sizes[tensor_idx];
+                        for (int i = span.begin; i < span.end; ++i)
+                            pos = place_tensor_against_left(pos, node.target_tensors[i]);
+                    }
                     else
-                        pos = place_tensor_against_left(pos, tensor_idx);
+                    {
+                        GGML_ASSERT(span.right_anchor_idx >= 0);
+                        pos = fit_offsets[span.right_anchor_idx];
+
+                        for (int i = span.end - 1; i >= span.begin; --i)
+                            pos = place_tensor_against_right(pos, node.target_tensors[i]);
+                    }
                 }
             }
-            else if (node.place_mode == FIT_PLACE_RIGHT_ANCHOR)
-            {
-                int last_idx = node.target_tensors.back();
-                pos = fit_offsets[last_idx];
-
-                for (int i = (int)node.target_tensors.size() - 2; i >= 0; --i)
-                {
-                    int tensor_idx = node.target_tensors[i];
-
-                    if (fit_offsets[tensor_idx] != SIZE_MAX)
-                        pos = fit_offsets[tensor_idx];
-                    else
-                        pos = place_tensor_against_right(pos, tensor_idx);
-                }
-            }
-            else if (node.place_mode == FIT_PLACE_LARGEST)
+            else if (place_mode == FIT_PLACE_LARGE)
             {
                 pos = candidate_offset;
 
@@ -2830,15 +2862,15 @@ size_t parameter_offloader::generate_streaming_fit(offloader_schedule & schedule
                 continue;
             }
 
-            //Remember the largest-node rotation that completed its whole subtree so future retries try it first.
+            //Remember the LARGE rotation that completed its whole subtree so future retries try it first.
             for (int completed_idx : node.completed_nodes)
             {
                 fit_graph_node & completed = fit_graph[completed_idx];
 
-                if (completed.lnp_offsets.size() > 1)
+                if (completed.active_large_candidate && completed.lnp_offsets.size() > 1)
                 {
-                    completed.preferred_lnp_offset_idx = completed.active_candidate_idx;
-                    completed.preferred_lnp_offset_valid = true;
+                    completed.preferred_large_offset_idx = completed.active_candidate_idx;
+                    completed.preferred_large_offset_valid = true;
                 }
             }
 
