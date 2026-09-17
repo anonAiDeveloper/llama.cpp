@@ -1674,6 +1674,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--no-moe-expert-prefetch"},
         "speculatively prefetch MoE expert slices during computation (default: disabled)",
         [](common_params & params, bool value) {
+            if (value) {
+                LOG_WRN("WARNING: --moe-expert-prefetch is experimental; speculative expert prefetching is not implemented yet\n");
+                LOG_WRN("WARNING: the current path is a debug cache test that intentionally copies only alternating expert requests to the GPU cache; do not use it for normal inference or performance measurements\n");
+            }
             params.moe_expert_prefetch = value;
         }
     ).set_env("LLAMA_ARG_MOE_EXPERT_PREFETCH"));
