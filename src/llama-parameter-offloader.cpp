@@ -11,7 +11,6 @@
 #include <thread>
 #include <condition_variable>
 #include <deque>
-#include <regex>
 #include <mutex>
 #include <math.h>       /* isfinite */
 #include <unordered_map>
@@ -99,16 +98,6 @@ static inline long long advance_ordinal_to_idx(long long ordinal, int idx, int t
     return ordinal + d;
 }
 
-static inline bool offloader_regex_matches_any(const std::string & name, const std::vector<std::regex> & patterns)
-{
-    for (const std::regex & pattern : patterns) {
-        if (std::regex_search(name, pattern))
-            return true;
-    }
-
-    return false;
-}
-
 /////////////////////////////////////
 //   INITIALIZATION
 /////////////////////////////////////
@@ -118,17 +107,9 @@ parameter_offloader::parameter_offloader(llama_model  * model)
     cpu_weight_set.clear();
     cpu_weight_set.reserve(model->tensors_by_name.size());
 
-    cpu_weight_by_name.clear();
-    cpu_weight_by_name.reserve(model->tensors_by_name.size());
-
     for (const auto & kv : model->tensors_by_name)
-    {
         if (kv.second)
-        {
             cpu_weight_set.insert(kv.second);
-            cpu_weight_by_name.emplace(kv.first, kv.second);
-        }
-    }
 }
 
 void parameter_offloader::attach_arena(ggml_backend_buffer_t arena)
@@ -155,97 +136,77 @@ void parameter_offloader::attach_arena(ggml_backend_buffer_t arena)
     GGML_ASSERT(arena_alignment > 0);
 }
 
-// Call this *before* transform/upload, i.e. at the top of parameter_offloader::init()
-// Guarantees collected_order contains all managed host-backed model weights not excluded by cpu_patterns
-void parameter_offloader::seed_all_weights_from_model(const std::vector<std::string> & cpu_patterns)
+// Consume the exact non-host placement decisions made by llama_model::load_tensors().
+// Stock owns execution placement; the offloader owns only the deferred bytes.
+void parameter_offloader::seed_deferred_weights_from_model()
 {
     collected_order.clear();
+    gpu2cpu.clear();
+    cpu2gpu.clear();
 
-    std::vector<std::regex> model_cpu_weight_regexes;
-    model_cpu_weight_regexes.reserve(model_i->cpu_weight_patterns.size());
-    for (const std::string & pattern : model_i->cpu_weight_patterns)
-        model_cpu_weight_regexes.emplace_back(pattern);
+    const auto & deferred = model->deferred_weights();
 
-    std::vector<std::regex> model_gpu_weight_regexes;
-    model_gpu_weight_regexes.reserve(model_i->gpu_weight_patterns.size());
-    for (const std::string & pattern : model_i->gpu_weight_patterns)
-        model_gpu_weight_regexes.emplace_back(pattern);
+    struct deferred_entry {
+        std::string name;
+        ggml_tensor * source;
+        ggml_tensor * tensor;
+        ggml_backend_buffer_type_t target_buft;
+    };
 
-    std::vector<std::regex> cpu_regexes;
-    cpu_regexes.reserve(cpu_patterns.size());
-    for (const std::string & pattern : cpu_patterns)
-        cpu_regexes.emplace_back(pattern);
+    std::vector<deferred_entry> ordered;
+    ordered.reserve(deferred.size());
 
-    std::unordered_set<ggml_tensor *> cpu_excluded;
-    if (!cpu_regexes.empty())
+    const ggml_backend_dev_t arena_dev = ggml_backend_buft_get_device(arena_buffer_type);
+    if (!arena_dev)
+        throw std::runtime_error("parameter_offloader: arena has no device");
+
+    for (const llama_deferred_weight & weight : deferred)
     {
-        cpu_excluded.reserve(model->tensors_by_name.size());
+        ggml_tensor * w_gpu = weight.tensor;
+        ggml_tensor * w_cpu = weight.source;
 
-        for (const auto & kv : model->tensors_by_name)
-        {
-            ggml_tensor * t = kv.second;
-            if (!t)
-                continue;
+        if (!w_gpu || !w_cpu || !weight.target_buft)
+            throw std::runtime_error("parameter_offloader: invalid deferred weight record");
 
-            for (const std::regex & pattern : cpu_regexes)
-            {
-                if (std::regex_search(kv.first, pattern))
-                {
-                    cpu_excluded.insert(t);
-                    break;
-                }
-            }
-        }
+        if (!w_cpu->buffer || !ggml_backend_buffer_is_host(w_cpu->buffer) || !w_cpu->data)
+            throw std::runtime_error(std::string("parameter_offloader: deferred host source is not resident: ") + ggml_get_name(w_gpu));
+
+        ggml_backend_dev_t target_dev = ggml_backend_buft_get_device(weight.target_buft);
+        if (target_dev != arena_dev)
+            throw std::runtime_error(std::string("parameter_offloader: deferred tensor targets a different device than the arena: ") + ggml_get_name(w_gpu));
+
+        ordered.push_back({
+            /*.name        =*/ ggml_get_name(w_gpu),
+            /*.source      =*/ w_cpu,
+            /*.tensor      =*/ w_gpu,
+            /*.target_buft =*/ weight.target_buft,
+        });
     }
 
-    // Gather (name,tensor) to get a deterministic ordering (lexicographic by name)
-    std::vector<std::pair<std::string, ggml_tensor *>> named;
-    //named.reserve(model->tensors_by_name.size());
+    std::sort(ordered.begin(), ordered.end(),
+        [](const deferred_entry & a, const deferred_entry & b) {
+            return a.name < b.name;
+        });
 
-    for (const auto & kv : model->tensors_by_name)
+    std::unordered_set<ggml_tensor *> seen_gpu;
+    std::unordered_set<ggml_tensor *> seen_cpu;
+    seen_gpu.reserve(ordered.size());
+    seen_cpu.reserve(ordered.size());
+
+    for (const deferred_entry & entry : ordered)
     {
-
-        ggml_tensor * t = kv.second;
-        if (!t || !t->buffer || !ggml_backend_buffer_is_host(t->buffer))
-            continue; // only real host weights
-        // Only keep actual weights you intend to manage (you already populated cpu_weight_set)
-        if (cpu_weight_set.find(t) == cpu_weight_set.end())
+        if (!seen_gpu.insert(entry.tensor).second)
             continue;
 
-        const bool model_cpu = offloader_regex_matches_any(kv.first, model_cpu_weight_regexes);
-        const bool model_gpu = offloader_regex_matches_any(kv.first, model_gpu_weight_regexes);
+        if (!seen_cpu.insert(entry.source).second)
+            throw std::runtime_error("parameter_offloader: multiple execution tensors share one deferred host source");
 
-        if (model_cpu && model_gpu)
-            throw std::runtime_error("parameter_offloader: weight matches both model CPU and GPU patterns: " + kv.first);
-
-        if (!model_cpu && !model_gpu)
-            throw std::runtime_error("parameter_offloader: weight is not classified by model CPU or GPU patterns: " + kv.first);
-
-        if (model_cpu)
-            continue;
-
-        // User-supplied CPU patterns override a model GPU classification, but are
-        // intentionally applied after model classification so they cannot hide a
-        // missing or overlapping model pattern.
-        if (cpu_excluded.find(t) != cpu_excluded.end())
-            continue;
-
-        named.emplace_back(kv.first, t);
+        gpu2cpu.emplace(entry.tensor, entry.source);
+        cpu2gpu.emplace(entry.source, entry.tensor);
+        collected_order.push_back(entry.source);
     }
 
-    std::sort(named.begin(), named.end(), [](auto &a, auto &b){ return a.first < b.first; });
-
-    std::unordered_set<ggml_tensor*> collect_seen;  // dedupe during collection
-    for (auto & kv : named)
-    {
-        ggml_tensor * t = kv.second;
-        if (collect_seen.insert(t).second)
-            collected_order.push_back(t);
-    }
-
-    //LLAMA_LOG_INFO("%s: model->tensors_by_name.size() == %lu\n", __func__, model->tensors_by_name.size());
-    //LLAMA_LOG_INFO("%s: named.size() == %lu\n", __func__, named.size());
-    LLAMA_LOG_INFO("%s: found %lu host-backed weights\n", __func__, collected_order.size());
+    LLAMA_LOG_INFO("%s: accepted %zu stock-deferred device weights\n", __func__, collected_order.size());
 }
 
 size_t parameter_offloader::transform_all_cpu_weights_to_device_layout()
@@ -337,379 +298,83 @@ bool parameter_offloader::transform_cpu_tensor_to_device_layout(ggml_tensor * w_
     return true;
 }
 
-// Enumerate model tensor pointer slots once so later CPU->GPU patching is a direct lookup instead of a full model scan.
-void parameter_offloader::build_model_ref_lookup()
+ggml_tensor * parameter_offloader::init_deferred_tensor_to_arena(
+        ggml_tensor * w_cpu,
+        ggml_tensor * w_gpu,
+        size_t & current_offset)
 {
-    model_ref_slots.clear();
-    model_ref_slots.reserve(cpu_weight_set.size());
-
-    // Build the original CPU-tensor name lookup once so the old pointer-OR-name matching behavior is preserved exactly.
-    std::unordered_map<std::string, std::vector<ggml_tensor *>> cpu_weights_by_name;
-    cpu_weights_by_name.reserve(cpu_weight_set.size());
-
-    for (ggml_tensor * w_cpu : cpu_weight_set)
-    {
-        const char * name = ggml_get_name(w_cpu);
-        if (name)
-            cpu_weights_by_name[name].push_back(w_cpu);
-    }
-
-    // Register one mutable tensor-pointer slot under one CPU tensor, without adding the same slot twice.
-    auto register_slot = [&](ggml_tensor * w_cpu, ggml_tensor * & slot) {
-        std::vector<ggml_tensor **> & slots = model_ref_slots[w_cpu];
-        if (std::find(slots.begin(), slots.end(), &slot) == slots.end())
-            slots.push_back(&slot);
-    };
-
-    // Index one model member using both pointer identity and tensor-name matching, exactly like the old patch loop.
-    auto INDEX = [&](ggml_tensor * & slot) {
-        if (!slot)
-            return;
-
-        if (cpu_weight_set.find(slot) != cpu_weight_set.end())
-            register_slot(slot, slot);
-
-        const char * name = ggml_get_name(slot);
-        if (!name)
-            return;
-
-        auto it = cpu_weights_by_name.find(name);
-        if (it == cpu_weights_by_name.end())
-            return;
-
-        for (ggml_tensor * w_cpu : it->second)
-            register_slot(w_cpu, slot);
-    };
-
-    // -------------------
-    // top-level (model)
-    // -------------------
-    INDEX(model->tok_embd);
-    INDEX(model->type_embd);
-    INDEX(model->pos_embd);
-    INDEX(model->tok_norm);
-    INDEX(model->tok_norm_b);
-
-    INDEX(model->output_norm);
-    INDEX(model->output_norm_b);
-    INDEX(model->output);
-    INDEX(model->output_b);
-    INDEX(model->output_norm_enc);
-
-    INDEX(model->output_s);
-    INDEX(model->output_in_s);
-    INDEX(model->hc_head_fn);
-    INDEX(model->hc_head_base);
-    INDEX(model->hc_head_scale);
-
-    INDEX(model->nextn_proj_pre);
-    INDEX(model->nextn_proj_post);
-
-    INDEX(model->cls);
-    INDEX(model->cls_b);
-    INDEX(model->cls_out);
-    INDEX(model->cls_out_b);
-    INDEX(model->cls_norm);
-
-    INDEX(model->conv1d);
-    INDEX(model->conv1d_b);
-
-    INDEX(model->altup_proj);
-    INDEX(model->altup_unembd_proj);
-    INDEX(model->per_layer_tok_embd);
-    INDEX(model->per_layer_model_proj);
-    INDEX(model->per_layer_proj_norm);
-
-    INDEX(model->fc);
-    INDEX(model->d2t);
-
-    // -------------------
-    // per-layer
-    // -------------------
-    const int nl = (int)model->hparams.n_layer();
-    for (int il = 0; il < nl; ++il)
-    {
-        llama_layer & L = model->layers[il];
-
-        // normalization
-        INDEX(L.attn_norm);        INDEX(L.attn_norm_b);
-        INDEX(L.attn_norm_2);      INDEX(L.attn_norm_2_b);
-        INDEX(L.attn_q_norm);      INDEX(L.attn_q_norm_b);
-        INDEX(L.attn_k_norm);      INDEX(L.attn_k_norm_b);
-        INDEX(L.attn_out_norm);    INDEX(L.attn_out_norm_b);
-        INDEX(L.attn_q_a_norm);    INDEX(L.attn_kv_a_norm);
-        INDEX(L.attn_kv_norm);
-        INDEX(L.attn_sub_norm);    INDEX(L.attn_post_norm);
-        INDEX(L.ffn_sub_norm);     INDEX(L.attn_norm_cross);
-        INDEX(L.attn_norm_enc);    INDEX(L.ssm_norm);
-        INDEX(L.ssm_dt_norm);      INDEX(L.ssm_b_norm);
-        INDEX(L.ssm_c_norm);
-
-        // attention
-        INDEX(L.wq);        INDEX(L.wk);        INDEX(L.wv);        INDEX(L.wo);
-        INDEX(L.wqkv);      INDEX(L.wq_a);      INDEX(L.wq_b);      INDEX(L.wkv_a_mqa);
-        INDEX(L.wkv);       INDEX(L.wkv_b);     INDEX(L.wk_b);      INDEX(L.wv_b);
-        INDEX(L.wqkv_b);    INDEX(L.wo_a);      INDEX(L.wo_b);
-        INDEX(L.wq_cross);  INDEX(L.wk_cross);  INDEX(L.wv_cross);  INDEX(L.wo_cross);
-        INDEX(L.wq_enc);    INDEX(L.wk_enc);    INDEX(L.wv_enc);    INDEX(L.wo_enc);
-        INDEX(L.wqkv_gate);
-
-        // relative position bias
-        INDEX(L.attn_rel_b);       INDEX(L.attn_rel_b_enc);
-        INDEX(L.attn_rel_b_cross);
-
-        // normalization
-        INDEX(L.ffn_norm);       INDEX(L.ffn_norm_b);
-        INDEX(L.ffn_post_norm);  INDEX(L.ffn_post_norm_1); INDEX(L.ffn_post_norm_2);
-        INDEX(L.ffn_pre_norm_2); INDEX(L.layer_out_norm);  INDEX(L.layer_out_norm_b);
-        INDEX(L.ffn_norm_exps);  INDEX(L.ffn_norm_enc);
-
-        // ff
-        INDEX(L.ffn_gate);       INDEX(L.ffn_down);
-        INDEX(L.ffn_up);         INDEX(L.ffn_gate_enc);
-        INDEX(L.ffn_down_enc);   INDEX(L.ffn_up_enc);
-
-        // ff MoE
-        INDEX(L.ffn_gate_inp);      INDEX(L.ffn_gate_inp_s);
-        INDEX(L.ffn_gate_tid2eid);
-        //INDEX(L.ffn_gate_exps);     INDEX(L.ffn_down_exps);       //sparse layers are handled separately
-        //INDEX(L.ffn_up_exps);       INDEX(L.ffn_gate_up_exps);
-        INDEX(L.ffn_gate_inp_b);
-        //INDEX(L.ffn_gate_exps_b);    INDEX(L.ffn_down_exps_b);
-        //INDEX(L.ffn_up_exps_b);      INDEX(L.ffn_gate_up_exps_b);
-
-        // ff MoE per-expert scales (NVFP4 per-tensor scale2)
-        // Routed expert tensors are handled by the sparse cache.
-        //INDEX(L.ffn_gate_exps_s);     INDEX(L.ffn_down_exps_s);
-        //INDEX(L.ffn_up_exps_s);
-
-        // ff MoE latent proj
-        INDEX(L.ffn_latent_down);     INDEX(L.ffn_latent_up);
-
-        // ffn shared expert (shexp)
-        INDEX(L.ffn_gate_inp_shexp);  INDEX(L.ffn_gate_shexp);
-        INDEX(L.ffn_down_shexp);      INDEX(L.ffn_up_shexp);
-
-        // ff adjugate experts (chexps)
-        //INDEX(L.ffn_gate_chexps);     INDEX(L.ffn_down_chexps);       //sparse layers are handled separately
-        //INDEX(L.ffn_up_chexps);
-
-        // ffn bias
-        INDEX(L.ffn_gate_b);   INDEX(L.ffn_down_b);
-        INDEX(L.ffn_up_b);     INDEX(L.ffn_act);
-        INDEX(L.ffn_exp_probs_b);
-
-        // mamba proj
-        INDEX(L.ssm_in);   INDEX(L.ssm_x);
-        INDEX(L.ssm_dt);   INDEX(L.ssm_out);
-
-        // mamba
-        INDEX(L.ssm_conv1d);   INDEX(L.ssm_a);
-        INDEX(L.ssm_d);
-
-        // mamba bias
-        INDEX(L.ssm_conv1d_b); INDEX(L.ssm_dt_b);
-
-        // qwen3next
-        INDEX(L.ssm_beta_alpha);
-
-        // qwen3.5
-        INDEX(L.ssm_alpha);
-
-        // rwkv
-        INDEX(L.time_mix_w1);     INDEX(L.time_mix_w2);
-        INDEX(L.time_mix_lerp_x); INDEX(L.time_mix_lerp_w);
-        INDEX(L.time_mix_lerp_k); INDEX(L.time_mix_lerp_v);
-        INDEX(L.time_mix_lerp_r); INDEX(L.time_mix_lerp_g);
-        INDEX(L.time_mix_lerp_fused);
-
-        INDEX(L.time_mix_first);      INDEX(L.time_mix_decay);
-        INDEX(L.time_mix_decay_w1);   INDEX(L.time_mix_decay_w2);
-        INDEX(L.time_mix_key);        INDEX(L.time_mix_key_b);
-        INDEX(L.time_mix_value);      INDEX(L.time_mix_value_b);
-        INDEX(L.time_mix_receptance); INDEX(L.time_mix_receptance_b);
-        INDEX(L.time_mix_gate);
-
-        // rwkv7
-        INDEX(L.time_mix_w0);
-        INDEX(L.time_mix_a0);  INDEX(L.time_mix_a1);  INDEX(L.time_mix_a2);
-        INDEX(L.time_mix_v0);  INDEX(L.time_mix_v1);  INDEX(L.time_mix_v2);
-        INDEX(L.time_mix_g1);  INDEX(L.time_mix_g2);
-        INDEX(L.time_mix_k_k); INDEX(L.time_mix_k_a); INDEX(L.time_mix_r_k);
-
-        INDEX(L.time_mix_ln);  INDEX(L.time_mix_ln_b);
-        INDEX(L.time_mix_output);
-
-        INDEX(L.channel_mix_lerp_k);   INDEX(L.channel_mix_lerp_r);
-
-        INDEX(L.channel_mix_key);      INDEX(L.channel_mix_receptance);
-        INDEX(L.channel_mix_value);
-
-        // long rope factors
-        INDEX(L.rope_long); INDEX(L.rope_short); INDEX(L.rope_freqs);
-
-        // bitnet scale
-        INDEX(L.wq_s);   INDEX(L.wk_s);   INDEX(L.wv_s);   INDEX(L.wo_s);
-        INDEX(L.wqkv_s); INDEX(L.wqkv_gate_s);
-        INDEX(L.ffn_gate_s);       INDEX(L.ffn_up_s);       INDEX(L.ffn_down_s);
-        INDEX(L.ffn_gate_shexp_s); INDEX(L.ffn_up_shexp_s); INDEX(L.ffn_down_shexp_s);
-        INDEX(L.ssm_in_s);    INDEX(L.ssm_out_s);
-        INDEX(L.ssm_alpha_s); INDEX(L.ssm_beta_s);
-
-        // input scales
-        INDEX(L.wq_in_s);   INDEX(L.wk_in_s);   INDEX(L.wv_in_s);   INDEX(L.wo_in_s);
-        INDEX(L.wqkv_in_s); INDEX(L.wqkv_gate_in_s);
-        INDEX(L.ffn_gate_in_s);       INDEX(L.ffn_up_in_s);        INDEX(L.ffn_down_in_s);
-        // Routed expert tensors are handled by the sparse cache.
-        //INDEX(L.ffn_gate_exps_in_s);  INDEX(L.ffn_down_exps_in_s); INDEX(L.ffn_up_exps_in_s);
-        INDEX(L.ffn_gate_shexp_in_s); INDEX(L.ffn_up_shexp_in_s);  INDEX(L.ffn_down_shexp_in_s);
-        INDEX(L.ssm_in_in_s);    INDEX(L.ssm_out_in_s);
-        INDEX(L.ssm_alpha_in_s); INDEX(L.ssm_beta_in_s);
-
-        // altup & laurel
-        INDEX(L.per_layer_inp_gate); INDEX(L.per_layer_proj); INDEX(L.per_layer_post_norm);
-        INDEX(L.altup_correct_coef);  INDEX(L.altup_correct_scale);
-        INDEX(L.altup_predict_coef);  INDEX(L.altup_router);
-        INDEX(L.altup_router_norm);
-        INDEX(L.laurel_l);  INDEX(L.laurel_r);
-        INDEX(L.laurel_post_norm);
-
-        // openai-moe
-        INDEX(L.attn_sinks);
-
-        // cogvlm
-        INDEX(L.visexp_attn_wqkv);  INDEX(L.visexp_attn_wo);
-        INDEX(L.visexp_ffn_gate);   INDEX(L.visexp_ffn_down);
-        INDEX(L.visexp_ffn_up);
-
-        // xIELU activation parameters for Apertus
-        INDEX(L.ffn_act_alpha_n);  INDEX(L.ffn_act_alpha_p);
-        INDEX(L.ffn_act_beta);     INDEX(L.ffn_act_eps);
-
-        // Kimi Linear KDA
-        INDEX(L.ssm_q_conv); INDEX(L.ssm_k_conv); INDEX(L.ssm_v_conv);
-        INDEX(L.ssm_f_a);    INDEX(L.ssm_f_b);    INDEX(L.ssm_beta);
-        INDEX(L.ssm_g_a);    INDEX(L.ssm_g_b);    INDEX(L.ssm_o_norm);
-
-        // DSA
-        INDEX(L.indexer_k_norm); INDEX(L.indexer_k_norm_b); INDEX(L.indexer_proj);
-        INDEX(L.indexer_attn_k); INDEX(L.indexer_attn_q_b);
-
-        // DeepSeek V4
-        INDEX(L.hc_attn_fn);       INDEX(L.hc_ffn_fn);
-        INDEX(L.hc_attn_base);     INDEX(L.hc_attn_scale);
-        INDEX(L.hc_ffn_base);      INDEX(L.hc_ffn_scale);
-        INDEX(L.attn_comp_wkv);    INDEX(L.attn_comp_wgate);
-        INDEX(L.attn_comp_ape);    INDEX(L.attn_comp_norm);
-        INDEX(L.indexer_comp_wkv); INDEX(L.indexer_comp_wgate);
-        INDEX(L.indexer_comp_ape); INDEX(L.indexer_comp_norm);
-
-        // gemma4 layer output scale, reused for talkie embedding skip scale
-        INDEX(L.out_scale);
-    }
-
-    // Index model->tensors_by_name using both value-pointer identity and the map key as the old name fallback.
-    for (auto & kv : model->tensors_by_name)
-    {
-        if (kv.second && cpu_weight_set.find(kv.second) != cpu_weight_set.end())
-            register_slot(kv.second, kv.second);
-
-        auto it = cpu_weights_by_name.find(kv.first);
-        if (it == cpu_weights_by_name.end())
-            continue;
-
-        for (ggml_tensor * w_cpu : it->second)
-            register_slot(w_cpu, kv.second);
-    }
-}
-
-// Patch every pre-indexed model slot that refers to this CPU tensor.
-void parameter_offloader::patch_model_refs_for(ggml_tensor * w_cpu, ggml_tensor * w_gpu)
-{
-    auto it = model_ref_slots.find(w_cpu);
-    if (it == model_ref_slots.end())
-        return;
-
-    for (ggml_tensor ** slot : it->second)
-        *slot = w_gpu;
-}
-
-ggml_tensor * parameter_offloader::init_cpu_tensor_to_arena(ggml_tensor * w_cpu, size_t & current_offset)
-{
-    GGML_ASSERT(ctx_gpu_twins);
     GGML_ASSERT(arena);
     GGML_ASSERT(w_cpu);
-    GGML_ASSERT(w_cpu->buffer && ggml_backend_buffer_is_host(w_cpu->buffer));     // Must be a “real” weight buffer on host
-    GGML_ASSERT(w_cpu->view_src == nullptr);                                       // Views complicate placement; for weights we expect contiguous
+    GGML_ASSERT(w_gpu);
+    GGML_ASSERT(w_cpu->buffer && ggml_backend_buffer_is_host(w_cpu->buffer));
+    GGML_ASSERT(w_cpu->data);
+    GGML_ASSERT(w_cpu->view_src == nullptr);
+    GGML_ASSERT(w_gpu->view_src == nullptr);
 
-    // If we already mirrored this weight, return the existing twin
-    auto it_cpu2gpu = cpu2gpu.find(w_cpu);
-    if (it_cpu2gpu != cpu2gpu.end())
-    {
-        LLAMA_LOG_WARN("%s: %s is already mirrored, skipping...\n", __func__, ggml_get_name(w_cpu));
-        return it_cpu2gpu->second;
-    }
-    
-    // Compute padded slot as the backend will expect it on device
     const size_t slot_bytes = ggml_backend_buft_get_alloc_size(arena_buffer_type, w_cpu);
-    size_t off              = align_up(current_offset, arena_alignment);
-    
-    if (off + slot_bytes > arena_dense_size)
-        off = 0; // wrap
+    size_t off = align_up(current_offset, arena_alignment);
 
-    // starting from current 'off' (possibly just wrapped to 0), bump until unused
-    const size_t bump      = arena_alignment;                         // step by arena alignment
-    const size_t max_tries = arena_dense_size / arena_alignment + 2;  // safety bound
+    if (slot_bytes > arena_dense_size)
+        throw std::runtime_error(std::string("parameter_offloader: deferred tensor does not fit in arena: ") + ggml_get_name(w_gpu));
+
+    if (off + slot_bytes > arena_dense_size)
+        off = 0;
+
+    // Keep initial tensor data pointers distinct when possible. Graph construction
+    // and diagnostics can use pointer identity before the first solved schedule
+    // retargets the tensors.
+    const size_t bump      = arena_alignment;
+    const size_t max_tries = arena_dense_size / arena_alignment + 2;
     size_t tries = 0;
+
     while (std::any_of(gpu2cpu.begin(), gpu2cpu.end(),
-                [&](const auto &kv) { return kv.first && kv.first->data == static_cast<void*>(arena_base + off); }))
+            [&](const auto & kv) {
+                return kv.first != w_gpu &&
+                       kv.first &&
+                       kv.first->buffer == arena &&
+                       kv.first->data == static_cast<void *>(arena_base + off);
+            }))
     {
         off = align_up(off + bump, arena_alignment);
+
         if (off + slot_bytes > arena_dense_size)
-            off = 0; // wrap again if we ran past the end
+            off = 0;
+
         if (++tries > max_tries) {
-            LLAMA_LOG_WARN("arena: could not find unique pointer for '%s' "
-                        "(arena_dense_size=%zu, arena_alignment=%zu, entries=%zu) — proceeding with overlap\n",
-                        ggml_get_name(w_cpu), arena_dense_size, arena_alignment, gpu2cpu.size());
-            break; // fall through; last 'off' may collide but we’ve warned
+            LLAMA_LOG_WARN(
+                "arena: could not find unique pointer for '%s' "
+                "(arena_dense_size=%zu, arena_alignment=%zu, entries=%zu) — proceeding with overlap\n",
+                ggml_get_name(w_gpu),
+                arena_dense_size,
+                arena_alignment,
+                gpu2cpu.size());
+            break;
         }
     }
 
-    // Duplicate tensor metadata into the GPU-twins context (no data yet)
-    ggml_tensor* w_gpu = ggml_dup_tensor_layout_public(ctx_gpu_twins, w_cpu);
-    GGML_ASSERT(w_gpu);
-    ggml_set_name(w_gpu, ggml_get_name(w_cpu)); // keep names consistent (optional)
+    // The execution tensor currently points at stock's zero-sized dummy buffer.
+    // Detach that placeholder and bind this same tensor object into the real arena.
+    w_gpu->buffer = nullptr;
+    w_gpu->data   = nullptr;
 
-    // Bind GPU twin into the arena at [arena_base + off]
     GGML_ASSERT(ggml_backend_tensor_alloc(arena, w_gpu, arena_base + off) == GGML_STATUS_SUCCESS);
 
-    // Upload
     ggml_cuda_copy_event * ev = upload_weight_auto(w_cpu, w_gpu);
     if (ev) {
         ggml_cuda_copy_event_wait(ev);
         ggml_cuda_copy_event_destroy(ev);
     }
 
-    // Register mappings
-    gpu2cpu.emplace(w_gpu, w_cpu);
-    cpu2gpu.emplace(w_cpu, w_gpu);
-    //gpu_weight_set.insert(w_gpu);
-
-    int idx = (int)schedule_current.gpu_tensors_in_order.size();
+    const int idx = (int) schedule_current.gpu_tensors_in_order.size();
     schedule_current.cpu_tensors_in_order.push_back(w_cpu);
     schedule_current.gpu_tensors_in_order.push_back(w_gpu);
     schedule_current.gpu2index.emplace(w_gpu, idx);
 
-    // Bump arena pointer
     current_offset = off + slot_bytes;
 
-    patch_model_refs_for(w_cpu, w_gpu);
-
 #ifdef LLAMA_CHECK_WEIGHTS
-    //record hashes right after we create the gpu tensors
     const size_t nbytes_g = ggml_nbytes(w_gpu);
     std::vector<uint8_t> tmp_(nbytes_g);
-    // copy device -> host for the logical bytes
     ggml_backend_tensor_get(w_gpu, tmp_.data(), 0, nbytes_g);
     gpu_hashes[w_gpu] = fnv1a64(tmp_.data(), nbytes_g);
 #endif
@@ -717,44 +382,34 @@ ggml_tensor * parameter_offloader::init_cpu_tensor_to_arena(ggml_tensor * w_cpu,
     return w_gpu;
 }
 
-void parameter_offloader::init(ggml_backend_buffer_t arena, llama_context_params cparams, ggml_context * ctx_twins, const std::vector<std::string> & cpu_patterns)
+void parameter_offloader::init(ggml_backend_buffer_t arena, llama_context_params cparams)
 {
     attach_arena(arena);
 
     std::fill(dense_read_ops, dense_read_ops + GGML_OP_COUNT, false);
     model_i->configure_dense_read_ops(dense_read_ops);
 
-    GGML_ASSERT(ctx_gpu_twins == nullptr);
     GGML_ASSERT(!cparams.moe_expert_prefetch || ctx_moe_cache != nullptr);
 
-    owns_arena     = true;
-    ctx_gpu_twins  = ctx_twins;
+    owns_arena = true;
 
-    // Optional: reserve to avoid rehash during init
-    gpu2cpu.reserve(4096);
-    cpu2gpu.reserve(4096);
-
-    seed_all_weights_from_model(cpu_patterns);
+    // Stock has already decided which weights belong on this device and has
+    // supplied a resident host source for each one.
+    seed_deferred_weights_from_model();
 
     const size_t packed = transform_all_cpu_weights_to_device_layout();
     LLAMA_LOG_INFO("host-packing: %zu/%zu weights packed on host\n", packed, collected_order.size());
 
 #ifdef OFFLOADER_CUDA_PIN_MEMORY
     GGML_ASSERT(packed == collected_order.size());
-
-    //The packed pinned buffers are now the permanent dense-weight source; release their original GGUF mappings.
-    model->unmap_tensor_data(collected_order);       //TODO: This sometimes causes a hard to reproduce SIGBUS crash, keep an eye on this
-                                                     //      However, a reboot made this begin working again. Hard to say if this is responsible for SIGBUS or not
 #endif
-
-    // Build the model-slot index once, then patch each mirrored tensor through direct lookup.
-    build_model_ref_lookup();
 
     size_t current_offset = 0;
     for (ggml_tensor * w_cpu : collected_order)
-        (void) init_cpu_tensor_to_arena(w_cpu, current_offset);
-
-    model_ref_slots.clear();
+    {
+        ggml_tensor * w_gpu = cpu2gpu.at(w_cpu);
+        (void) init_deferred_tensor_to_arena(w_cpu, w_gpu, current_offset);
+    }
 
     //////////////////////////////////////////////////////////////////
     //       CREATE COPY SCHEDULE
@@ -773,7 +428,6 @@ void parameter_offloader::init(ggml_backend_buffer_t arena, llama_context_params
     ready = true;
     LLAMA_LOG_INFO("%s ready\n", __func__);
 
-    // Optional log
     size_t peak = 0;
     if (!schedule_current.end_offset.empty())
         peak = *std::max_element(schedule_current.end_offset.begin(), schedule_current.end_offset.end());
@@ -786,10 +440,6 @@ parameter_offloader::~parameter_offloader()
     if (ctx_moe_cache) {
         ggml_free(ctx_moe_cache);
         ctx_moe_cache = nullptr;
-    }
-    if (ctx_gpu_twins) {
-        ggml_free(ctx_gpu_twins);
-        ctx_gpu_twins = nullptr;
     }
     if (arena && owns_arena) {
         ggml_backend_buffer_free(arena);
@@ -845,7 +495,7 @@ void parameter_offloader::stop_streamer_join() {
 //   READ
 /////////////////////////////////////
 
-// Return true if node 't' reads any tracked GPU twin; optionally output the
+// Return true if node 't' reads any tracked execution tensor; optionally output the
 // furthest tracked weight used by the node in the active schedule.
 bool parameter_offloader::node_reads_tracked_weight(ggml_tensor * t, int * out_idx = nullptr)
 {
@@ -921,7 +571,7 @@ bool parameter_offloader::wants_observe(ggml_tensor * node)
         const char * src_name = ggml_get_name(src_node);
         ggml_backend_buffer_t buf = src_node->buffer;
 
-        // skip true model weights that we track (either CPU weight or its GPU twin)
+        // skip true model weights that we track (either host source or execution tensor)
         bool is_tracked_weight =
             (cpu2gpu.find(src_node) != cpu2gpu.end()) ||
             (gpu2cpu.find(src_node) != gpu2cpu.end());
@@ -1101,7 +751,7 @@ bool parameter_offloader::on_eval_tensor(ggml_tensor * node)
 
 #ifdef LLAMA_CHECK_WEIGHTS
     {
-        // Resolve the GPU twin + its CPU source so we can print name/size/offset
+        // Resolve the execution tensor + its host source so we can print name/size/offset
         ggml_tensor * w_gpu = schedule_current.gpu_tensors_in_order[idx];
         ggml_tensor * w_cpu = gpu2cpu.at(w_gpu);
         const char * name   = ggml_get_name(w_gpu);
@@ -3347,7 +2997,7 @@ bool parameter_offloader::swap_next_schedule(size_t streaming_fit)
 
 void parameter_offloader::seat_dense_tensors(offloader_schedule & schedule)
 {
-    const size_t tensor_count = schedule.gpu_tensors_in_order.size(); // number of streamed GPU twins to retarget
+    const size_t tensor_count = schedule.gpu_tensors_in_order.size(); // number of streamed execution tensors to retarget
     const size_t a = arena_alignment ? arena_alignment : 1; // alignment used for arena start offsets
     const size_t reusable_static_count = common_prefix_len(static_dense_order_current, static_dense_order); // unchanged top-down static prefix already resident at the same offsets
 
@@ -3359,7 +3009,7 @@ void parameter_offloader::seat_dense_tensors(offloader_schedule & schedule)
 
         for (size_t i = 0; i < tensor_count; ++i)
         {
-            ggml_tensor * w_gpu = schedule.gpu_tensors_in_order[i]; // existing GPU twin whose data pointer will move
+            ggml_tensor * w_gpu = schedule.gpu_tensors_in_order[i]; // existing execution tensor whose data pointer will move
             ggml_tensor * w_cpu = schedule.cpu_tensors_in_order[i]; // CPU weight used only to compute padded device size
 
             GGML_ASSERT(w_gpu);

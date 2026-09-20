@@ -338,6 +338,7 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
+        bool defer_non_host_weights; // preserve non-host weight placement but defer their device byte allocation
     };
 
     struct llama_sampler_seq_config {

@@ -30,17 +30,14 @@ public:
     size_t get_gpu_aligned_size(ggml_tensor * tensor, size_t alignment);
 
     // Fast lookups
-    // GPU->CPU: answer "what CPU weight backs this GPU twin?"
+    // Execution tensor -> host source tensor.
     std::unordered_map<ggml_tensor*, ggml_tensor*> gpu2cpu;
-    // CPU->GPU: answer "do we already have a GPU twin for this CPU weight?"
+    // Host source tensor -> execution tensor.
     std::unordered_map<ggml_tensor*, ggml_tensor*> cpu2gpu;
 
-    // Must preserve original CPU tensors by name even after patch_model_refs_for()
-    // changes model->tensors_by_name to point at GPU/placeholder twins.
-    std::unordered_map<std::string, ggml_tensor *> cpu_weight_by_name;
-
-
-    std::unordered_set<ggml_tensor*> cpu_weight_set; // CPU weight ptrs
+    // Model tensor pointers, used only by diagnostics that need to recognize
+    // ordinary (non-managed) model weights.
+    std::unordered_set<ggml_tensor*> cpu_weight_set;
     //std::unordered_set<ggml_tensor*> gpu_weight_set; // GPU weight ptrs
 
     void copy_host_to_arena_with_transform(ggml_tensor * src_host, ggml_tensor * dst_arena);
@@ -48,13 +45,12 @@ public:
     // Init and destructor functions
     bool ready = false;
 
-    std::vector<ggml_tensor*> collected_order;      // CPU weights managed by the offloader, excluding CPU-pattern matches
+    std::vector<ggml_tensor*> collected_order;      // host source tensors managed by the offloader
 
-    // Arena + twin-context
+    // Arena
     llama_model*                model;
     const parameter_offloader_model_i * model_i = nullptr; // selected once from model->arch
     ggml_backend_buffer_t       arena           = nullptr; // offloader CUDA arena buffer
-    ggml_context*               ctx_gpu_twins   = nullptr; // no-alloc ctx for duplicated GPU tensors
     bool                        owns_arena      = false;
     
     bool dense_read_ops[GGML_OP_COUNT] = {}; // Per-model op lookup configured during init; true when the op can directly read an enabled dense weight.
@@ -71,7 +67,7 @@ public:
     size_t                      arena_stream_size  = 0;         // dense streaming region size
     size_t                      arena_alignment = 0;            // required byte alignment for arena placement
 
-    void init(ggml_backend_buffer_t arena, llama_context_params params, ggml_context * ctx_twins, const std::vector<std::string> & cpu_patterns);
+    void init(ggml_backend_buffer_t arena, llama_context_params params);
     parameter_offloader(llama_model * model);
     ~parameter_offloader();
 
@@ -80,9 +76,9 @@ public:
     {
         // Scheduling
         std::vector<int>                      ready_after;           // per index: last safe copy index before arena overlap risk
-        std::vector<ggml_tensor*>             cpu_tensors_in_order;  // feed-order list of CPU twins
-        std::vector<ggml_tensor*>             gpu_tensors_in_order;  // feed-order list of GPU twins
-        std::unordered_map<ggml_tensor*, int> gpu2index;             // GPU twin -> feed-order index
+        std::vector<ggml_tensor*>             cpu_tensors_in_order;  // feed-order list of host source tensors
+        std::vector<ggml_tensor*>             gpu_tensors_in_order;  // feed-order list of execution tensors
+        std::unordered_map<ggml_tensor*, int> gpu2index;             // execution tensor -> feed-order index
 
         std::vector<size_t> start_offset; // arena start offset for each scheduled GPU tensor
         std::vector<size_t> end_offset;   // arena end offset for each scheduled GPU tensor
@@ -226,18 +222,13 @@ private:
     inline ggml_cuda_copy_event * upload_weight_auto(ggml_tensor *w_cpu, ggml_tensor *w_gpu);
 
     // Init and destructor functions
-    void seed_all_weights_from_model(const std::vector<std::string> & cpu_patterns);
+    void seed_deferred_weights_from_model();
 
-    // Index every model tensor pointer slot once so CPU->GPU patching can use direct lookup.
-    void build_model_ref_lookup();
-
-    // Patch every indexed model tensor pointer slot associated with one CPU tensor.
-    void patch_model_refs_for(ggml_tensor * w_cpu, ggml_tensor * w_gpu);
-
-    // CPU weight -> every llama_model/llama_layer/name-map pointer slot that must follow its GPU twin.
-    std::unordered_map<ggml_tensor *, std::vector<ggml_tensor **>> model_ref_slots;
-
-    ggml_tensor * init_cpu_tensor_to_arena(ggml_tensor * w_cpu, size_t & current_offset);
+    // Bind one stock execution tensor to an initial arena slot and upload its host source.
+    ggml_tensor * init_deferred_tensor_to_arena(
+        ggml_tensor * w_cpu,
+        ggml_tensor * w_gpu,
+        size_t & current_offset);
 
     // start/stop the streaming worker
     void start_streamer();

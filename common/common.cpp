@@ -56,6 +56,7 @@
 #endif
 
 #include "../src/llama-context.h"
+#include "../src/llama-model.h"
 #include "../src/llama-parameter-offloader.h"
 #include "../ggml/include/ggml-cuda-arena.h"
 
@@ -71,13 +72,6 @@
 #ifndef PARAMETER_OFFLOADER_VRAM_MAX_MIB
 #define PARAMETER_OFFLOADER_VRAM_MAX_MIB 0
 #endif
-
-// parameter_offloader keeps canonical model weights in host memory. Managed
-// tensors are exposed to the graph through GPU twins backed by the arena.
-static const llama_model_tensor_buft_override parameter_offloader_source_weight_overrides[] = {
-    {".*", ggml_backend_cpu_buffer_type()},
-    {nullptr, nullptr},
-};
 
 common_time_meas::common_time_meas(int64_t & t_acc, bool disable) : t_start_us(disable ? -1 : ggml_time_us()), t_acc(t_acc) {}
 
@@ -1249,6 +1243,10 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
     bool parameter_offloader_active = false;
 
+    // Storage for parameter-offloader placement overrides. The pattern pointers
+    // borrow from strings owned by `params`, which outlive model loading below.
+    std::vector<llama_model_tensor_buft_override> parameter_offloader_tensor_buft_overrides;
+
     if (!model_only && params.param_offload) {
         //TODO: Today this only supports CUDA. Given how simple ggml-cuda-arena.cu is I dont think it'd be too hard to support other types of device?
         ggml_backend_dev_t cuda_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
@@ -1257,6 +1255,42 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             COM_ERR("%s", "parameter offloader requires a GPU device\n");
             return;
         }
+
+        // Configure the model exactly as it will be loaded at runtime before
+        // probing memory. Stock owns execution placement; the parameter
+        // offloader only changes physical residency for tensors stock places on
+        // a non-host device.
+        mparams.defer_non_host_weights = true;
+
+        // CPU-resident weights should use ordinary CPU storage. In particular,
+        // do not pin/repack the full CPU portion of the model just because the
+        // parameter offloader is enabled.
+        mparams.no_host = true;
+        mparams.use_extra_bufts = false;
+
+        // --param-offload-cpu is retained for compatibility for now, but its
+        // only effect is to feed an ordinary stock tensor-placement override.
+        // Put these overrides first so they win over broader existing overrides.
+        parameter_offloader_tensor_buft_overrides.reserve(
+            params.param_offload_cpu.size() +
+            params.tensor_buft_overrides.size() + 1);
+
+        for (const std::string & pattern : params.param_offload_cpu) {
+            parameter_offloader_tensor_buft_overrides.push_back({
+                pattern.c_str(),
+                ggml_backend_cpu_buffer_type(),
+            });
+        }
+
+        for (const auto & override_ : params.tensor_buft_overrides) {
+            if (override_.pattern == nullptr)
+                break;
+
+            parameter_offloader_tensor_buft_overrides.push_back(override_);
+        }
+
+        parameter_offloader_tensor_buft_overrides.push_back({ nullptr, nullptr });
+        mparams.tensor_buft_overrides = parameter_offloader_tensor_buft_overrides.data();
 
         const size_t MiB = 1024ull * 1024ull;
         size_t arena_bytes = 0;
@@ -1313,37 +1347,6 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.fit_params_target.data(),
             params.fit_params_min_ctx,
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
-    }
-
-    if (parameter_offloader_active) {
-        // The parameter offloader does not use the canonical model buffer for
-        // GPU transfers:
-        //
-        // - dense weights are streamed from host_packed_
-        // - MoE misses execute directly from the canonical CPU weights
-        //
-        // no_host must be true so the canonical model is not allocated in
-        // CUDA_Host memory. Pinning the full model with CUDA_Host causes a
-        // large persistent VRAM mapping/page-table overhead that the offloader
-        // does not benefit from.
-        //
-        // no_host alone is not sufficient: removing CUDA_Host allows CPU extra
-        // buffer types such as CPU_REPACK to win buffer selection. That changes
-        // the physical representation of large portions of the model and causes
-        // a major performance regression in the parameter-offloader path.
-        //
-        // use_extra_bufts must therefore also be false so those weights fall
-        // back to the ordinary CPU buffer instead. Conversely,
-        // use_extra_bufts=false alone is not sufficient because CUDA_Host would
-        // still remain eligible and would still pin the canonical model.
-        //
-        // Together these settings keep canonical weights in ordinary CPU memory
-        // without CUDA pinning and without CPU repacking.
-        mparams.no_host = true;
-        mparams.use_extra_bufts = false;
-        
-        mparams.n_gpu_layers = INT32_MAX;
-        mparams.tensor_buft_overrides = parameter_offloader_source_weight_overrides;
     }
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
@@ -1500,12 +1503,9 @@ void common_init_result::init_parameter_offloader(common_params & params) {
         return;
     }
 
-    const size_t MB = 1024ull * 1024ull;
-    ggml_init_params twins = { 64 * MB, nullptr, true };
-
     auto cparams = common_context_params_to_llama(params);
 
-    pimpl->param_offloader->init(arena, cparams, ggml_init(twins), params.param_offload_cpu);
+    pimpl->param_offloader->init(arena, cparams);
     pimpl->param_offloader_arena = nullptr;
 }
 

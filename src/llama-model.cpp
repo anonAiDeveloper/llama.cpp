@@ -1019,8 +1019,11 @@ struct llama_model::impl {
     llama_mlocks mlock_bufs;
     llama_mlocks mlock_mmaps;
 
-    // contexts where the model tensors metadata is stored as well as the corresponding buffers:
+    // contexts whose tensor metadata/buffers are owned for the lifetime of the model.
+    // This also owns the host source tensors for deferred non-host weights.
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
+
+    std::vector<llama_deferred_weight> deferred_weights;
 
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
@@ -1279,6 +1282,40 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         throw std::runtime_error(format("%s: no CPU backend found", __func__));
     }
 
+    auto should_defer_buft = [&](ggml_backend_buffer_type_t buft) -> bool {
+        if (!params.defer_non_host_weights || ml.no_alloc) {
+            return false;
+        }
+
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+        if (!dev) {
+            return false;
+        }
+
+        // Defer only storage selected for one of this model's accelerator
+        // devices. CPU fallback and unrelated accelerator buffer types keep
+        // their normal allocation behavior.
+        bool model_device = false;
+        for (const auto & model_dev : devices) {
+            if (!model_dev.is_meta && model_dev.dev == dev) {
+                model_device = true;
+                break;
+            }
+        }
+        if (!model_device) {
+            return false;
+        }
+
+        // A device can expose a host buffer type (for example pinned host
+        // memory). That is already host storage and must not be deferred.
+        ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(dev);
+        if (host_buft && buft == host_buft) {
+            return false;
+        }
+
+        return true;
+    };
+
     // calculate the split points
     bool all_zero = tensor_split == nullptr || std::all_of(tensor_split, tensor_split + n_devices(), [](float x) { return x == 0.0f; });
     std::vector<float> splits(n_devices());
@@ -1531,7 +1568,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // create the backend buffers
     std::vector<std::pair<ggml_context *, llama_buf_map>> ctx_buf_maps;
-    ctx_buf_maps.reserve(ml.ctx_map.size());
+    ctx_buf_maps.reserve(ml.ctx_map.size() + 1);
+
+    struct deferred_exec_tensor {
+        ggml_tensor * tensor;
+        ggml_backend_buffer_type_t target_buft;
+    };
+    std::vector<deferred_exec_tensor> deferred_exec_tensors;
 
     // Ensure we have enough capacity for the maximum backend buffer we will potentially create
     const size_t n_max_backend_buffer = ml.ctx_map.size() * ml.files.size();
@@ -1562,8 +1605,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         bool buffer_from_host_ptr_supported = props.caps.buffer_from_host_ptr;
         bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
 
+        const bool defer_weight_data = should_defer_buft(buft);
+
         std::vector<ggml_backend_buffer_ptr> bufs;
-        if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
+        if (!defer_weight_data && ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
             GGML_ASSERT(!ml.no_alloc);
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
                 // only the mmap region containing the tensors in the model is mapped to the backend buffer
@@ -1586,17 +1631,31 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
         } else {
             ggml_backend_buffer_t buf;
-            if (ml.no_alloc) {
-                buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
+            if (ml.no_alloc || defer_weight_data) {
+                // Preserve the exact buffer type selected by stock without
+                // allocating the weight payload. This is the same dummy-buffer
+                // mechanism used by the existing no_alloc path.
+                buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0);
+                if (buf == nullptr) {
+                    throw std::runtime_error(format("unable to allocate dummy %s buffer", ggml_backend_buft_name(buft)));
+                }
+
                 for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
-                    t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them
+                    // Set a dummy buffer so the backend scheduler preserves the
+                    // placement chosen by the normal model-loading path.
+                    t->buffer = buf;
+
+                    if (defer_weight_data && ml.get_weight(ggml_get_name(t)) != nullptr) {
+                        deferred_exec_tensors.push_back({ t, buft });
+                    }
                 }
             } else {
                 buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
+                if (buf == nullptr) {
+                    throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
+                }
             }
-            if (buf == nullptr) {
-                throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
-            }
+
             if (use_mlock && ggml_backend_buffer_is_host(buf)) {
                 pimpl->mlock_bufs.emplace_back(new llama_mlock);
                 auto & mlock_buf = pimpl->mlock_bufs.back();
@@ -1604,8 +1663,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 mlock_buf->grow_to(ggml_backend_buffer_get_size(buf));
             }
             bufs.emplace_back(buf);
-            for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
-                buf_map.emplace(idx, buf);
+
+            // Deferred execution buffers have no storage and must not be passed
+            // to load_all_data(). Their bytes are loaded into the CPU source
+            // context created below instead.
+            if (!defer_weight_data) {
+                for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
+                    buf_map.emplace(idx, buf);
+                }
             }
         }
 
@@ -1617,7 +1682,77 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
         pimpl->ctxs_bufs.emplace_back(std::move(ctx_ptr), std::move(bufs));
 
-        ctx_buf_maps.emplace_back(ctx, buf_map);
+        if (!defer_weight_data) {
+            ctx_buf_maps.emplace_back(ctx, std::move(buf_map));
+        }
+    }
+
+    if (!deferred_exec_tensors.empty()) {
+        const size_t ctx_size = ggml_tensor_overhead() * deferred_exec_tensors.size();
+
+        ggml_init_params source_ctx_params = {
+            /*.mem_size   =*/ ctx_size,
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+
+        ggml_context_ptr source_ctx { ggml_init(source_ctx_params) };
+        if (!source_ctx) {
+            throw std::runtime_error("failed to create deferred-weight source context");
+        }
+
+        pimpl->deferred_weights.clear();
+        pimpl->deferred_weights.reserve(deferred_exec_tensors.size());
+
+        size_t deferred_logical_bytes = 0;
+
+        for (const auto & entry : deferred_exec_tensors) {
+            ggml_tensor * source = ggml_dup_tensor(source_ctx.get(), entry.tensor);
+            if (!source) {
+                throw std::runtime_error(format(
+                    "failed to create CPU source for deferred tensor '%s'",
+                    ggml_get_name(entry.tensor)));
+            }
+
+            ggml_set_name(source, ggml_get_name(entry.tensor));
+
+            pimpl->deferred_weights.push_back({
+                entry.tensor,
+                source,
+                entry.target_buft,
+            });
+
+            deferred_logical_bytes += ggml_nbytes(entry.tensor);
+        }
+
+        ggml_backend_buffer_t source_buf =
+            ggml_backend_alloc_ctx_tensors_from_buft(source_ctx.get(), ggml_backend_cpu_buffer_type());
+        if (!source_buf) {
+            throw std::runtime_error("failed to allocate deferred-weight CPU source buffer");
+        }
+
+        if (use_mlock) {
+            pimpl->mlock_bufs.emplace_back(new llama_mlock);
+            auto & mlock_buf = pimpl->mlock_bufs.back();
+            mlock_buf->init   (ggml_backend_buffer_get_base(source_buf));
+            mlock_buf->grow_to(ggml_backend_buffer_get_size(source_buf));
+        }
+
+        LLAMA_LOG_INFO(
+            "%s: deferred %zu non-host weights (%.2f MiB logical) to host source storage\n",
+            __func__,
+            pimpl->deferred_weights.size(),
+            deferred_logical_bytes / 1024.0 / 1024.0);
+
+        // load_all_data() will populate these already-allocated CPU tensors.
+        // An empty buf_map is intentional: mmap mode copies from the mapping
+        // into cur->data, while non-mmap mode reads directly into cur->data.
+        ggml_context * source_ctx_raw = source_ctx.get();
+        ctx_buf_maps.emplace_back(source_ctx_raw, llama_buf_map {});
+
+        std::vector<ggml_backend_buffer_ptr> source_bufs;
+        source_bufs.emplace_back(source_buf);
+        pimpl->ctxs_bufs.emplace_back(std::move(source_ctx), std::move(source_bufs));
     }
 
     if (llama_supports_gpu_offload()) {
@@ -1710,6 +1845,10 @@ uint32_t llama_model::n_gpu_layers() const {
 
 llama_split_mode llama_model::split_mode() const {
     return params.split_mode;
+}
+
+const std::vector<llama_deferred_weight> & llama_model::deferred_weights() const {
+    return pimpl->deferred_weights;
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() const {
@@ -2517,6 +2656,7 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
+        /*.defer_non_host_weights      =*/ false,
     };
 
     return result;

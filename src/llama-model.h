@@ -548,6 +548,20 @@ struct llama_meta_device_get_split_state_userdata {
 
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata);
 
+struct llama_deferred_weight {
+    // Final tensor referenced by the model/graph. Its buffer type is the exact
+    // non-host buffer type selected by the normal placement logic, but its
+    // backing buffer is zero-sized until a storage manager materializes it.
+    ggml_tensor * tensor = nullptr;
+
+    // Complete host-resident copy of the original model weight. This tensor is
+    // not referenced by the model graph.
+    ggml_tensor * source = nullptr;
+
+    // Exact non-host buffer type selected for `tensor`.
+    ggml_backend_buffer_type_t target_buft = nullptr;
+};
+
 struct llama_model {
     llm_type type = LLM_TYPE_UNKNOWN;
     llm_arch arch = LLM_ARCH_UNKNOWN;
@@ -662,6 +676,8 @@ struct llama_model {
     llama_split_mode split_mode() const;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
+
+    const std::vector<llama_deferred_weight> & deferred_weights() const;
 
     // total number of parameters in the model
     uint64_t n_elements() const;
