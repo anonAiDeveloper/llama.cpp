@@ -3,16 +3,12 @@
 #include "log.h"
 
 #include "../src/llama-ext.h"
-#include "../src/llama-context.h"
-#include "../src/llama-memory.h"
-#include "../src/llama-parameter-offloader.h"
+#include "../src/llama-model.h"
 
 #include <array>
 #include <cassert>
 #include <stdexcept>
 #include <cinttypes>
-#include <memory>
-#include <map>
 #include <set>
 #include <string>
 #include <vector>
@@ -31,105 +27,211 @@ class common_params_fit_exception : public std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
-static std::map<ggml_backend_buffer_type_t, size_t> common_probe_compute_buffers(llama_context * ctx) {
-    if (!ctx)
-        throw std::runtime_error("compute buffer probe received a null context");
+// MoE expert prefetch does not choose CPU/GPU placement while the graph is built. Each MoE block is built with K + 1 lanes covering every possible CPU/GPU split of the K selected experts.
+// The scheduler selects one lane at execution time after querying the residency callback.
+//
+// Building those lanes still requires both expert tensor sets to exist in the model: the ordinary CPU expert banks and the GPU cache banks. At runtime parameter_offloader::init_moe_cache()
+// creates the real arena-backed cache tensors before llama_init_from_model(). Fit runs with no_alloc and, for automatic arena sizing, before that arena exists.
+// Without this shim, the fit model would have no GPU cache tensors from which to build the GPU sides of the lanes.
+//
+// common_fit_moe_topology supplies only that missing tensor topology. It creates metadata-only cache tensors with the runtime shapes and sharing pattern, then attaches them to a zero-byte buffer
+// of the target GPU BUFT and installs the model's *_cache pointers before context construction. The zero-byte buffer consumes no VRAM; it only preserves logical GPU buffer-type identity.
+// The ordinary graph builder and scheduler then reserve the same K + 1 lane topology as runtime.
+//
+// This helper deliberately does NOT predict expert residency, select lanes, enumerate CPU/GPU combinations, or count cache storage as ordinary resident model memory.
+// The graph already contains every lane, and the real cache storage belongs to the parameter-offloader arena.
+struct common_fit_moe_cache_field {
+    ggml_tensor * llama_layer::* cpu;
+    ggml_tensor * llama_layer::* cache;
+};
 
-    ggml_backend_sched_t sched = ctx->get_sched();
-    if (!sched)
-        throw std::runtime_error("compute buffer probe received a context without a scheduler");
+static const common_fit_moe_cache_field common_fit_moe_cache_fields[] = {
+    { &llama_layer::ffn_gate_exps,      &llama_layer::ffn_gate_exps_cache },     { &llama_layer::ffn_down_exps,      &llama_layer::ffn_down_exps_cache },
+    { &llama_layer::ffn_up_exps,        &llama_layer::ffn_up_exps_cache },       { &llama_layer::ffn_gate_up_exps,   &llama_layer::ffn_gate_up_exps_cache },
+    { &llama_layer::ffn_gate_chexps,    &llama_layer::ffn_gate_chexps_cache },   { &llama_layer::ffn_down_chexps,    &llama_layer::ffn_down_chexps_cache },
+    { &llama_layer::ffn_up_chexps,      &llama_layer::ffn_up_chexps_cache },     { &llama_layer::ffn_gate_exps_b,    &llama_layer::ffn_gate_exps_b_cache },
+    { &llama_layer::ffn_down_exps_b,    &llama_layer::ffn_down_exps_b_cache },   { &llama_layer::ffn_up_exps_b,      &llama_layer::ffn_up_exps_b_cache },
+    { &llama_layer::ffn_gate_up_exps_b, &llama_layer::ffn_gate_up_exps_b_cache },{ &llama_layer::ffn_gate_exps_s,    &llama_layer::ffn_gate_exps_s_cache },
+    { &llama_layer::ffn_down_exps_s,    &llama_layer::ffn_down_exps_s_cache },   { &llama_layer::ffn_up_exps_s,      &llama_layer::ffn_up_exps_s_cache },
+    { &llama_layer::ffn_gate_exps_in_s, &llama_layer::ffn_gate_exps_in_s_cache },{ &llama_layer::ffn_down_exps_in_s, &llama_layer::ffn_down_exps_in_s_cache },
+    { &llama_layer::ffn_up_exps_in_s,   &llama_layer::ffn_up_exps_in_s_cache },
+};
 
-    const int n_backends = ggml_backend_sched_get_n_backends(sched);
-    if (n_backends <= 0)
-        throw std::runtime_error("compute buffer probe found no scheduler backends");
+struct common_fit_moe_cache_bank {
+    int field_id;
+    ggml_type type;
+    int n_dims;
+    int64_t ne[GGML_MAX_DIMS];
+    ggml_tensor * tensor;
+};
 
-    llama_memory_context_ptr mctx;
-    if (llama_memory_t memory = ctx->get_memory()) {
-        mctx = memory->init_full();
-        if (!mctx)
-            throw std::runtime_error("compute buffer probe failed to initialize the full memory context");
+class common_fit_moe_topology {
+public:
+    ~common_fit_moe_topology() {
+        reset();
     }
 
-    const llama_cparams & cparams = ctx->get_cparams();
-    const uint32_t n_tokens_max = std::min(cparams.n_ctx, cparams.n_ubatch);
-    if (n_tokens_max == 0)
-        throw std::runtime_error("compute buffer probe has no valid ubatch token count");
+    void init(llama_model * model, ggml_backend_buffer_type_t buft, int32_t n_slots) {
+        reset();
 
-    const uint32_t n_seqs_max = cparams.n_seq_max;
-    if (n_seqs_max == 0)
-        throw std::runtime_error("compute buffer probe has no valid sequence count");
+        if (n_slots <= 0)
+            return;
 
-    std::vector<size_t> max_sizes((size_t)n_backends, 0);
-    std::vector<size_t> sizes((size_t)n_backends, 0);
-    size_t probe_count = 0;
+        model_ = model;
 
-    auto probe = [&](uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs) {
-        std::fill(sizes.begin(), sizes.end(), 0);
+        const int n_layers = (int) model_->hparams.n_layer();
+        const int n_fields = (int) (sizeof(common_fit_moe_cache_fields) / sizeof(common_fit_moe_cache_fields[0]));
+        size_t n_source_banks = 0;
 
-        if (!ctx->graph_reserve(n_tokens, n_seqs, n_outputs, mctx.get(), true, sizes.data()))
-            throw std::runtime_error("compute buffer probe failed to reserve a graph shape");
+        for (int il = 0; il < n_layers; ++il) {
+            llama_layer & layer = model_->layers[il];
 
-        for (int i = 0; i < n_backends; ++i)
-            max_sizes[(size_t)i] = std::max(max_sizes[(size_t)i], sizes[(size_t)i]);
+            for (int field_id = 0; field_id < n_fields; ++field_id) {
+                const common_fit_moe_cache_field & field = common_fit_moe_cache_fields[field_id];
+                layer.*(field.cache) = nullptr;
 
-        ++probe_count;
-    };
+                if (layer.*(field.cpu) != nullptr)
+                    ++n_source_banks;
+            }
+        }
 
-    for (uint32_t n_seqs = 1; n_seqs <= n_seqs_max; ++n_seqs) {
-        // graph_reserve() rounds n_tokens up to a multiple of n_seqs. Enumerate
-        // those rounded equal-sequence widths, including the final width which can
-        // exceed n_tokens_max by up to n_seqs - 1. This also covers TG with more
-        // active sequences than n_ubatch (one token per sequence).
-        const uint32_t n_seq_tokens_max = 1 + (n_tokens_max - 1) / n_seqs;
+        if (n_source_banks == 0)
+            return;
 
-        for (uint32_t n_seq_tokens = 1; n_seq_tokens <= n_seq_tokens_max; ++n_seq_tokens) {
-            const uint32_t n_tokens = n_seq_tokens * n_seqs;
+        GGML_ASSERT(n_source_banks <= SIZE_MAX / ggml_tensor_overhead());
 
-            // One output per sequence is the TG-style reserve shape used by
-            // llama_context::sched_reserve(). The maximum-output PP shape is
-            // bounded by the configured logical ubatch width rather than any
-            // token padding introduced solely to make the reserve batch equal.
-            const uint32_t n_outputs_tg = n_seqs;
-            const uint32_t n_outputs_pp = std::min(std::min(n_tokens, n_tokens_max), cparams.n_outputs_max);
+        ggml_init_params params = {
+            /* .mem_size   = */ ggml_tensor_overhead() * n_source_banks,
+            /* .mem_buffer = */ nullptr,
+            /* .no_alloc   = */ true,
+        };
 
-            probe(n_tokens, n_seqs, n_outputs_tg);
-            if (n_outputs_pp != n_outputs_tg)
-                probe(n_tokens, n_seqs, n_outputs_pp);
+        ctx_ = ggml_init(params);
+        if (!ctx_)
+            throw std::runtime_error("failed to create fit-only MoE cache metadata context");
+
+        // Preserve the target GPU BUFT without allocating cache bytes; graph construction only needs tensor placement identity here.
+        buffer_ = ggml_backend_buft_alloc_buffer(buft, 0);
+        if (!buffer_)
+            throw std::runtime_error("failed to create fit-only MoE cache buffer");
+
+        std::vector<common_fit_moe_cache_bank> banks;
+        banks.reserve(n_source_banks);
+
+        for (int il = 0; il < n_layers; ++il) {
+            llama_layer & layer = model_->layers[il];
+
+            for (int field_id = 0; field_id < n_fields; ++field_id) {
+                const common_fit_moe_cache_field & field = common_fit_moe_cache_fields[field_id];
+                ggml_tensor * cpu = layer.*(field.cpu);
+
+                if (!cpu)
+                    continue;
+
+                GGML_ASSERT(cpu->view_src == nullptr);
+                GGML_ASSERT(!ggml_is_transposed(cpu));
+                GGML_ASSERT(ggml_is_contiguous(cpu));
+
+                const int n_dims = ggml_n_dims(cpu);
+                GGML_ASSERT(n_dims >= 1);
+                GGML_ASSERT(n_dims <= GGML_MAX_DIMS);
+
+                const int expert_dim = n_dims - 1;
+                int64_t cache_ne[GGML_MAX_DIMS];
+
+                for (int d = 0; d < GGML_MAX_DIMS; ++d)
+                    cache_ne[d] = 1;
+
+                for (int d = 0; d < n_dims; ++d)
+                    cache_ne[d] = cpu->ne[d];
+
+                cache_ne[expert_dim] = n_slots;
+
+                // Runtime shares compatible cache banks across layers. Mirror that pointer sharing so the fit graph sees the same tensor topology.
+                size_t bank_id = banks.size();
+
+                for (size_t i = 0; i < banks.size(); ++i) {
+                    const common_fit_moe_cache_bank & bank = banks[i];
+
+                    if (bank.field_id != field_id || bank.type != cpu->type || bank.n_dims != n_dims)
+                        continue;
+
+                    bool same_shape = true;
+
+                    for (int d = 0; d < n_dims; ++d) {
+                        if (bank.ne[d] != cache_ne[d]) {
+                            same_shape = false;
+                            break;
+                        }
+                    }
+
+                    if (same_shape) {
+                        bank_id = i;
+                        break;
+                    }
+                }
+
+                if (bank_id == banks.size()) {
+                    ggml_tensor * cache = ggml_new_tensor(ctx_, cpu->type, n_dims, cache_ne);
+                    GGML_ASSERT(cache);
+                    cache->buffer = buffer_;
+
+                    common_fit_moe_cache_bank bank = {};
+                    bank.field_id = field_id;
+                    bank.type = cpu->type;
+                    bank.n_dims = n_dims;
+                    bank.tensor = cache;
+
+                    for (int d = 0; d < GGML_MAX_DIMS; ++d)
+                        bank.ne[d] = cache_ne[d];
+
+                    banks.push_back(bank);
+                }
+
+                layer.*(field.cache) = banks[bank_id].tensor;
+            }
         }
     }
 
-    std::map<ggml_backend_buffer_type_t, size_t> result;
-    for (int i = 0; i < n_backends; ++i) {
-        ggml_backend_t backend = ggml_backend_sched_get_backend(sched, i);
-        if (!backend)
-            continue;
+    void reset() {
+        if (model_) {
+            const int n_layers = (int) model_->hparams.n_layer();
+            const int n_fields = (int) (sizeof(common_fit_moe_cache_fields) / sizeof(common_fit_moe_cache_fields[0]));
 
-        ggml_backend_buffer_type_t buft = ggml_backend_sched_get_buffer_type(sched, backend);
-        if (!buft)
-            continue;
+            for (int il = 0; il < n_layers; ++il) {
+                llama_layer & layer = model_->layers[il];
 
-        result[buft] += max_sizes[(size_t)i];
+                for (int field_id = 0; field_id < n_fields; ++field_id)
+                    layer.*(common_fit_moe_cache_fields[field_id].cache) = nullptr;
+            }
+        }
+
+        if (buffer_)
+            ggml_backend_buffer_free(buffer_);
+
+        if (ctx_)
+            ggml_free(ctx_);
+
+        model_ = nullptr;
+        ctx_ = nullptr;
+        buffer_ = nullptr;
     }
 
-    LOG_TRC("%s: measured %zu graph shapes for worst-case compute buffers\n", __func__, probe_count);
-    for (const auto & [buft, size] : result) {
-        LOG_TRC("%s: %s worst-case compute buffer = %.2f MiB\n", __func__, ggml_backend_buft_name(buft), size / 1024.0 / 1024.0);
-    }
-
-    return result;
-}
+private:
+    llama_model * model_ = nullptr;
+    ggml_context * ctx_ = nullptr;
+    ggml_backend_buffer_t buffer_ = nullptr;
+};
 
 static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         const char * path_model,
         const llama_model_params * mparams,
         const llama_context_params * cparams,
-        ggml_backend_buffer_t param_offloader_arena,
         std::vector<ggml_backend_dev_t> & devs,
         uint32_t & hp_ngl,
         uint32_t & hp_n_ctx_train,
         uint32_t & hp_n_expert,
-        ggml_log_level log_level,
-        bool probe_compute_buffers = false) {
+        ggml_log_level log_level) {
     struct user_data_t {
         struct {
             ggml_log_callback callback;
@@ -157,24 +259,38 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         throw std::runtime_error("failed to load model");
     }
 
-    std::unique_ptr<parameter_offloader> fit_offloader;
+    common_fit_moe_topology moe_topology;
 
     if (cparams->moe_expert_prefetch) {
-        if (!param_offloader_arena) {
+        // The scheduler already reserves every MoE CPU/GPU lane. Fit only needs the logical GPU cache tensors to exist before llama_init_from_model().
+        if (llama_model_n_devices(model) != 1) {
             llama_model_free(model);
             llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
-            throw std::runtime_error("MoE expert prefetch fit requires a parameter offloader arena");
+            throw std::runtime_error("MoE expert prefetch fit currently supports exactly one accelerator device");
         }
 
-        fit_offloader.reset(new parameter_offloader(model));
-        fit_offloader->init_moe_cache(
-            param_offloader_arena,
-            parameter_offloader::MOE_CACHE_SLOT_COUNT);
+        ggml_backend_dev_t dev = llama_model_get_device(model, 0);
+        ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+
+        if (!buft) {
+            llama_model_free(model);
+            llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
+            throw std::runtime_error("MoE expert prefetch fit device has no default buffer type");
+        }
+
+        try {
+            moe_topology.init(model, buft, (int32_t) model->hparams.n_expert_used);
+        } catch (...) {
+            moe_topology.reset();
+            llama_model_free(model);
+            llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
+            throw;
+        }
     }
 
     llama_context * ctx = llama_init_from_model(model, *cparams);
     if (ctx == nullptr) {
-        fit_offloader.reset();
+        moe_topology.reset();
         llama_model_free(model);
         llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
         throw std::runtime_error("failed to create llama_context from model");
@@ -184,20 +300,6 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     std::vector<llama_device_memory_data> ret(nd + 1);
 
     llama_memory_breakdown memory_breakdown = llama_get_memory_breakdown(ctx);
-
-    if (probe_compute_buffers) {
-        try {
-            const auto compute_max = common_probe_compute_buffers(ctx);
-            for (const auto & [buft, size] : compute_max)
-                memory_breakdown[buft].compute = std::max(memory_breakdown[buft].compute, size);
-        } catch (...) {
-            llama_free(ctx);
-            fit_offloader.reset();
-            llama_model_free(model);
-            llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
-            throw;
-        }
-    }
 
     for (const auto & [buft, mb] : memory_breakdown) {
         if (ggml_backend_buft_is_host(buft)) {
@@ -213,7 +315,9 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         }
         for (size_t i = 0; i < nd; i++) {
             if (dev == llama_model_get_device(model, i)) {
-                ret[i].mb.model   += mb.model;
+                if (!mparams->defer_non_host_weights)
+                    ret[i].mb.model += mb.model;
+
                 ret[i].mb.context += mb.context;
                 ret[i].mb.compute += mb.compute;
                 break;
@@ -268,7 +372,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     common_memory_breakdown_print(ctx);
 
     llama_free(ctx);
-    fit_offloader.reset();
+    moe_topology.reset();
     llama_model_free(model);
     llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
 
@@ -285,7 +389,7 @@ common_device_memory_data_vec common_get_device_memory_data(
         uint32_t & hp_n_expert,
         ggml_log_level log_level) {
     std::vector<llama_device_memory_data> impl = common_get_device_memory_data_impl(
-            path_model, mparams, cparams, nullptr, devs, hp_ngl, hp_n_ctx_train, hp_n_expert, log_level);
+            path_model, mparams, cparams, devs, hp_ngl, hp_n_ctx_train, hp_n_expert, log_level);
 
     common_device_memory_data_vec ret(impl.size());
     for (size_t i = 0; i < impl.size(); i++) {
@@ -300,7 +404,6 @@ common_device_memory_data_vec common_get_device_memory_data(
 
 static void common_params_fit_impl(
         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
-        ggml_backend_buffer_t param_offloader_arena,
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
         size_t * margins_s, uint32_t n_ctx_min, enum ggml_log_level log_level) {
     if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
@@ -318,7 +421,7 @@ static void common_params_fit_impl(
     // step 1: get data for default parameters and check whether any changes are necessary in the first place
 
     LOG_TRC("%s: getting device memory data for initial parameters:\n", __func__);
-    const dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, param_offloader_arena, devs, hp_ngl, hp_nct, hp_nex, log_level);
+    const dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
     const size_t nd = devs.size(); // number of devices
 
     std::vector<int64_t> margins; // this function uses int64_t rather than size_t for memory sizes to more conveniently handle deficits
@@ -453,7 +556,7 @@ static void common_params_fit_impl(
 
                     int64_t sum_projected_used_min_ctx = 0;
                     cparams->n_ctx = n_ctx_min;
-                    const dmds_t dmds_min_ctx = common_get_device_memory_data_impl(path_model, mparams, cparams, param_offloader_arena, devs, hp_ngl, hp_nct, hp_nex, log_level);
+                    const dmds_t dmds_min_ctx = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
                     if (nd == 0) {
                         sum_projected_used_min_ctx = dmds_min_ctx.back().mb.total();
                     } else {
@@ -632,7 +735,7 @@ static void common_params_fit_impl(
         set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, mparams_copy);
 
         const dmds_t dmd_nl = common_get_device_memory_data_impl(
-            path_model, &mparams_copy, cparams, param_offloader_arena, devs, hp_ngl, hp_nct, hp_nex, log_level);
+            path_model, &mparams_copy, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
 
         LOG_TRC("%s: memory for test allocation by device:\n", func_name);
         for (size_t id = 0; id < nd; id++) {
@@ -660,7 +763,7 @@ static void common_params_fit_impl(
 
         LOG_TRC("%s: getting device memory data with all MoE tensors moved to system memory:\n", __func__);
         const dmds_t dmds_cpu_moe = common_get_device_memory_data_impl(
-            path_model, mparams, cparams, param_offloader_arena, devs, hp_ngl, hp_nct, hp_nex, log_level);
+            path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
 
         for (size_t id = 0; id < nd; id++) {
             global_surplus_cpu_moe += dmds_cpu_moe[id].free;
@@ -916,7 +1019,6 @@ enum common_params_fit_status common_fit_params(
         const char * path_model,
         llama_model_params * mparams,
         llama_context_params * cparams,
-        ggml_backend_buffer_t param_offloader_arena,
         float * tensor_split,
         llama_model_tensor_buft_override * tensor_buft_overrides,
         size_t * margins,
@@ -925,7 +1027,7 @@ enum common_params_fit_status common_fit_params(
     const int64_t t0_us = llama_time_us();
     common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
     try {
-        common_params_fit_impl(path_model, mparams, cparams, param_offloader_arena, tensor_split, tensor_buft_overrides, margins, n_ctx_min, log_level);
+        common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, log_level);
         LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
     } catch (const common_params_fit_exception & e) {
         LOG_WRN("%s: failed to fit params to free device memory: %s\n", __func__, e.what());
@@ -936,121 +1038,6 @@ enum common_params_fit_status common_fit_params(
     }
     const int64_t t1_us = llama_time_us();
     LOG_TRC("%s: fitting params to free memory took %.2f seconds\n", __func__, (t1_us - t0_us) * 1e-6);
-    return status;
-}
-
-
-enum common_params_fit_status common_fit_parameter_offloader(
-        const char * path_model,
-        llama_model_params * mparams,
-        llama_context_params * cparams,
-        ggml_backend_dev_t device,
-        size_t * arena_size,
-        size_t margin,
-        size_t max_arena_size,
-        const std::vector<std::string> & cpu_patterns,
-        ggml_log_level log_level) {
-    const int64_t t0_us = llama_time_us();
-    common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
-
-    if (!mparams || !cparams || !device || !arena_size) {
-        LOG_ERR("%s: invalid parameter-offloader fit arguments\n", __func__);
-        return COMMON_PARAMS_FIT_STATUS_ERROR;
-    }
-
-    // Retained only for API compatibility while --param-offload-cpu is being
-    // deprecated. Any such patterns have already been converted to ordinary
-    // stock tensor-placement overrides in common.cpp before this function is
-    // called.
-    (void) cpu_patterns;
-
-    *arena_size = 0;
-
-    try {
-        // Probe exactly the same execution placement that will be used by the
-        // real model load. common_get_device_memory_data_impl() switches the
-        // copy to no_alloc internally, so device-selected weights keep their
-        // stock BUFT identity without consuming their reported model bytes.
-        llama_model_params mparams_probe = *mparams;
-        llama_context_params cparams_probe = *cparams;
-        mparams_probe.defer_non_host_weights = true;
-
-        // The arena does not exist yet, so the MoE cache cannot be instantiated
-        // during this sizing probe. Its storage comes out of the arena itself;
-        // disabling the cache here must not change stock tensor placement.
-        cparams_probe.moe_expert_prefetch = false;
-
-        //TODO: Generalize this probe together with parameter_offloader before supporting multiple accelerator devices; the current arena targets one CUDA device.
-        std::vector<ggml_backend_dev_t> devs;
-        uint32_t hp_ngl = 0;
-        uint32_t hp_n_ctx_train = 0;
-        uint32_t hp_n_expert = 0;
-
-        const std::vector<llama_device_memory_data> dmds = common_get_device_memory_data_impl(
-            path_model, &mparams_probe, &cparams_probe, nullptr,
-            devs, hp_ngl, hp_n_ctx_train, hp_n_expert, log_level, true);
-
-        size_t device_id = devs.size();
-        for (size_t id = 0; id < devs.size(); ++id) {
-            if (devs[id] == device) {
-                device_id = id;
-                break;
-            }
-        }
-
-        if (device_id == devs.size())
-            throw std::runtime_error("parameter-offloader device is not part of the model device set");
-
-        const llama_device_memory_data & dmd = dmds[device_id];
-
-        // dmd.mb.model is intentionally NOT part of the VRAM budget here. The
-        // no_alloc probe reports how many bytes stock would normally place on
-        // this device, but parameter-offloader defers those bytes into its arena.
-        // Context and worst-case compute reservations remain real independent
-        // device allocations and therefore reduce the arena budget.
-        const int64_t projected_context = (int64_t)dmd.mb.context;
-        const int64_t projected_compute = (int64_t)dmd.mb.compute;
-        const int64_t projected_non_model = projected_context + projected_compute;
-        const int64_t available = dmd.free - projected_non_model - (int64_t)margin;
-
-        if (available <= 0)
-            throw common_params_fit_exception(
-                "no VRAM remains for the parameter-offloader arena after projected context/compute allocations and margin");
-
-        size_t selected = (size_t)available;
-        if (max_arena_size != 0)
-            selected = std::min(selected, max_arena_size);
-
-        //TODO: Add a minimum viable arena-size check once the offloader's graph-derived minimum streaming requirement is exposed to the fitter.
-        *arena_size = selected;
-
-        // Do not mutate mparams here. The caller already supplied the final
-        // stock execution placement, and the real model load must use exactly
-        // the same placement that was probed above.
-
-        constexpr int64_t MiB = 1024 * 1024;
-        LOG_TRC(
-            "%s: device=%s free=%" PRId64
-            " MiB deferred_model=%zu MiB projected_context=%" PRId64
-            " MiB projected_compute=%" PRId64 " MiB margin=%zu MiB arena=%zu MiB\n",
-            __func__,
-            ggml_backend_dev_name(device),
-            dmd.free / MiB,
-            dmd.mb.model / (size_t)MiB,
-            projected_context / MiB,
-            projected_compute / MiB,
-            margin / (size_t)MiB,
-            selected / (size_t)MiB);
-    } catch (const common_params_fit_exception & e) {
-        LOG_WRN("%s: failed to fit parameter-offloader arena: %s\n", __func__, e.what());
-        status = COMMON_PARAMS_FIT_STATUS_FAILURE;
-    } catch (const std::runtime_error & e) {
-        LOG_ERR("%s: encountered an error while fitting parameter-offloader arena: %s\n", __func__, e.what());
-        status = COMMON_PARAMS_FIT_STATUS_ERROR;
-    }
-
-    const int64_t t1_us = llama_time_us();
-    LOG_TRC("%s: parameter-offloader fitting took %.2f seconds\n", __func__, (t1_us - t0_us) * 1e-6);
     return status;
 }
 
@@ -1205,7 +1192,7 @@ void common_fit_print(
     uint32_t hp_nct = 0; // hparams.n_ctx_train
     uint32_t hp_nex = 0; // hparams.n_expert
 
-    auto dmd = common_get_device_memory_data_impl(path_model, mparams, cparams, nullptr, devs, hp_ngl, hp_nct, hp_nex, GGML_LOG_LEVEL_ERROR);
+    auto dmd = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, GGML_LOG_LEVEL_ERROR);
     GGML_ASSERT(dmd.size() == devs.size() + 1);
 
     for (size_t id = 0; id < devs.size(); id++) {
@@ -1222,3 +1209,4 @@ void common_fit_print(
     printf("%zu ", dmd.back().mb.compute/1024/1024);
     printf("\n");
 }
+

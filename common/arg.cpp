@@ -751,7 +751,7 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
                 throw std::invalid_argument(string_format("error: invalid argument: %s", arg.c_str()));
             }
             if (!seen_args.insert(arg).second) {
-                const bool skip = (arg == "--spec-type" || arg == "--param-offload-cpu");
+                const bool skip = (arg == "--spec-type");
 
                 if (!skip) {
                     LOG_WRN("DEPRECATED: argument '%s' specified multiple times, use comma-separated values instead (only last value will be used)\n", arg.c_str());
@@ -826,12 +826,11 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         };
 
         const bool param_offload_fixed_vram = has_arg({"--param-offload-vram"});
-        const bool param_offload_cpu = has_arg({"--param-offload-cpu"});
         const bool param_offload_margin = has_arg({"--param-offload-vram-margin"});
         const bool param_offload_moe_prefetch = has_arg_or_env({"--moe-expert-prefetch", "--no-moe-expert-prefetch"});
 
         if (!params.param_offload &&
-            (param_offload_fixed_vram || param_offload_cpu || param_offload_margin || param_offload_moe_prefetch)) {
+            (param_offload_fixed_vram || param_offload_margin || param_offload_moe_prefetch)) {
             throw std::invalid_argument("parameter-offloader options require --param-offload");
         }
 
@@ -842,6 +841,10 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
 
     // parse all CLI args now, so that -hf is available below for remote preset resolution
     parse_cli_args();
+
+    if (params.param_offload && params.n_gpu_layers == -1) {
+        throw std::invalid_argument("--param-offload does not support --n-gpu-layers auto; specify an explicit layer count or 'all'");
+    }
 
     postprocess_cpu_params(params.cpuparams,       nullptr);
     postprocess_cpu_params(params.cpuparams_batch, &params.cpuparams);
@@ -2685,15 +2688,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ));
     add_opt(common_arg(
-        {"--param-offload-cpu"}, "REGEX",
-        "keep tensors matching REGEX on CPU instead of managing them with the parameter offloader; may be specified multiple times",
-        [](common_params & params, const std::string & value) {
-            params.param_offload_cpu.push_back(value);
-        }
-    ));
-    add_opt(common_arg(
         {"--param-offload-vram-margin"}, "MIB",
-        string_format("VRAM margin to reserve outside the parameter-offloader arena (default: %zu MiB)", params.param_offload_vram_margin / (1024ull * 1024ull)),
+        string_format("VRAM margin to reserve outside the parameter-offloader arena (default: %llu MiB)", params.param_offload_vram_margin / (1024ull * 1024ull)),
         [](common_params & params, const std::string & value) {
             params.param_offload_vram_margin = std::stoull(value) * 1024ull * 1024ull;
         }

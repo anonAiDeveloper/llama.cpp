@@ -1242,84 +1242,101 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     auto cparams = common_context_params_to_llama(params);
 
     bool parameter_offloader_active = false;
+    ggml_backend_dev_t parameter_offloader_device = nullptr;
 
-    // Storage for parameter-offloader placement overrides. The pattern pointers
-    // borrow from strings owned by `params`, which outlive model loading below.
-    std::vector<llama_model_tensor_buft_override> parameter_offloader_tensor_buft_overrides;
+    const size_t MiB = 1024ull * 1024ull;
 
     if (!model_only && params.param_offload) {
         //TODO: Today this only supports CUDA. Given how simple ggml-cuda-arena.cu is I dont think it'd be too hard to support other types of device?
-        ggml_backend_dev_t cuda_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+        parameter_offloader_device = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
 
-        if (!cuda_dev) {
+        if (!parameter_offloader_device) {
             COM_ERR("%s", "parameter offloader requires a GPU device\n");
             return;
         }
 
-        // Configure the model exactly as it will be loaded at runtime before
-        // probing memory. Stock owns execution placement; the parameter
-        // offloader only changes physical residency for tensors stock places on
-        // a non-host device.
+        // Stock owns execution placement; deferred non-host model bytes keep that placement but are excluded from fit residency.
         mparams.defer_non_host_weights = true;
 
-        // CPU-resident weights should use ordinary CPU storage. In particular,
-        // do not pin/repack the full CPU portion of the model just because the
-        // parameter offloader is enabled.
+        // Keep CPU-resident weights in ordinary CPU storage; do not pin/repack the full CPU portion for parameter offload.
         mparams.no_host = true;
         mparams.use_extra_bufts = false;
 
-        // --param-offload-cpu is retained for compatibility for now, but its
-        // only effect is to feed an ordinary stock tensor-placement override.
-        // Put these overrides first so they win over broader existing overrides.
-        parameter_offloader_tensor_buft_overrides.reserve(
-            params.param_offload_cpu.size() +
-            params.tensor_buft_overrides.size() + 1);
+        // A fixed arena is a real allocation, so reserve it before stock fit; the fitter then sees the reduced free VRAM.
+        if (!params.param_offload_fit) {
+            const size_t arena_bytes = params.param_offload_vram;
 
-        for (const std::string & pattern : params.param_offload_cpu) {
-            parameter_offloader_tensor_buft_overrides.push_back({
-                pattern.c_str(),
-                ggml_backend_cpu_buffer_type(),
-            });
-        }
+            pimpl->param_offloader_arena = ggml_cuda_arena_create_on(parameter_offloader_device, arena_bytes, 0);
 
-        for (const auto & override_ : params.tensor_buft_overrides) {
-            if (override_.pattern == nullptr)
-                break;
-
-            parameter_offloader_tensor_buft_overrides.push_back(override_);
-        }
-
-        parameter_offloader_tensor_buft_overrides.push_back({ nullptr, nullptr });
-        mparams.tensor_buft_overrides = parameter_offloader_tensor_buft_overrides.data();
-
-        const size_t MiB = 1024ull * 1024ull;
-        size_t arena_bytes = 0;
-
-        if (params.param_offload_fit) {
-            //TODO: Replace the single margin with separate runtime headroom and measured maximum temporary device-packing scratch.
-            const size_t margin = params.param_offload_vram_margin;
-            const size_t max_arena_size = PARAMETER_OFFLOADER_VRAM_MAX_MIB == 0 ? 0 : (size_t)PARAMETER_OFFLOADER_VRAM_MAX_MIB * MiB;
-
-            COM_TRC("%s", "fitting parameter-offloader arena to device memory ...\n");
-
-            const common_params_fit_status fit_status = common_fit_parameter_offloader(
-                params.model.path.c_str(),
-                &mparams,
-                &cparams,
-                cuda_dev,
-                &arena_bytes,
-                margin,
-                max_arena_size,
-                params.param_offload_cpu,
-                params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
-
-            if (fit_status != COMMON_PARAMS_FIT_STATUS_SUCCESS)
+            if (!pimpl->param_offloader_arena) {
+                COM_ERR("%s: failed to allocate %zu MiB parameter-offloader arena\n", __func__, arena_bytes / MiB);
                 return;
-        } else {
-            arena_bytes = params.param_offload_vram;
+            }
+
+            parameter_offloader_active = true;
+            COM_INF("%s: parameter-offloader arena = %zu MiB (fixed)\n", __func__, arena_bytes / MiB);
+        }
+    }
+
+    if (params.fit_params) {
+        COM_TRC("%s", "fitting params to device memory ...\n");
+        COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
+
+        // Automatic deferred storage leaves only the free-space margin for stock fit; deferred non-host model bytes are ignored by fit.cpp.
+        auto fit_targets = params.fit_params_target;
+        size_t * fit_targets_data = params.fit_params_target.data();
+
+        if (params.param_offload && params.param_offload_fit) {
+            std::fill(fit_targets.begin(), fit_targets.end(), params.param_offload_vram_margin);
+            fit_targets_data = fit_targets.data();
         }
 
-        pimpl->param_offloader_arena = ggml_cuda_arena_create_on(cuda_dev, arena_bytes, 0);
+        const common_params_fit_status fit_status = common_fit_params(params.model.path.c_str(), &mparams, &cparams, params.tensor_split,
+            params.tensor_buft_overrides.data(), fit_targets_data, params.fit_params_min_ctx, params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+
+        if (fit_status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+            return;
+        }
+    }
+
+    if (!model_only && params.param_offload && params.param_offload_fit) {
+        std::vector<ggml_backend_dev_t> fit_devs;
+        uint32_t hp_ngl = 0;
+        uint32_t hp_n_ctx_train = 0;
+        uint32_t hp_n_expert = 0;
+
+        const common_device_memory_data_vec dmds = common_get_device_memory_data(params.model.path.c_str(), &mparams, &cparams, fit_devs, hp_ngl, hp_n_ctx_train, hp_n_expert,
+            params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+
+        size_t device_id = fit_devs.size();
+        for (size_t i = 0; i < fit_devs.size(); ++i) {
+            if (fit_devs[i] == parameter_offloader_device) {
+                device_id = i;
+                break;
+            }
+        }
+
+        if (device_id == fit_devs.size() || device_id >= dmds.size()) {
+            COM_ERR("%s", "parameter-offloader device is not part of the fitted model device set\n");
+            return;
+        }
+
+        const common_device_memory_data & dmd = dmds[device_id];
+        const int64_t projected_used = (int64_t) dmd.model + (int64_t) dmd.context + (int64_t) dmd.compute;
+        const int64_t arena_available = (int64_t) dmd.free - projected_used - (int64_t) params.param_offload_vram_margin;
+
+        if (arena_available <= 0) {
+            COM_ERR("%s: no VRAM remains for the parameter-offloader arena after projected resident model/context/compute allocations and margin\n", __func__);
+            return;
+        }
+
+        size_t arena_bytes = (size_t) arena_available;
+
+        if (PARAMETER_OFFLOADER_VRAM_MAX_MIB != 0) {
+            arena_bytes = std::min(arena_bytes, (size_t) PARAMETER_OFFLOADER_VRAM_MAX_MIB * MiB);
+        }
+
+        pimpl->param_offloader_arena = ggml_cuda_arena_create_on(parameter_offloader_device, arena_bytes, 0);
 
         if (!pimpl->param_offloader_arena) {
             COM_ERR("%s: failed to allocate %zu MiB parameter-offloader arena\n", __func__, arena_bytes / MiB);
@@ -1328,25 +1345,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
         parameter_offloader_active = true;
 
-        if (params.param_offload_fit) {
-            COM_INF("%s: parameter-offloader arena = %zu MiB; reserved free VRAM = %zu MiB\n",
-                __func__, arena_bytes / MiB, params.param_offload_vram_margin / MiB);
-        } else {
-            COM_INF("%s: parameter-offloader arena = %zu MiB (fixed)\n", __func__, arena_bytes / MiB);
-        }
-    }
-
-    //TODO: When parameter_offloader_active is true, reuse only the stock context-size reduction stage instead of bypassing --fit entirely.
-    if (params.fit_params && !parameter_offloader_active) {
-        COM_TRC("%s", "fitting params to device memory ...\n");
-        COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
-        common_fit_params(params.model.path.c_str(), &mparams, &cparams,
-            nullptr,
-            params.tensor_split,
-            params.tensor_buft_overrides.data(),
-            params.fit_params_target.data(),
-            params.fit_params_min_ctx,
-            params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+        COM_INF("%s: parameter-offloader arena = %zu MiB; projected resident VRAM = %lld MiB; reserved free VRAM = %zu MiB\n", __func__, arena_bytes / MiB,
+            (long long) (projected_used / (int64_t) MiB), params.param_offload_vram_margin / MiB);
     }
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
@@ -1432,9 +1432,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         pimpl->param_offloader.reset(new parameter_offloader(model));
 
         if (cparams.moe_expert_prefetch) {
-            pimpl->param_offloader->init_moe_cache(
-                pimpl->param_offloader_arena,
-                parameter_offloader::MOE_CACHE_SLOT_COUNT);
+            pimpl->param_offloader->init_moe_cache(pimpl->param_offloader_arena, (int32_t) model->hparams.n_expert_used);
         }
 
         init_parameter_offloader(params);
