@@ -27,6 +27,15 @@ common_params_fit_status common_fit_params(
                            uint32_t   n_ctx_min,             // minimum context size to set when trying to reduce memory use
                      ggml_log_level   log_level);            // minimum log level to print during fitting, lower levels go to debug log
 
+// redistributes the final parameter-offload device-weight budget over graph-ordered placement groups
+// fit_generated_overrides indicates that tensor_buft_overrides were produced by common_fit_params()
+common_params_fit_status common_fit_distribute_param_offload(
+                         const char * path_model,
+                 llama_model_params * mparams,
+         const llama_context_params * cparams,
+   llama_model_tensor_buft_override * tensor_buft_overrides,
+                               bool   fit_generated_overrides);
+
 // print estimated memory to stdout
 void common_fit_print(
                          const char * path_model,

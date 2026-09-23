@@ -2548,6 +2548,9 @@ llm_graph_cb llama_context::graph_get_cb() const {
         const bool full_offload = model.n_gpu_layers() > model.hparams.n_layer_all;
         if (ubatch.n_tokens < 32 || full_offload) {
             if (il != -1 && (strcmp(name, "norm") == 0 || strcmp(name, "l_last") == 0)) {
+                // TODO: dev_layer remains the stock layer-level default when tensor overrides
+                // distribute weights within a layer. Revisit this scheduling hint if distributed
+                // parameter placement exposes a concrete backend scheduling problem.
                 const auto & dev_layer = model.dev_layer(il);
                 for (const auto & backend : backends) {
                     if (ggml_backend_get_device(backend.get()) == dev_layer) {
@@ -3894,6 +3897,40 @@ struct ggml_cgraph * llama_graph_reserve(
         mctx = memory->init_full();
     }
     return ctx->graph_reserve(n_tokens, n_seqs, n_outputs, mctx.get());
+}
+
+using llama_reserve_graph_walk_callback = void (*)(ggml_cgraph * graph, uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, void * user_data);
+
+// Rebuild the same representative PP/TG graph shapes used by sched_reserve(), but split only so callers can inspect graph topology without allocating compute buffers.
+LLAMA_API bool llama_context_walk_reserve_graphs(llama_context * ctx, llama_reserve_graph_walk_callback callback, void * user_data) {
+    GGML_ASSERT(ctx);
+    GGML_ASSERT(callback);
+
+    auto memory = ctx->get_memory();
+    llama_memory_context_ptr mctx;
+    if (memory) {
+        mctx = memory->init_full();
+        if (!mctx)
+            return false;
+    }
+
+    const llama_cparams & cparams = ctx->get_cparams();
+    const uint32_t n_seqs = cparams.n_seq_max;
+    const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+    const uint32_t n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
+
+    ggml_cgraph * gf = ctx->graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(), true);
+    if (!gf)
+        return false;
+    callback(gf, n_tokens, n_seqs, n_outputs_pp, user_data);
+
+    gf = ctx->graph_reserve(n_seqs, n_seqs, n_seqs, mctx.get(), true);
+    if (!gf)
+        return false;
+    callback(gf, n_seqs, n_seqs, n_seqs, user_data);
+
+    // TODO: Extend this list if stock sched_reserve() starts using another representative graph shape for general reservation.
+    return true;
 }
 
 // llama adapter API

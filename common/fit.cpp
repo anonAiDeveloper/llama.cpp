@@ -5,13 +5,22 @@
 #include "../src/llama-ext.h"
 #include "../src/llama-model.h"
 
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <stdexcept>
 #include <cinttypes>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <vector>
+
+// Maximum number of redistributed GPU placement windows. 0 leaves stock placement unchanged.
+#ifndef COMMON_FIT_PARAM_OFFLOAD_GPU_GROUPS
+#define COMMON_FIT_PARAM_OFFLOAD_GPU_GROUPS 8
+#endif
+
+static_assert(COMMON_FIT_PARAM_OFFLOAD_GPU_GROUPS >= 0, "COMMON_FIT_PARAM_OFFLOAD_GPU_GROUPS must be non-negative");
 
 // this enum is only used in llama_params_fit_impl but needs to be defined outside of it to fix a Windows compilation issue
 // enum to identify part of a layer for distributing its tensors:
@@ -25,6 +34,38 @@ enum common_layer_fraction_t {
 
 class common_params_fit_exception : public std::runtime_error {
     using std::runtime_error::runtime_error;
+};
+
+using common_fit_graph_walk_callback = void (*)(ggml_cgraph * graph, uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, void * user_data);
+
+// Internal helper implemented in llama-context.cpp. It rebuilds the same representative PP/TG graphs used by stock scheduler reservation without allocating compute buffers.
+LLAMA_API bool llama_context_walk_reserve_graphs(llama_context * ctx, common_fit_graph_walk_callback callback, void * user_data);
+
+struct common_fit_placement_tensor {
+    std::string name;
+    ggml_backend_buffer_type_t device_buft = nullptr;
+    bool device_eligible = false;
+    bool graph_seen = false;
+};
+
+struct common_fit_placement_region {
+    bool device_eligible = false;
+    std::vector<std::string> tensors;
+};
+
+struct common_fit_placement_graph {
+    uint32_t n_tokens = 0;
+    uint32_t n_seqs = 0;
+    uint32_t n_outputs = 0;
+    std::vector<common_fit_placement_region> regions;
+    std::vector<std::vector<size_t>> weight_nodes;
+};
+
+struct common_fit_placement_probe_result {
+    size_t n_devices = 0;
+    size_t n_blocks = 0;
+    std::vector<common_fit_placement_tensor> tensors;
+    std::vector<common_fit_placement_graph> graphs;
 };
 
 // MoE expert prefetch does not choose CPU/GPU placement while the graph is built. Each MoE block is built with K + 1 lanes covering every possible CPU/GPU split of the K selected experts.
@@ -223,6 +264,670 @@ private:
     ggml_backend_buffer_t buffer_ = nullptr;
 };
 
+static void common_fit_moe_topology_init(common_fit_moe_topology & topology, llama_model * model, const llama_context_params & cparams) {
+    if (!cparams.moe_expert_prefetch)
+        return;
+
+    if (llama_model_n_devices(model) != 1)
+        throw std::runtime_error("MoE expert prefetch fit currently supports exactly one accelerator device");
+
+    ggml_backend_dev_t dev = llama_model_get_device(model, 0);
+    ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+    if (!buft)
+        throw std::runtime_error("MoE expert prefetch fit device has no default buffer type");
+
+    topology.init(model, buft, (int32_t) model->hparams.n_expert_used);
+}
+
+static ggml_tensor * common_fit_placement_root(ggml_tensor * tensor) {
+    while (tensor && tensor->view_src)
+        tensor = tensor->view_src;
+
+    return tensor;
+}
+
+static ggml_backend_buffer_type_t common_fit_placement_device_buft(const llama_model * model, ggml_tensor * tensor) {
+    tensor = common_fit_placement_root(tensor);
+    if (!tensor || !tensor->buffer)
+        return nullptr;
+
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(tensor->buffer);
+    if (!buft || ggml_backend_buft_is_host(buft))
+        return nullptr;
+
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    if (!dev)
+        return nullptr;
+
+    for (int i = 0; i < llama_model_n_devices(model); ++i) {
+        if (llama_model_get_device(model, i) == dev)
+            return buft;
+    }
+
+    return nullptr;
+}
+
+struct common_fit_placement_capture {
+    common_fit_placement_probe_result * result = nullptr;
+    std::unordered_map<ggml_tensor *, size_t> tensor_index;
+};
+
+static void common_fit_placement_capture_graph(ggml_cgraph * graph, uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, void * user_data) {
+    common_fit_placement_capture * capture = static_cast<common_fit_placement_capture *>(user_data);
+    GGML_ASSERT(capture);
+    GGML_ASSERT(capture->result);
+    GGML_ASSERT(graph);
+
+    common_fit_placement_graph graph_result;
+    graph_result.n_tokens = n_tokens;
+    graph_result.n_seqs = n_seqs;
+    graph_result.n_outputs = n_outputs;
+
+    for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+        ggml_tensor * node = ggml_graph_node(graph, i);
+        std::vector<size_t> node_weights;
+        bool node_device_eligible = true;
+
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            ggml_tensor * weight = common_fit_placement_root(node->src[j]);
+            if (!weight)
+                continue;
+
+            auto it = capture->tensor_index.find(weight);
+            if (it == capture->tensor_index.end())
+                continue;
+
+            if (std::find(node_weights.begin(), node_weights.end(), it->second) != node_weights.end())
+                continue;
+
+            node_weights.push_back(it->second);
+            node_device_eligible = node_device_eligible && capture->result->tensors[it->second].device_eligible;
+        }
+
+        if (node_weights.empty())
+            continue;
+
+        graph_result.weight_nodes.push_back(node_weights);
+
+        for (size_t tensor_index : node_weights)
+            capture->result->tensors[tensor_index].graph_seen = true;
+
+        if (graph_result.regions.empty() || graph_result.regions.back().device_eligible != node_device_eligible) {
+            graph_result.regions.emplace_back();
+            graph_result.regions.back().device_eligible = node_device_eligible;
+        }
+
+        common_fit_placement_region & region = graph_result.regions.back();
+        for (size_t tensor_index : node_weights) {
+            const common_fit_placement_tensor & tensor = capture->result->tensors[tensor_index];
+            if (std::find(region.tensors.begin(), region.tensors.end(), tensor.name) == region.tensors.end())
+                region.tensors.push_back(tensor.name);
+        }
+    }
+
+    capture->result->graphs.push_back(std::move(graph_result));
+}
+
+static const char * common_fit_placement_policy_pattern(common_layer_fraction_t fraction) {
+    switch (fraction) {
+        case LAYER_FRACTION_NONE:
+            return nullptr;
+        case LAYER_FRACTION_ATTN:
+            return "blk\\.\\d+\\.ffn_(gate|up|gate_up|down).*";
+        case LAYER_FRACTION_UP:
+            return "blk\\.\\d+\\.ffn_(gate|gate_up|down).*";
+        case LAYER_FRACTION_GATE:
+            return "blk\\.\\d+\\.ffn_down.*";
+        case LAYER_FRACTION_MOE:
+            return "blk\\.\\d+\\.ffn_(up|down|gate_up|gate)_(ch|)exps";
+    }
+
+    GGML_ABORT("fatal error");
+}
+
+static common_layer_fraction_t common_fit_placement_policy_from_fit_overrides(const llama_model_params & mparams, size_t & n_policy_overrides) {
+    n_policy_overrides = 0;
+    if (!mparams.tensor_buft_overrides)
+        return LAYER_FRACTION_NONE;
+
+    common_layer_fraction_t fraction = LAYER_FRACTION_NONE;
+
+    for (const llama_model_tensor_buft_override * override = mparams.tensor_buft_overrides; override->pattern; ++override) {
+        if (!override->buft || !ggml_backend_buft_is_host(override->buft))
+            continue;
+
+        const std::string pattern = override->pattern;
+        const size_t suffix_pos = pattern.find("\\.ffn_");
+        if (suffix_pos == std::string::npos)
+            continue;
+
+        const std::string suffix = pattern.substr(suffix_pos);
+        if (suffix == "\\.ffn_(up|down|gate_up|gate)_(ch|)exps") {
+            ++n_policy_overrides;
+            fraction = LAYER_FRACTION_MOE;
+        } else if (suffix == "\\.ffn_(gate|up|gate_up|down).*") {
+            ++n_policy_overrides;
+            if (fraction == LAYER_FRACTION_NONE)
+                fraction = LAYER_FRACTION_ATTN;
+        } else if (suffix == "\\.ffn_(gate|gate_up|down).*") {
+            ++n_policy_overrides;
+            if (fraction == LAYER_FRACTION_NONE)
+                fraction = LAYER_FRACTION_UP;
+        } else if (suffix == "\\.ffn_down.*") {
+            ++n_policy_overrides;
+            if (fraction == LAYER_FRACTION_NONE)
+                fraction = LAYER_FRACTION_GATE;
+        }
+    }
+
+    return fraction;
+}
+
+static common_fit_placement_probe_result common_fit_probe_placement(
+        const char * path_model,
+        const llama_model_params * mparams,
+        const llama_context_params * cparams,
+        common_layer_fraction_t policy_fraction,
+        bool fit_generated_overrides) {
+    common_fit_placement_probe_result result;
+
+    llama_model_params probe_mparams = *mparams;
+    probe_mparams.n_gpu_layers = -1;
+    probe_mparams.no_alloc = true;
+    probe_mparams.load_mode = LLAMA_LOAD_MODE_NONE;
+    probe_mparams.defer_non_host_weights = false;
+
+    llama_model_tensor_buft_override policy_overrides[2] = {};
+    if (fit_generated_overrides) {
+        // Stock fit's overflow overrides are positional. Remove only that layer location and
+        // extrapolate the placement class it selected across the repeating layers.
+        if (const char * pattern = common_fit_placement_policy_pattern(policy_fraction)) {
+            policy_overrides[0] = { pattern, ggml_backend_cpu_buffer_type() };
+            policy_overrides[1] = { nullptr, nullptr };
+            probe_mparams.tensor_buft_overrides = policy_overrides;
+        } else {
+            probe_mparams.tensor_buft_overrides = nullptr;
+        }
+    }
+
+    llama_model * model = llama_model_load_from_file(path_model, probe_mparams);
+    if (!model)
+        throw std::runtime_error("failed to load placement probe model");
+
+    result.n_devices = llama_model_n_devices(model);
+    result.n_blocks = llama_model_n_layer(model);
+
+    llama_context * ctx = nullptr;
+    common_fit_moe_topology moe_topology;
+
+    try {
+        common_fit_placement_capture capture;
+        capture.result = &result;
+
+        const auto & tensor_map = llama_internal_get_tensor_map(model);
+        result.tensors.reserve(tensor_map.size());
+        capture.tensor_index.reserve(tensor_map.size());
+
+        for (const auto & [name, tensor_raw] : tensor_map) {
+            ggml_tensor * tensor = common_fit_placement_root(tensor_raw);
+            if (!tensor || capture.tensor_index.find(tensor) != capture.tensor_index.end())
+                continue;
+
+            const size_t tensor_index = result.tensors.size();
+            ggml_backend_buffer_type_t device_buft = common_fit_placement_device_buft(model, tensor);
+            capture.tensor_index.emplace(tensor, tensor_index);
+            result.tensors.push_back({ name, device_buft, device_buft != nullptr, false });
+        }
+
+        llama_context_params probe_cparams = *cparams;
+        probe_cparams.cb_eval = nullptr;
+        probe_cparams.cb_eval_user_data = nullptr;
+        probe_cparams.cb_graph = nullptr;
+        probe_cparams.cb_graph_user_data = nullptr;
+        probe_cparams.cb_moe_residency = nullptr;
+        probe_cparams.cb_moe_residency_user_data = nullptr;
+
+        common_fit_moe_topology_init(moe_topology, model, probe_cparams);
+
+        ctx = llama_init_from_model(model, probe_cparams);
+        if (!ctx)
+            throw std::runtime_error("failed to create placement probe context");
+
+        if (!llama_context_walk_reserve_graphs(ctx, common_fit_placement_capture_graph, &capture))
+            throw std::runtime_error("failed to build placement probe graphs");
+
+        llama_free(ctx);
+        ctx = nullptr;
+        moe_topology.reset();
+        llama_model_free(model);
+        model = nullptr;
+    } catch (...) {
+        if (ctx)
+            llama_free(ctx);
+        moe_topology.reset();
+        if (model)
+            llama_model_free(model);
+        throw;
+    }
+
+    return result;
+}
+
+static void common_fit_placement_probe_print(const common_fit_placement_probe_result & result) {
+    size_t n_device_eligible = 0;
+    size_t n_seen = 0;
+
+    for (const common_fit_placement_tensor & tensor : result.tensors) {
+        n_device_eligible += tensor.device_eligible ? 1 : 0;
+        n_seen += tensor.graph_seen ? 1 : 0;
+        LOG_TRC("common_fit: placement tensor: %-64s device_eligible=%d graph_seen=%d\n", tensor.name.c_str(), tensor.device_eligible ? 1 : 0, tensor.graph_seen ? 1 : 0);
+    }
+
+    LOG_INF("common_fit: placement probe: %zu graphs, %zu/%zu tensors seen in graphs, %zu device eligible, %zu CPU required\n",
+        result.graphs.size(), n_seen, result.tensors.size(), n_device_eligible, result.tensors.size() - n_device_eligible);
+
+    for (size_t graph_id = 0; graph_id < result.graphs.size(); ++graph_id) {
+        const common_fit_placement_graph & graph = result.graphs[graph_id];
+        LOG_TRC("common_fit: placement graph %zu: n_tokens=%u n_seqs=%u n_outputs=%u regions=%zu\n",
+            graph_id, graph.n_tokens, graph.n_seqs, graph.n_outputs, graph.regions.size());
+
+        for (size_t region_id = 0; region_id < graph.regions.size(); ++region_id) {
+            const common_fit_placement_region & region = graph.regions[region_id];
+            LOG_TRC("common_fit:   region %zu: %s, %zu tensors\n", region_id, region.device_eligible ? "DEVICE_ELIGIBLE" : "CPU_REQUIRED", region.tensors.size());
+
+            for (const std::string & name : region.tensors)
+                LOG_TRC("common_fit:     %s\n", name.c_str());
+        }
+    }
+
+    if (n_seen != result.tensors.size()) {
+        // TODO: Add another stock-representative graph shape if a model needs one for placement coverage.
+        for (const common_fit_placement_tensor & tensor : result.tensors) {
+            if (!tensor.graph_seen)
+                LOG_TRC("common_fit: placement tensor not present in PP/TG reserve graphs: %s\n", tensor.name.c_str());
+        }
+    }
+}
+
+static int common_fit_placement_block_id(const std::string & name) {
+    if (name.size() < 6 || name.compare(0, 4, "blk.") != 0)
+        return -1;
+
+    size_t pos = 4;
+    int block_id = 0;
+    bool have_digit = false;
+
+    while (pos < name.size() && name[pos] >= '0' && name[pos] <= '9') {
+        have_digit = true;
+        block_id = block_id * 10 + (name[pos] - '0');
+        ++pos;
+    }
+
+    return have_digit && pos < name.size() && name[pos] == '.' ? block_id : -1;
+}
+
+static std::vector<std::vector<size_t>> common_fit_placement_border_groups(const common_fit_placement_probe_result & result) {
+    std::vector<std::vector<size_t>> border_groups(result.n_blocks);
+    if (result.graphs.empty() || result.n_blocks < 2)
+        return border_groups;
+
+    // Each internal block border is one placement unit. For a CPU-required section inside block i,
+    // eligible reads before it belong to border i and eligible reads after it belong to border i + 1.
+    // A tensor is usable only when every representative graph that reads it assigns it to the same border.
+    std::vector<int> tensor_border(result.tensors.size(), -2); // -2 = not seen yet, -1 = not a safe internal-border tensor
+
+    for (const common_fit_placement_graph & graph : result.graphs) {
+        std::vector<int> first_read(result.tensors.size(), -1);
+        std::vector<int> last_read(result.tensors.size(), -1);
+        std::vector<int> cpu_first(result.n_blocks, -1);
+        std::vector<int> cpu_last(result.n_blocks, -1);
+
+        for (size_t node_id = 0; node_id < graph.weight_nodes.size(); ++node_id) {
+            for (size_t tensor_id : graph.weight_nodes[node_id]) {
+                if (first_read[tensor_id] < 0)
+                    first_read[tensor_id] = (int) node_id;
+                last_read[tensor_id] = (int) node_id;
+
+                const int block_id = common_fit_placement_block_id(result.tensors[tensor_id].name);
+                if (block_id < 0 || block_id >= (int) result.n_blocks || result.tensors[tensor_id].device_eligible)
+                    continue;
+
+                if (cpu_first[block_id] < 0)
+                    cpu_first[block_id] = (int) node_id;
+                cpu_last[block_id] = (int) node_id;
+            }
+        }
+
+        for (size_t tensor_id = 0; tensor_id < result.tensors.size(); ++tensor_id) {
+            if (first_read[tensor_id] < 0)
+                continue;
+
+            int graph_border = -1;
+            const common_fit_placement_tensor & tensor = result.tensors[tensor_id];
+            const int block_id = common_fit_placement_block_id(tensor.name);
+
+            if (tensor.device_eligible && block_id >= 0 && block_id < (int) result.n_blocks && cpu_first[block_id] >= 0) {
+                if (last_read[tensor_id] < cpu_first[block_id] && block_id > 0) {
+                    graph_border = block_id;
+                } else if (first_read[tensor_id] > cpu_last[block_id] && block_id + 1 < (int) result.n_blocks) {
+                    graph_border = block_id + 1;
+                }
+            }
+
+            if (tensor_border[tensor_id] == -2) {
+                tensor_border[tensor_id] = graph_border;
+            } else if (tensor_border[tensor_id] != graph_border) {
+                tensor_border[tensor_id] = -1;
+            }
+        }
+    }
+
+    for (size_t tensor_id = 0; tensor_id < result.tensors.size(); ++tensor_id) {
+        const int border = tensor_border[tensor_id];
+        if (border > 0 && border < (int) result.n_blocks)
+            border_groups[border].push_back(tensor_id);
+    }
+
+    return border_groups;
+}
+
+static std::vector<bool> common_fit_placement_probe_selected(
+        const char * path_model,
+        const llama_model_params & mparams,
+        const common_fit_placement_probe_result & probe) {
+    llama_model_params probe_mparams = mparams;
+    probe_mparams.no_alloc = true;
+    probe_mparams.load_mode = LLAMA_LOAD_MODE_NONE;
+    probe_mparams.defer_non_host_weights = false;
+
+    llama_model * model = llama_model_load_from_file(path_model, probe_mparams);
+    if (!model)
+        throw std::runtime_error("failed to load fitted placement probe model");
+
+    std::unordered_map<std::string, size_t> tensor_index;
+    tensor_index.reserve(probe.tensors.size());
+    for (size_t i = 0; i < probe.tensors.size(); ++i)
+        tensor_index.emplace(probe.tensors[i].name, i);
+
+    std::vector<bool> selected(probe.tensors.size(), false);
+    std::vector<bool> found(probe.tensors.size(), false);
+
+    const auto & tensor_map = llama_internal_get_tensor_map(model);
+    for (const auto & [name, tensor_raw] : tensor_map) {
+        auto it = tensor_index.find(name);
+        if (it == tensor_index.end())
+            continue;
+
+        ggml_tensor * tensor = common_fit_placement_root(tensor_raw);
+        selected[it->second] = common_fit_placement_device_buft(model, tensor) != nullptr;
+        found[it->second] = true;
+    }
+
+    llama_model_free(model);
+
+    for (size_t i = 0; i < found.size(); ++i) {
+        if (!found[i])
+            throw std::runtime_error("fitted placement probe did not recreate tensor '" + probe.tensors[i].name + "'");
+    }
+
+    return selected;
+}
+
+static std::string common_fit_placement_regex_escape(const std::string & value) {
+    std::string result;
+    result.reserve(value.size() * 2);
+
+    for (char c : value) {
+        switch (c) {
+            case '\\': case '.': case '^': case '$': case '|': case '(': case ')':
+            case '[': case ']': case '*': case '+': case '?': case '{': case '}':
+                result.push_back('\\');
+                break;
+            default:
+                break;
+        }
+        result.push_back(c);
+    }
+
+    return result;
+}
+
+// Placement fitting is not thread safe. Keep generated pattern storage alive until the subsequent model load consumes the fitted params.
+static std::vector<std::string> common_fit_placement_override_patterns;
+
+static void common_fit_placement_set_overrides(
+        const common_fit_placement_probe_result & probe,
+        const std::vector<bool> & stock_selected,
+        const std::vector<bool> & desired_selected,
+        llama_model_tensor_buft_override * tensor_buft_overrides,
+        size_t ntbo,
+        llama_model_params & mparams) {
+    struct override_bucket {
+        ggml_backend_buffer_type_t buft = nullptr;
+        std::vector<std::string> names;
+    };
+
+    std::vector<llama_model_tensor_buft_override> stock_overrides;
+    if (mparams.tensor_buft_overrides) {
+        for (const llama_model_tensor_buft_override * override = mparams.tensor_buft_overrides; override->pattern; ++override)
+            stock_overrides.push_back(*override);
+    }
+
+    std::vector<override_bucket> buckets;
+    ggml_backend_buffer_type_t cpu_buft = ggml_backend_cpu_buffer_type();
+
+    for (size_t i = 0; i < probe.tensors.size(); ++i) {
+        const common_fit_placement_tensor & tensor = probe.tensors[i];
+        if (stock_selected[i] == desired_selected[i])
+            continue;
+
+        ggml_backend_buffer_type_t buft = desired_selected[i] ? tensor.device_buft : cpu_buft;
+        GGML_ASSERT(buft);
+
+        auto it = std::find_if(buckets.begin(), buckets.end(), [&](const override_bucket & bucket) { return bucket.buft == buft; });
+        if (it == buckets.end()) {
+            buckets.push_back({});
+            buckets.back().buft = buft;
+            it = buckets.end() - 1;
+        }
+        it->names.push_back(tensor.name);
+    }
+
+    struct generated_override {
+        std::string pattern;
+        ggml_backend_buffer_type_t buft = nullptr;
+    };
+
+    std::vector<generated_override> generated;
+    constexpr size_t max_pattern_length = 4096;
+
+    for (const override_bucket & bucket : buckets) {
+        std::string pattern = "^(?:";
+        bool has_name = false;
+
+        for (const std::string & name : bucket.names) {
+            const std::string escaped = common_fit_placement_regex_escape(name);
+            const size_t added = escaped.size() + (has_name ? 1 : 0) + 2;
+
+            if (has_name && pattern.size() + added > max_pattern_length) {
+                pattern += ")$";
+                generated.push_back({ std::move(pattern), bucket.buft });
+                pattern = "^(?:";
+                has_name = false;
+            }
+
+            if (has_name)
+                pattern += '|';
+            pattern += escaped;
+            has_name = true;
+        }
+
+        if (has_name) {
+            pattern += ")$";
+            generated.push_back({ std::move(pattern), bucket.buft });
+        }
+    }
+
+    if (generated.size() + stock_overrides.size() + 1 > ntbo)
+        throw common_params_fit_exception("llama_max_tensor_buft_overrides() == " + std::to_string(ntbo) + " is insufficient for distributed placement");
+
+    common_fit_placement_override_patterns.clear();
+    common_fit_placement_override_patterns.reserve(generated.size());
+    for (generated_override & entry : generated)
+        common_fit_placement_override_patterns.push_back(std::move(entry.pattern));
+
+    size_t itbo = 0;
+    for (size_t i = 0; i < generated.size(); ++i) {
+        tensor_buft_overrides[itbo].pattern = common_fit_placement_override_patterns[i].c_str();
+        tensor_buft_overrides[itbo].buft = generated[i].buft;
+        ++itbo;
+    }
+    for (const llama_model_tensor_buft_override & override : stock_overrides)
+        tensor_buft_overrides[itbo++] = override;
+    tensor_buft_overrides[itbo] = { nullptr, nullptr };
+    mparams.tensor_buft_overrides = tensor_buft_overrides;
+}
+
+static void common_fit_placement_distribute(
+        const char * path_model,
+        llama_model_params & mparams,
+        const llama_context_params * cparams,
+        llama_model_tensor_buft_override * tensor_buft_overrides,
+        size_t ntbo,
+        bool fit_generated_overrides) {
+    if (!mparams.defer_non_host_weights)
+        return;
+
+    common_layer_fraction_t policy_fraction = LAYER_FRACTION_NONE;
+    size_t n_policy_overrides = 0;
+    if (fit_generated_overrides) {
+        policy_fraction = common_fit_placement_policy_from_fit_overrides(mparams, n_policy_overrides);
+
+        if (policy_fraction != LAYER_FRACTION_NONE && mparams.n_gpu_layers > 0 &&
+            size_t(mparams.n_gpu_layers) > n_policy_overrides + 1) {
+            // TODO: Represent mixed full-repeating + partial-repeating fits without collapsing the two placement classes.
+            LOG_TRC("common_fit: distributed placement left unchanged for mixed full/partial fitted placement\n");
+            return;
+        }
+    }
+
+    // Placement steps 1-2: remove only the NGL location. User placement overrides remain
+    // intact; stock-fit overflow overrides are generalized from their fitted layer location.
+    const common_fit_placement_probe_result probe = common_fit_probe_placement(
+        path_model, &mparams, cparams, policy_fraction, fit_generated_overrides);
+
+    if (probe.n_devices != 1) {
+        // TODO: Preserve per-device placement when parameter offloading is extended to multi-device streaming.
+        LOG_TRC("common_fit: distributed placement is currently left unchanged for %zu devices\n", probe.n_devices);
+        return;
+    }
+
+    if (fit_generated_overrides && policy_fraction != LAYER_FRACTION_NONE)
+        LOG_INF("common_fit: placement probe generalized stock fit overflow policy %d across repeating layers\n", int(policy_fraction));
+
+    common_fit_placement_probe_print(probe);
+
+    const std::vector<bool> stock_selected = common_fit_placement_probe_selected(path_model, mparams, probe);
+    std::vector<bool> desired_selected = stock_selected;
+
+    size_t target_blocks = 0;
+    if (mparams.n_gpu_layers < 0) {
+        target_blocks = probe.n_blocks;
+    } else if (mparams.n_gpu_layers > 1) {
+        target_blocks = std::min(probe.n_blocks, size_t(mparams.n_gpu_layers - 1));
+    }
+
+    if (target_blocks == 0 || probe.n_blocks == 0) {
+        LOG_INF("common_fit: distributed placement has no repeating blocks to redistribute\n");
+        return;
+    }
+
+    if (COMMON_FIT_PARAM_OFFLOAD_GPU_GROUPS == 0) {
+        LOG_INF("common_fit: distributed placement disabled by COMMON_FIT_PARAM_OFFLOAD_GPU_GROUPS=0; leaving stock placement unchanged\n");
+        return;
+    }
+
+    // Only repeating-block placement is redistributed. Input/output tensors and graph-unseen tensors retain stock placement.
+    for (size_t tensor_id = 0; tensor_id < probe.tensors.size(); ++tensor_id) {
+        const common_fit_placement_tensor & tensor = probe.tensors[tensor_id];
+        if (tensor.graph_seen && common_fit_placement_block_id(tensor.name) >= 0)
+            desired_selected[tensor_id] = false;
+    }
+
+    const std::vector<std::vector<size_t>> border_groups = common_fit_placement_border_groups(probe);
+
+    std::vector<size_t> available_borders;
+    for (size_t border = 1; border < border_groups.size(); ++border) {
+        if (!border_groups[border].empty()) {
+            available_borders.push_back(border);
+            LOG_TRC("common_fit: placement border %zu: %zu eligible tensors\n", border, border_groups[border].size());
+        }
+    }
+
+    LOG_INF("common_fit: placement overlay: %zu/%zu internal block borders have safe device-eligible groups\n",
+        available_borders.size(), probe.n_blocks > 0 ? probe.n_blocks - 1 : 0);
+
+    if (target_blocks >= probe.n_blocks) {
+        for (size_t tensor_id = 0; tensor_id < probe.tensors.size(); ++tensor_id) {
+            if (probe.tensors[tensor_id].graph_seen && probe.tensors[tensor_id].device_eligible && common_fit_placement_block_id(probe.tensors[tensor_id].name) >= 0)
+                desired_selected[tensor_id] = true;
+        }
+
+        LOG_INF("common_fit: distributed placement selected all %zu repeating blocks\n", probe.n_blocks);
+        common_fit_placement_set_overrides(probe, stock_selected, desired_selected, tensor_buft_overrides, ntbo, mparams);
+        return;
+    }
+
+    if (available_borders.empty()) {
+        LOG_INF("common_fit: distributed placement found no safe device-eligible block-border groups; leaving stock placement unchanged\n");
+        return;
+    }
+
+    const size_t n_block_units = std::min(target_blocks, available_borders.size());
+    constexpr size_t max_gpu_windows = COMMON_FIT_PARAM_OFFLOAD_GPU_GROUPS;
+    const size_t n_windows = std::min(max_gpu_windows, n_block_units);
+
+    // Spread at most COMMON_FIT_PARAM_OFFLOAD_GPU_GROUPS placement windows over execution order. Window lengths and gaps are measured only
+    // in block-border units; tensor sizes are deliberately irrelevant to NGL accounting.
+    std::vector<bool> selected_border(probe.n_blocks, false);
+    const size_t skipped_units = available_borders.size() - n_block_units;
+    size_t cursor = skipped_units / (n_windows + 1) + (0 < skipped_units % (n_windows + 1) ? 1 : 0);
+
+    for (size_t window = 0; window < n_windows; ++window) {
+        const size_t window_length = n_block_units / n_windows + (window < n_block_units % n_windows ? 1 : 0);
+        const size_t first_rank = cursor;
+
+        for (size_t i = 0; i < window_length; ++i)
+            selected_border[available_borders[cursor++]] = true;
+
+        const size_t last_rank = cursor - 1;
+        LOG_TRC("common_fit: placement window %zu: block borders %zu..%zu (%zu block units)\n",
+            window, available_borders[first_rank], available_borders[last_rank], window_length);
+
+        const size_t gap_id = window + 1;
+        const size_t gap = skipped_units / (n_windows + 1) + (gap_id < skipped_units % (n_windows + 1) ? 1 : 0);
+        cursor += gap;
+    }
+
+    size_t n_selected_tensors = 0;
+    for (size_t border = 1; border < selected_border.size(); ++border) {
+        if (!selected_border[border])
+            continue;
+
+        for (size_t tensor_id : border_groups[border]) {
+            if (!desired_selected[tensor_id]) {
+                desired_selected[tensor_id] = true;
+                ++n_selected_tensors;
+            }
+        }
+    }
+
+    LOG_INF("common_fit: distributed placement selected %zu/%zu repeating-block units across %zu GPU windows (%zu tensors from %zu/%zu safe block-border groups)\n",
+        n_block_units, target_blocks, n_windows, n_selected_tensors, n_block_units, available_borders.size());
+
+    common_fit_placement_set_overrides(probe, stock_selected, desired_selected, tensor_buft_overrides, ntbo, mparams);
+}
+
 static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         const char * path_model,
         const llama_model_params * mparams,
@@ -252,6 +957,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     llama_model_params mparams_copy = *mparams;
     mparams_copy.no_alloc  = true;
     mparams_copy.load_mode = LLAMA_LOAD_MODE_NONE;
+    mparams_copy.defer_non_host_weights = false;
 
     llama_model * model = llama_model_load_from_file(path_model, mparams_copy);
     if (model == nullptr) {
@@ -261,31 +967,13 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
 
     common_fit_moe_topology moe_topology;
 
-    if (cparams->moe_expert_prefetch) {
-        // The scheduler already reserves every MoE CPU/GPU lane. Fit only needs the logical GPU cache tensors to exist before llama_init_from_model().
-        if (llama_model_n_devices(model) != 1) {
-            llama_model_free(model);
-            llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
-            throw std::runtime_error("MoE expert prefetch fit currently supports exactly one accelerator device");
-        }
-
-        ggml_backend_dev_t dev = llama_model_get_device(model, 0);
-        ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
-
-        if (!buft) {
-            llama_model_free(model);
-            llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
-            throw std::runtime_error("MoE expert prefetch fit device has no default buffer type");
-        }
-
-        try {
-            moe_topology.init(model, buft, (int32_t) model->hparams.n_expert_used);
-        } catch (...) {
-            moe_topology.reset();
-            llama_model_free(model);
-            llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
-            throw;
-        }
+    try {
+        common_fit_moe_topology_init(moe_topology, model, *cparams);
+    } catch (...) {
+        moe_topology.reset();
+        llama_model_free(model);
+        llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
+        throw;
     }
 
     llama_context * ctx = llama_init_from_model(model, *cparams);
@@ -1038,6 +1726,34 @@ enum common_params_fit_status common_fit_params(
     }
     const int64_t t1_us = llama_time_us();
     LOG_TRC("%s: fitting params to free memory took %.2f seconds\n", __func__, (t1_us - t0_us) * 1e-6);
+    return status;
+}
+
+common_params_fit_status common_fit_distribute_param_offload(
+        const char * path_model,
+        llama_model_params * mparams,
+        const llama_context_params * cparams,
+        llama_model_tensor_buft_override * tensor_buft_overrides,
+        bool fit_generated_overrides) {
+    const int64_t t0_us = llama_time_us();
+    common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
+
+    LOG_INF("%s: analyzing parameter-offload placement\n", __func__);
+
+    try {
+        common_fit_placement_distribute(
+            path_model, *mparams, cparams, tensor_buft_overrides,
+            llama_max_tensor_buft_overrides(), fit_generated_overrides);
+    } catch (const common_params_fit_exception & e) {
+        LOG_WRN("%s: failed to distribute parameter-offload placement: %s\n", __func__, e.what());
+        status = COMMON_PARAMS_FIT_STATUS_FAILURE;
+    } catch (const std::runtime_error & e) {
+        LOG_ERR("%s: encountered an error while distributing parameter-offload placement: %s\n", __func__, e.what());
+        status = COMMON_PARAMS_FIT_STATUS_ERROR;
+    }
+
+    const int64_t t1_us = llama_time_us();
+    LOG_TRC("%s: parameter-offload placement analysis took %.2f seconds\n", __func__, (t1_us - t0_us) * 1e-6);
     return status;
 }
 

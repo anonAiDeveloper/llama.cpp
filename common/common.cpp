@@ -1242,7 +1242,9 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     auto cparams = common_context_params_to_llama(params);
 
     bool parameter_offloader_active = false;
+    bool fit_params_applied = false;
     ggml_backend_dev_t parameter_offloader_device = nullptr;
+    std::vector<llama_model_tensor_buft_override> param_offload_tensor_buft_overrides;
 
     const size_t MiB = 1024ull * 1024ull;
 
@@ -1295,6 +1297,19 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.tensor_buft_overrides.data(), fit_targets_data, params.fit_params_min_ctx, params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
 
         if (fit_status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+            return;
+        }
+
+        fit_params_applied = true;
+    }
+
+    if (!model_only && params.param_offload) {
+        param_offload_tensor_buft_overrides.resize(llama_max_tensor_buft_overrides());
+
+        const common_params_fit_status placement_status = common_fit_distribute_param_offload(
+            params.model.path.c_str(), &mparams, &cparams, param_offload_tensor_buft_overrides.data(), fit_params_applied);
+
+        if (placement_status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
             return;
         }
     }
